@@ -42,7 +42,9 @@ EVENT_TYPES = (
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """Naive UTC. The DateTime columns are naive, and SQLite hands them back naive — returning an
+    aware value here would make `a > b` raise as soon as one side came from the database."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class User(Base):
@@ -252,7 +254,9 @@ class Conversation(Base):
     event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(String(200), default="New plan")
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    # Deliberately no onupdate: this tracks the last MESSAGE, not the last row touch. With
+    # onupdate, marking a thread seen would bump it too and it would read as unread again.
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     messages: Mapped[list["Message"]] = relationship(
