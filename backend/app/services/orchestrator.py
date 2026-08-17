@@ -576,6 +576,13 @@ class ChatOrchestrator:
                 yield sse("tool", {"name": call["name"]})
                 result = self.call_tool(call["name"], arguments)
                 self.db.commit()
+
+                # Surface a blocked intake to the client as well as to the model, so the chat can
+                # render the numbered checklist from the design. The model will also ask in prose;
+                # the checklist makes what is missing scannable.
+                if isinstance(result, dict) and result.get("error") == "intake_incomplete":
+                    yield sse("intake_required", {"missing_fields": result.get("missing_fields", [])})
+
                 messages.append(
                     {
                         "role": "tool",

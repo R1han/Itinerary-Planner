@@ -52,7 +52,7 @@ account's likes influence the other's scoring.
 
 ```
 React + TypeScript (Vite)                    FastAPI
-├─ ChatPanel      SSE via fetch/ReadableStream  ├─ orchestrator.py   OpenAI function calling
+├─ ChatPanel      the only way to plan          ├─ orchestrator.py   OpenAI function calling
 ├─ MapView        react-leaflet + MapTiler      ├─ planner.py        deterministic, pure
 ├─ ItineraryStrip day tabs → slot cards         ├─ validator.py      constraint checker + repair
 ├─ SlotEditor     replace / adjust / remove     ├─ retrieval.py      Chroma → SQL filters
@@ -63,35 +63,10 @@ React + TypeScript (Vite)                    FastAPI
                                         SQLite (truth) + ChromaDB (semantic)
 ```
 
-### Three things worth knowing
-
-**`repo.py` is the only place user-owned tables are queried.** Every function takes `user_id` from
-the auth dependency, cross-user access returns 404 rather than 403 (a 403 would confirm the row
-exists), and asking it for a shared table raises `TypeError` — so misusing the choke point fails
-loudly instead of silently returning everything.
-
-**The planner is pure.** No DB session, no HTTP client, no clock; travel is injected as a callable.
-That is what makes the hypothesis property tests — random party profiles, catalogs and budgets,
-asserting the validator always passes — cheap enough to run on every commit.
-
-**The assistant reads the plan, it does not remember it.** `get_itinerary` returns the same
-payload the budget bar renders, and the system prompt forbids quoting a time, price or total from
-memory — otherwise a recap describes the plan as it was several edits ago and contradicts the
-figures on screen beside it.
-
-**SSE is consumed with `fetch` + `ReadableStream`, not `EventSource`,** because `EventSource`
-cannot send an `Authorization` header.
-
-**Candidates are ranked on estimates; only the chosen legs are routed for real.** The planner asks
-"how far is this one?" for every candidate at every step — hundreds of pairs per trip, of which a
-dozen survive. Routing all of them burns the ORS free tier's 40-requests-a-minute limit to answer a
-question haversine answers well enough. A three-day plan now makes about ten real route calls, and
-segments ORS cannot route degrade to dashed estimates.
-
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest        # 179 tests, ~55s (the model is stubbed)
+cd backend && .venv/bin/python -m pytest        # 180 tests, ~55s (the model is stubbed)
 cd frontend && npm run build                    # tsc + vite, clean
 ```
 
@@ -137,8 +112,3 @@ down a file cannot leave a half-applied import. Idempotent on `(user_id, title, 
 - **Web search needs both keys.** Tavily finds the pages; extracting an event name out of scraped
   page chrome needs comprehension, so without `OPENAI_API_KEY` the adapter returns nothing rather
   than feeding the planner regex noise.
-- **The assistant is a hard dependency.** Spec §1.11 and acceptance criterion 6 called for the app
-  to keep working with the LLM switched off, via a scripted responder. That was built and then
-  removed at the project's request, on the basis that the key will always be present. Chat now
-  reports a failure rather than working around it. The planner, the validator, the budget and the
-  form-based plan intake are all unaffected — none of them ever called the model.

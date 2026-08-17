@@ -200,6 +200,7 @@ export type StreamEvent =
   | { type: 'tool'; data: { name: string } }
   | { type: 'itinerary_updated'; data: { itinerary_id: number } }
   | { type: 'budget_updated'; data: Budget }
+  | { type: 'intake_required'; data: { missing_fields: string[] } }
   | { type: 'error'; data: { message: string } }
   | { type: 'done'; data: { conversation_id: number; failed?: boolean } }
 

@@ -8,7 +8,7 @@ import { ItineraryStrip } from './ItineraryStrip'
 import { MapView } from './MapView'
 import { ThreadRail } from './ThreadRail'
 import { TopBar } from './TopBar'
-import { EventsPanel, FamilyPanel, PlanPanel } from './SidePanels'
+import { EventsPanel, FamilyPanel } from './SidePanels'
 
 export function AppShell() {
   const itinerary = useStore((s) => s.itinerary)
@@ -66,11 +66,10 @@ export function AppShell() {
               <div className="empty__inner">
                 <h2>No plan yet</h2>
                 <p>
-                  Ask Rihla &ldquo;what events are upcoming?&rdquo; and it will offer to plan one —
-                  or build it from a form.
+                  Ask Rihla &ldquo;what events are upcoming?&rdquo; and it will offer to plan one.
                 </p>
-                <button className="btn btn--primary" onClick={() => setPanel('plan')}>
-                  Plan a trip
+                <button className="btn btn--primary" onClick={() => setPanel('events')}>
+                  Manage events
                 </button>
               </div>
             </div>
@@ -80,7 +79,6 @@ export function AppShell() {
 
           {panel === 'events' && <EventsPanel />}
           {panel === 'family' && <FamilyPanel onSaved={loadFamily} />}
-          {panel === 'plan' && <PlanPanel />}
         </main>
       </div>
 

@@ -1,8 +1,8 @@
 /** Events CRUD, family/preferences, and the form-based plan intake.
  *
- *  None of these screens exist in the design mock — the mock covers the workspace only. They are
- *  built from the same tokens rather than a second visual language. The plan form is a first-class
- *  way to generate a trip without conversing, not a fallback.
+ *  Neither screen exists in the design mock — the mock covers the workspace only — so both are
+ *  built from the same tokens rather than a second visual language. Planning itself happens in
+ *  chat; these panels only manage the events and family it plans around.
  */
 
 import { useEffect, useState } from 'react'
@@ -50,7 +50,6 @@ function PanelShell({
 }
 
 export function EventsPanel() {
-  const setPanel = useStore((s) => s.setPanel)
   const setError = useStore((s) => s.setError)
   const [events, setEvents] = useState<CalendarEvent[]>([])
   const [form, setForm] = useState({
@@ -159,9 +158,6 @@ export function EventsPanel() {
         <p className="list-row__meta">No events yet. Add one and Rihla can plan around it.</p>
       )}
 
-      <button className="btn btn--ghost" onClick={() => setPanel('plan')}>
-        Plan a trip from a form instead
-      </button>
     </PanelShell>
   )
 }
@@ -318,161 +314,3 @@ export function FamilyPanel({ onSaved }: { onSaved: () => void }) {
   )
 }
 
-export function PlanPanel() {
-  const user = useStore((s) => s.user)
-  const setItinerary = useStore((s) => s.setItinerary)
-  const setPanel = useStore((s) => s.setPanel)
-  const refreshConversations = useStore((s) => s.refreshConversations)
-  const conversationId = useStore((s) => s.conversationId)
-
-  const [events, setEvents] = useState<CalendarEvent[]>([])
-  const [eventId, setEventId] = useState<string>('')
-  const [startDate, setStartDate] = useState(today())
-  const [days, setDays] = useState(3)
-  const [budget, setBudget] = useState(user?.default_budget ?? 3500)
-  const [prayerBreaks, setPrayerBreaks] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [problem, setProblem] = useState<string | null>(null)
-  const [missing, setMissing] = useState<string[]>([])
-
-  useEffect(() => {
-    void api
-      .upcomingEvents()
-      .then((rows) => {
-        setEvents(rows)
-        const unplanned = rows.find((row) => !row.planned)
-        if (unplanned) {
-          setEventId(String(unplanned.id))
-          setStartDate(unplanned.date)
-        }
-      })
-      .catch(() => undefined)
-  }, [])
-
-  const generate = async () => {
-    if (!user) return
-    setBusy(true)
-    setProblem(null)
-    setMissing([])
-    try {
-      const itinerary = await api.generate({
-        event_id: eventId ? Number(eventId) : null,
-        start_date: startDate,
-        num_days: days,
-        total_budget: budget,
-        start_lat: user.home_base_lat,
-        start_lng: user.home_base_lng,
-        prayer_breaks: prayerBreaks,
-      })
-      setItinerary(itinerary)
-      setPanel(null)
-
-      // Bind the active thread to the plan so the rail shows the event's initial, as in the
-      // design, rather than a generic "New plan".
-      const thread =
-        conversationId ?? (await api.createConversation(itinerary.title, itinerary.event_id)).id
-      await api.updateConversation(thread, {
-        title: itinerary.event_title ?? itinerary.title,
-        itinerary_id: itinerary.id,
-        event_id: itinerary.event_id,
-      })
-      await refreshConversations()
-    } catch (error) {
-      const detail = (error as { detail?: unknown }).detail
-      if (detail && typeof detail === 'object' && 'missing_fields' in detail) {
-        setMissing((detail as { missing_fields: string[] }).missing_fields)
-        setProblem('Some details are still missing before I can plan this.')
-      } else {
-        setProblem(error instanceof Error ? error.message : 'Could not generate that plan.')
-      }
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <PanelShell title="Plan a trip" icon={<Calendar />}>
-      <div className="field">
-        <label htmlFor="plan-event">Event</label>
-        <select
-          id="plan-event"
-          value={eventId}
-          onChange={(event) => {
-            setEventId(event.target.value)
-            const match = events.find((row) => String(row.id) === event.target.value)
-            if (match) setStartDate(match.date)
-          }}
-        >
-          <option value="">No particular event</option>
-          {events.map((event) => (
-            <option key={event.id} value={event.id}>
-              {event.title} — {event.date}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div className="field__row">
-        <div className="field">
-          <label htmlFor="plan-start">Start date</label>
-          <input
-            id="plan-start"
-            type="date"
-            min={today()}
-            value={startDate}
-            onChange={(event) => setStartDate(event.target.value)}
-          />
-        </div>
-        <div className="field">
-          <label htmlFor="plan-days">Days</label>
-          <input
-            id="plan-days"
-            type="number"
-            min={1}
-            max={5}
-            value={days}
-            onChange={(event) => setDays(Number(event.target.value))}
-          />
-        </div>
-      </div>
-
-      <div className="field">
-        <label htmlFor="plan-budget">Total budget (AED)</label>
-        <input
-          id="plan-budget"
-          type="number"
-          min={1}
-          step={50}
-          value={budget}
-          onChange={(event) => setBudget(Number(event.target.value))}
-        />
-      </div>
-
-      <label className="field__row" style={{ alignItems: 'center', gap: 8 }}>
-        <input
-          type="checkbox"
-          style={{ flex: 'none', width: 16, height: 16 }}
-          checked={prayerBreaks}
-          onChange={(event) => setPrayerBreaks(event.target.checked)}
-        />
-        <span style={{ fontSize: 13 }}>Leave gaps for prayer times</span>
-      </label>
-
-      {problem && <div className="error-text">{problem}</div>}
-      {missing.length > 0 && (
-        <div className="notice-text">
-          Still needed: {missing.map((field) => field.replace(/_/g, ' ')).join(', ')}. Set these in
-          Family &amp; preferences.
-        </div>
-      )}
-
-      <button className="btn btn--primary" disabled={busy} onClick={generate}>
-        {busy ? 'Planning…' : 'Generate itinerary'}
-      </button>
-      <p className="list-row__meta">
-        Max 5 days, UAE only. The planner enforces travel time, opening hours, age limits and your
-        budget cap.
-      </p>
-    </PanelShell>
-  )
-}

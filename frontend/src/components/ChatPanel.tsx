@@ -197,6 +197,9 @@ export function ChatPanel() {
           case 'budget_updated':
             applyBudget(event.data)
             break
+          case 'intake_required':
+            setIntakeFields(event.data.missing_fields)
+            break
           case 'error':
             setNotice(event.data.message)
             break

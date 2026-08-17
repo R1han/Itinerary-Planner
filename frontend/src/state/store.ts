@@ -47,7 +47,7 @@ interface State {
 
   // ui
   sheetOpen: boolean
-  panel: 'events' | 'family' | 'plan' | null
+  panel: 'events' | 'family' | null
   error: string | null
 }
 

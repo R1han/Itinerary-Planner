@@ -493,3 +493,25 @@ def test_the_users_message_is_kept_even_when_the_assistant_fails(client, make_us
 
     history = client.get(f"/conversations/{conversation_id}/messages", headers=headers).json()
     assert [m["content"] for m in history] == ["remember this"]
+
+
+def test_a_blocked_intake_is_surfaced_to_the_client(client, make_user, monkeypatch):
+    """Chat is the only way to plan now, so the user must be told what is still missing."""
+    from app.services.orchestrator import ChatOrchestrator, sse
+
+    def fake_llm(self, user_message: str):
+        del user_message
+        result = self.call_tool("generate_itinerary", {"days": 3, "budget": 3000, "start_date": FUTURE})
+        if result.get("error") == "intake_incomplete":
+            yield sse("intake_required", {"missing_fields": result["missing_fields"]})
+        self.record("assistant", "I need a little more first.")
+        self.db.commit()
+        yield sse("done", {"conversation_id": self.conversation.id})
+
+    monkeypatch.setattr(ChatOrchestrator, "_llm", fake_llm)
+
+    headers, _ = make_user("intake@rihla.app")  # registered, but no family recorded
+    events = frames(client.post("/chat", headers=headers, json={"message": "plan my trip"}))
+
+    checklist = next(e for e in events if e["type"] == "intake_required")
+    assert "adults" in checklist["data"]["missing_fields"]
