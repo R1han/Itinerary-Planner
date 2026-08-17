@@ -744,7 +744,9 @@ a:hover {
 
 /* Recolour real tiles toward the cream + teal palette of the design. */
 .map .leaflet-tile-pane {
-  filter: sepia(0.62) saturate(0.62) hue-rotate(347deg) brightness(1.08) contrast(0.86);
+  /* Warm the land toward the design's cream and pull the water from blue toward teal, without
+   * flattening the two into one colour — a heavy sepia loses the land/water distinction entirely. */
+  filter: sepia(0.3) saturate(1.1) hue-rotate(328deg) brightness(1.02) contrast(0.95);
 }
 
 .map .leaflet-control-attribution {

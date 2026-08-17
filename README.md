@@ -77,10 +77,16 @@ asserting the validator always passes — cheap enough to run on every commit.
 **SSE is consumed with `fetch` + `ReadableStream`, not `EventSource`,** because `EventSource`
 cannot send an `Authorization` header.
 
+**Candidates are ranked on estimates; only the chosen legs are routed for real.** The planner asks
+"how far is this one?" for every candidate at every step — hundreds of pairs per trip, of which a
+dozen survive. Routing all of them burns the ORS free tier's 40-requests-a-minute limit to answer a
+question haversine answers well enough. A three-day plan now makes about ten real route calls, and
+segments ORS cannot route degrade to dashed estimates.
+
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest        # 164 tests, ~50s
+cd backend && .venv/bin/python -m pytest        # 173 tests, ~55s
 cd frontend && npm run build                    # tsc + vite, clean
 ```
 
@@ -110,9 +116,12 @@ down a file cannot leave a half-applied import. Idempotent on `(user_id, title, 
 
 ## Known limits
 
-- **The map is real geography, not the illustration.** MapTiler tiles are recoloured toward the
-  design's cream and teal, and the pins, routes, chips and popovers are drawn to match — but tiles
-  cannot reproduce hand-drawn road ribbons or lettering.
+- **The map is real geography, not the illustration.** MapTiler's `basic-v2` tiles are recoloured
+  toward the design's cream and teal, and the pins, routes, chips and popovers are drawn to match —
+  but tiles cannot reproduce hand-drawn road ribbons or lettering.
+- **Some coordinates are unroutable.** ORS returns 404 for a handful of beach and island points
+  with no road access; those legs fall back to dashed estimates, which is the intended behaviour
+  rather than a failure.
 - **Prayer times are approximate.** A static monthly UAE table, accurate to roughly ±10 minutes,
   which is well inside the slack of a 20-minute gap. `services/prayer.py` documents the upgrade
   path to a live API.
@@ -120,3 +129,6 @@ down a file cannot leave a half-applied import. Idempotent on `(user_id, title, 
   illustration, so a card can never show a broken image.
 - **Re-running `app.seed` without `OPENAI_API_KEY`** is a no-op for the SQL rows but still exits
   non-zero at the embeddings step, by design.
+- **Web search needs both keys.** Tavily finds the pages; extracting an event name out of scraped
+  page chrome needs comprehension, so without `OPENAI_API_KEY` the adapter returns nothing rather
+  than feeding the planner regex noise.

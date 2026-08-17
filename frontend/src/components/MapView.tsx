@@ -21,7 +21,7 @@ const MAPTILER_KEY = import.meta.env.VITE_MAPTILER_KEY as string | undefined
 
 const TILES = MAPTILER_KEY
   ? {
-      url: `https://api.maptiler.com/maps/dataviz-light/{z}/{x}/{y}.png?key=${MAPTILER_KEY}`,
+      url: `https://api.maptiler.com/maps/basic-v2/{z}/{x}/{y}.png?key=${MAPTILER_KEY}`,
       attribution:
         '&copy; <a href="https://www.maptiler.com/copyright/">MapTiler</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     }

@@ -158,13 +158,13 @@ def generate(
     )
 
     travel_service = TravelService(db)
-    places_by_id = {c.id: c for c in candidates}
-    travel_fn = travel_service.travel_fn(list(places_by_id.values()))
+    travel_fn = travel_service.travel_fn(list(candidates))
 
     plan = generate_plan(
         candidates,
         context.profile,
-        travel_fn,
+        # Candidates are ranked on cheap estimates; the chosen legs are routed for real below.
+        travel_service.estimate_fn(),
         start_date=start_date,
         num_days=num_days,
         total_budget=total_budget,
@@ -172,6 +172,8 @@ def generate(
         preferences=context.preferences,
         currency=currency,
     )
+
+    plan = route_for_real(plan, context, travel_fn)
 
     if prayer_breaks:
         for day in plan.days:
@@ -199,6 +201,17 @@ def generate(
     db.commit()
     db.refresh(itinerary)
     return itinerary
+
+
+def route_for_real(plan: Plan, context: PlanContext, travel_fn) -> Plan:
+    """Replace the planner's estimates with real routed legs, then re-validate.
+
+    A real route is usually a little slower than the estimate, so the day can end up infeasible —
+    which is exactly what the validator and repair pass are for.
+    """
+    for day in plan.days:
+        rebuild_segments(day, travel_fn, context.origin)
+    return repair_plan(plan, context.profile, travel_fn, context.origin)
 
 
 def persist_plan(db: Session, itinerary: Itinerary, plan: Plan) -> None:
@@ -547,7 +560,9 @@ def alternatives_for_slot(
     travel_service = TravelService(db)
     booked = {s.place.id for d in plan.days for s in d.slots}
     candidates = _candidates_for_gap(db, context, booked)
-    travel_fn = travel_service.travel_fn(candidates + [s.place for d in plan.days for s in d.slots])
+    # Offering three options must not cost dozens of route lookups; the real leg is routed when
+    # one is actually chosen, in patch_slot.
+    travel_fn = travel_service.estimate_fn()
 
     earliest, latest = gap_window(day, slot_row.position)
     ordered = sorted(day.slots, key=lambda s: s.start_min)
@@ -720,7 +735,7 @@ def cheaper_day(db: Session, itinerary: Itinerary, user: User, day_index: int) -
         day_date=day.day_date,
         candidates=candidates,
         profile=context.profile,
-        travel_fn=travel_fn,
+        travel_fn=travel_service.estimate_fn(),
         origin=context.origin,
         day_envelope=target_spend,
         remaining_total=plan.total_budget,
@@ -733,7 +748,7 @@ def cheaper_day(db: Session, itinerary: Itinerary, user: User, day_index: int) -
     else:
         log.info("cheaper_day found nothing better for day %s", day_index)
 
-    plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    plan = route_for_real(plan, context, travel_fn)
     persist_plan(db, itinerary, plan)
     db.commit()
     return plan

@@ -31,19 +31,37 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TMP_ROOT}/test.db"
 os.environ["CHROMA_PATH"] = f"{_TMP_ROOT}/chroma"
 os.environ.setdefault("JWT_SECRET", "test-secret")
 os.environ["LANGSMITH_TRACING"] = "false"
-for _key in ("OPENAI_API_KEY", "ORS_API_KEY", "LANGSMITH_API_KEY"):
-    os.environ.pop(_key, None)
+
+# Blanked, NOT popped. Settings also reads backend/.env, and an absent environment variable does
+# not override a value present in that file — so popping these left a developer's real keys live
+# and the suite quietly made billable calls to OpenAI, ORS and Tavily. An empty string is falsy,
+# which is what every `if not settings.<key>` branch checks.
+for _key in ("OPENAI_API_KEY", "ORS_API_KEY", "LANGSMITH_API_KEY", "WEB_SEARCH_API_KEY"):
+    os.environ[_key] = ""
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _storage_is_isolated() -> Iterator[None]:
-    """Fail loudly if the suite is somehow pointed at a real database."""
+    """Fail loudly if the suite is pointed at real storage or a real third-party account."""
     from app.config import settings
 
     assert _TMP_ROOT in settings.database_url, (
         f"tests are pointed at {settings.database_url!r}, not the temp directory — "
         "something imported app.config before conftest set DATABASE_URL"
     )
+    assert _TMP_ROOT in settings.chroma_path, "tests are pointed at a real Chroma directory"
+
+    live = [
+        name
+        for name, value in (
+            ("OPENAI_API_KEY", settings.openai_api_key),
+            ("ORS_API_KEY", settings.ors_api_key),
+            ("WEB_SEARCH_API_KEY", settings.web_search_api_key),
+            ("LANGSMITH_API_KEY", settings.langsmith_api_key),
+        )
+        if value
+    ]
+    assert not live, f"tests would make billable calls with a live {', '.join(live)}"
     yield
 
 

@@ -185,10 +185,13 @@ class ChatOrchestrator:
             f"Likes: {', '.join(likes)}\n"
             f"Dislikes: {', '.join(dislikes)}\n"
             f"Remembered from earlier sessions:\n{memory_text}\n\n"
-            "Before generating, you need: number of adults, number of children and their ages, "
-            "budget in AED, the dates, and where they are starting from. Ask for anything missing, "
-            "briefly and in one message. When an event is coming up and unplanned, offer to plan "
-            "it. Keep replies short and concrete — the itinerary itself is shown beside the chat."
+            "Everything listed above is already on file — never ask the user to repeat it. Ask "
+            "only for what is genuinely missing: usually just the budget and the dates, and an "
+            "event's own date is a fine default start date. When you have enough, call "
+            "generate_itinerary; the server validates the checklist and will tell you if something "
+            "is still missing, so prefer trying over interrogating. When an event is coming up and "
+            "unplanned, offer to plan it. Keep replies short and concrete — the itinerary itself "
+            "is shown beside the chat."
         )
 
     def history(self) -> list[dict]:

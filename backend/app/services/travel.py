@@ -182,6 +182,25 @@ class TravelService:
 
     # --- adapter for the pure planner --------------------------------------------------------
 
+    def estimate_fn(self) -> TravelFn:
+        """Network-free travel estimates, for choosing between candidates.
+
+        The planner asks "how far is this one?" for every candidate at every step — hundreds of
+        pairs for a three-day trip, of which a dozen survive. Routing all of those for real burns
+        the provider's rate limit (ORS free tier allows 40 requests a minute) to answer a question
+        haversine answers well enough: ranking only needs relative distance. The chosen legs are
+        then routed properly by `travel_fn`, so what the user sees is still real.
+        """
+        memo: dict[tuple, TravelInfo] = {}
+
+        def _estimate(from_lat: float, from_lng: float, to_lat: float, to_lng: float) -> TravelInfo:
+            key = (round(from_lat, 4), round(from_lng, 4), round(to_lat, 4), round(to_lng, 4))
+            if key not in memo:
+                memo[key] = self.fallback.route(from_lat, from_lng, to_lat, to_lng)
+            return memo[key]
+
+        return _estimate
+
     def travel_fn(self, places: Sequence) -> TravelFn:
         """Wrap this service as the coordinate-based callable the planner expects.
 

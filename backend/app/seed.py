@@ -25,6 +25,7 @@ from .db import SessionLocal, create_all
 from .models import FamilyMember, Place, Preference, User
 from .seed_events import insert_events
 from .services import vectors
+from .services.memory import MemoryService
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -210,6 +211,24 @@ def seed_users(db: Session) -> tuple[int, int]:
     return created, existing
 
 
+def seed_preference_memory(db: Session) -> int:
+    """Embed each demo account's stated preferences into their Chroma memory.
+
+    Without this the preferences exist in SQL but not in vector memory, so the assistant opens
+    every conversation with "remembered from earlier sessions: nothing yet" despite the rows
+    being right there.
+    """
+    if not vectors.embeddings_available():
+        return 0
+
+    embedded = 0
+    for user in db.query(User).all():
+        embedded += MemoryService(db, user.id).reindex_all()
+    if embedded:
+        _log(f"memory: embedded {embedded} preferences")
+    return embedded
+
+
 def seed_demo_events(db: Session) -> tuple[int, int]:
     """Attach each demo account's events, reusing the seed_events insertion path."""
     payload = json.loads((DATA_DIR / "events.json").read_text(encoding="utf-8"))
@@ -238,6 +257,7 @@ def main() -> int:
         # Embeddings run after the commit so place ids are final and a Chroma failure cannot
         # roll back a good SQL seed.
         vectors_added = seed_place_embeddings(db)
+        seed_preference_memory(db)
     except Exception:
         db.rollback()
         raise
