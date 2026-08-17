@@ -1,0 +1,458 @@
+"""Itinerary API: intake gating, generation, single-slot editing and the action chips.
+
+These run against the real seeded catalog so the assertions are about the actual product, not a
+toy fixture.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date, timedelta
+from pathlib import Path
+
+import pytest
+
+from app.models import Place
+from app.seed import default_price_bands
+
+TOMORROW = (date.today() + timedelta(days=1)).isoformat()
+ABU_DHABI = {"start_lat": 24.4539, "start_lng": 54.3773}
+
+DATA = Path(__file__).resolve().parent.parent / "app" / "data" / "places.json"
+
+
+@pytest.fixture
+def catalog(db) -> int:
+    """Load the real 164-place catalog (no embeddings — retrieval falls back to keywords)."""
+    rows = json.loads(DATA.read_text(encoding="utf-8"))
+    for row in rows:
+        db.add(
+            Place(
+                name=row["name"], emirate=row["emirate"], lat=row["lat"], lng=row["lng"],
+                category=row["category"], price_adult=row.get("price_adult", 0),
+                price_child=row.get("price_child", 0),
+                price_bands=row.get("price_bands") or default_price_bands(row),
+                min_age=row.get("min_age", 0), open_time=row.get("open_time", "09:00"),
+                close_time=row.get("close_time", "22:00"),
+                avg_duration_min=row.get("avg_duration_min", 90), tags=row.get("tags", []),
+                kid_score=row.get("kid_score", 0.5), teen_score=row.get("teen_score", 0.5),
+                romance_score=row.get("romance_score", 0.5),
+                category_icon=row["category"], description=row.get("description", ""),
+            )
+        )
+    db.commit()
+    return len(rows)
+
+
+@pytest.fixture
+def mixed_family(client, make_user, catalog):
+    headers, user = make_user("family@rihla.app", "Family")
+    client.put(
+        "/family",
+        headers=headers,
+        json={
+            "members": [
+                {"role": "adult", "age": 34, "name": "Dad"},
+                {"role": "adult", "age": 31, "name": "Mom"},
+                {"role": "child", "age": 7, "name": "Aisha"},
+                {"role": "child", "age": 13, "name": "Omar"},
+            ]
+        },
+    )
+    for pref in (
+        {"kind": "like", "subject": "animals and zoos", "category": "aquarium", "strength": 0.9},
+        {"kind": "dislike", "subject": "very loud thrill rides", "category": "adventure",
+         "strength": 0.7},
+    ):
+        client.post("/preferences", headers=headers, json=pref)
+    return headers, user
+
+
+@pytest.fixture
+def couple(client, make_user, catalog):
+    headers, user = make_user("couple@rihla.app", "Couple")
+    client.put(
+        "/family",
+        headers=headers,
+        json={"members": [{"role": "adult", "age": 36}, {"role": "adult", "age": 38}]},
+    )
+    client.post(
+        "/preferences",
+        headers=headers,
+        json={"kind": "like", "subject": "fine dining", "category": "fine_dining", "strength": 0.9},
+    )
+    return headers, user
+
+
+def generate(client, headers, **overrides) -> dict:
+    body = {"start_date": TOMORROW, "num_days": 3, "total_budget": 3500.0, **ABU_DHABI, **overrides}
+    response = client.post("/itineraries/generate", headers=headers, json=body)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+# --- intake gating -----------------------------------------------------------------------------
+
+
+def test_generation_is_refused_until_the_family_is_known(client, make_user, catalog):
+    headers, _ = make_user("nofamily@rihla.app")
+    response = client.post(
+        "/itineraries/generate",
+        headers=headers,
+        json={"start_date": TOMORROW, "num_days": 2, "total_budget": 2000.0, **ABU_DHABI},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "intake_incomplete"
+    assert "adults" in response.json()["detail"]["missing_fields"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_days", 6),
+        ("num_days", 0),
+        ("total_budget", -100),
+        ("start_date", (date.today() - timedelta(days=1)).isoformat()),
+        ("start_lat", 48.85),  # Paris — outside the UAE bounding box
+    ],
+)
+def test_boundary_validation_rejects_impossible_requests(client, mixed_family, field, value):
+    headers, _ = mixed_family
+    body = {"start_date": TOMORROW, "num_days": 2, "total_budget": 2000.0, **ABU_DHABI, field: value}
+    assert client.post("/itineraries/generate", headers=headers, json=body).status_code == 422
+
+
+# --- generation --------------------------------------------------------------------------------
+
+
+def test_a_generated_plan_satisfies_every_hard_constraint(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+
+    assert len(plan["days"]) == 3
+    assert plan["budget"]["total"] <= plan["budget"]["cap"]
+    assert plan["budget"]["over_budget"] is False
+
+    for day in plan["days"]:
+        travel_into = {s["to_slot_id"]: s["duration_min"] for s in day["segments"]}
+        slots = sorted(day["slots"], key=lambda s: s["start_time"])
+        for previous, current in zip(slots, slots[1:]):
+            assert current["start_time"] >= previous["end_time"], "slots overlap"
+            required = travel_into.get(current["id"], 0)
+            gap = _minutes(current["start_time"]) - _minutes(previous["end_time"])
+            assert gap >= required, "not enough time for the drive"
+
+        for slot in day["slots"]:
+            place = slot["place"]
+            assert slot["start_time"] >= place["open_time"]
+            assert place["min_age"] <= 7, "a 7-year-old was booked into an age-restricted venue"
+
+
+def _minutes(hhmm: str) -> int:
+    hours, _, mins = hhmm.partition(":")
+    return int(hours) * 60 + int(mins)
+
+
+def test_the_response_carries_everything_the_workspace_renders(client, mixed_family):
+    """Spec §9: geometry per segment and image_url per place, so there are no extra round trips."""
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    day = next(d for d in plan["days"] if d["slots"])
+
+    assert day["theme"] and day["theme"] != "Open day"
+    assert day["subtotal"] > 0
+    assert day["driving_total_min"] > 0
+    assert set(plan["budget"]["categories"]) == {"activities", "food", "travel"}
+
+    slot = day["slots"][0]
+    assert {"id", "start_time", "end_time", "cost_breakdown", "place"} <= set(slot)
+    assert "image_url" in slot["place"]
+    assert slot["cost_breakdown"]["chips"], "cost chips drive the slot card"
+
+    for segment in day["segments"]:
+        assert segment["geometry_json"] is not None
+        assert "estimated" in segment
+
+
+def test_a_birthday_plan_for_young_children_skews_to_parks_and_wildlife(client, mixed_family):
+    headers, _ = mixed_family
+    event = client.post(
+        "/events",
+        headers=headers,
+        json={"title": "Aisha's 7th birthday", "event_type": "birthday", "date": TOMORROW,
+              "notes": "loves animals, afraid of loud rides"},
+    ).json()
+
+    plan = generate(client, headers, event_id=event["id"])
+    categories = [s["place"]["category"] for d in plan["days"] for s in d["slots"]]
+
+    assert any(c in {"park", "aquarium", "beach"} for c in categories)
+    assert "adventure" not in categories, "a disliked category was still booked"
+    assert client.get("/events", headers=headers).json()[0]["planned"] is True
+
+
+def test_an_adults_only_anniversary_is_romantic_and_evening_heavy(client, couple):
+    headers, _ = couple
+    event = client.post(
+        "/events",
+        headers=headers,
+        json={"title": "Anniversary weekend", "event_type": "anniversary", "date": TOMORROW},
+    ).json()
+
+    plan = generate(client, headers, event_id=event["id"], num_days=2, total_budget=4000.0)
+    slots = [s for d in plan["days"] for s in d["slots"]]
+    categories = {s["place"]["category"] for s in slots}
+
+    assert "fine_dining" in categories
+    for slot in slots:
+        if slot["place"]["category"] == "fine_dining":
+            assert slot["start_time"] >= "17:00"
+        assert slot["cost_breakdown"]["free_children"] == 0
+        assert slot["cost_breakdown"]["children"] == []
+
+
+def test_a_teen_visit_reaches_waterparks_or_adventure(client, make_user, catalog):
+    headers, _ = make_user("teens@rihla.app")
+    client.put(
+        "/family",
+        headers=headers,
+        json={
+            "members": [
+                {"role": "adult", "age": 40},
+                {"role": "child", "age": 14},
+                {"role": "child", "age": 16},
+            ]
+        },
+    )
+    event = client.post(
+        "/events",
+        headers=headers,
+        json={"title": "Cousins visiting", "event_type": "family_visit", "date": TOMORROW},
+    ).json()
+
+    plan = generate(client, headers, event_id=event["id"], num_days=4, total_budget=6000.0)
+    categories = {s["place"]["category"] for d in plan["days"] for s in d["slots"]}
+    assert categories & {"waterpark", "theme_park", "adventure"}
+
+
+def test_a_tight_budget_substitutes_rather_than_failing(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=350.0)
+    assert any(d["slots"] for d in plan["days"]), "planner gave up instead of substituting"
+    assert plan["budget"]["total"] <= 350.0
+
+
+# --- action chips ------------------------------------------------------------------------------
+
+
+def test_suggestions_name_the_priciest_day(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    suggestions = {s["action"]: s for s in plan["suggestions"]}
+
+    assert "prayer_breaks" in suggestions
+    cheaper = suggestions["cheaper_day"]
+    priciest = max(range(len(plan["budget"]["per_day"])), key=lambda i: plan["budget"]["per_day"][i])
+    assert cheaper["day_index"] == priciest
+    assert cheaper["label"] == f"Cheaper Day {priciest + 1}"
+
+
+def test_cheaper_day_reduces_that_day_without_breaking_the_plan(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    target = max(range(len(plan["budget"]["per_day"])), key=lambda i: plan["budget"]["per_day"][i])
+    before = plan["budget"]["per_day"][target]
+
+    response = client.post(
+        f"/itineraries/{plan['id']}/days/{target}/cheaper", headers=headers
+    )
+    assert response.status_code == 200
+    after = response.json()
+
+    assert after["budget"]["per_day"][target] <= before
+    assert after["budget"]["over_budget"] is False
+    assert after["days"][target]["slots"], "the day was emptied rather than made cheaper"
+
+
+def test_prayer_breaks_reflow_the_day_and_keep_it_valid(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+
+    response = client.post(f"/itineraries/{plan['id']}/prayer-breaks", headers=headers)
+    assert response.status_code == 200
+    after = response.json()
+
+    assert after["budget"]["over_budget"] is False
+    for day in after["days"]:
+        slots = sorted(day["slots"], key=lambda s: s["start_time"])
+        for previous, current in zip(slots, slots[1:]):
+            assert current["start_time"] >= previous["end_time"]
+
+
+# --- single-slot editing -----------------------------------------------------------------------
+
+
+def _first_editable(plan: dict) -> tuple[int, dict]:
+    for day in plan["days"]:
+        if len(day["slots"]) >= 2:
+            return day["day_index"], day["slots"][1]
+    day = next(d for d in plan["days"] if d["slots"])
+    return day["day_index"], day["slots"][0]
+
+
+def test_alternatives_fit_the_window_and_the_remaining_budget(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    day_index, slot = _first_editable(plan)
+
+    response = client.get(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}/alternatives", headers=headers
+    )
+    assert response.status_code == 200
+    options = response.json()
+    assert len(options) <= 3
+
+    booked = {s["place_id"] for d in plan["days"] for s in d["slots"]}
+    for option in options:
+        assert option["place"]["id"] not in booked, "offered a place already in the plan"
+        assert option["place"]["min_age"] <= 7
+        assert option["start_time"] >= option["place"]["open_time"]
+
+
+def test_removing_a_slot_returns_the_whole_day_and_a_fresh_budget(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    day_index, slot = _first_editable(plan)
+    before_total = plan["budget"]["total"]
+
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "remove"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["day"]["day_index"] == day_index
+    assert slot["id"] not in [s["id"] for s in body["day"]["slots"]]
+    assert body["budget"]["total"] < before_total, "budget did not update server-side"
+    assert "suggestions" in body
+
+
+def test_an_edit_touches_only_its_own_day(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    day_index, slot = _first_editable(plan)
+
+    untouched_before = {
+        d["day_index"]: [(s["place_id"], s["start_time"]) for s in d["slots"]]
+        for d in plan["days"]
+        if d["day_index"] != day_index
+    }
+
+    client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}", headers=headers, json={"action": "remove"}
+    )
+    after = client.get(f"/itineraries/{plan['id']}", headers=headers).json()
+
+    untouched_after = {
+        d["day_index"]: [(s["place_id"], s["start_time"]) for s in d["slots"]]
+        for d in after["days"]
+        if d["day_index"] != day_index
+    }
+    assert untouched_before == untouched_after, "an edit cascaded into another day"
+
+
+def test_replacing_a_slot_swaps_the_place_and_recomputes_its_travel(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    day_index, slot = _first_editable(plan)
+
+    options = client.get(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}/alternatives", headers=headers
+    ).json()
+    if not options:
+        pytest.skip("no alternative fits this window")
+
+    replacement = options[0]["place"]["id"]
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "replace", "place_id": replacement},
+    )
+    assert response.status_code == 200
+    day = response.json()["day"]
+
+    assert replacement in [s["place_id"] for s in day["slots"]]
+    assert len(day["segments"]) == len(day["slots"]), "a slot lost its travel segment"
+
+
+def test_replacing_with_an_age_restricted_place_is_rejected(client, mixed_family, db):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    _, slot = _first_editable(plan)
+
+    adults_only = db.query(Place).filter(Place.min_age >= 12).first()
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "replace", "place_id": adults_only.id},
+    )
+    assert response.status_code == 400
+    assert "requires age" in response.json()["detail"]
+
+
+def test_adjusting_a_time_keeps_the_day_valid(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    day_index, slot = _first_editable(plan)
+
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "adjust", "start_time": "15:00"},
+    )
+    assert response.status_code == 200
+    day = response.json()["day"]
+
+    slots = sorted(day["slots"], key=lambda s: s["start_time"])
+    for previous, current in zip(slots, slots[1:]):
+        assert current["start_time"] >= previous["end_time"]
+    for entry in day["slots"]:
+        assert entry["start_time"] >= entry["place"]["open_time"]
+
+
+def test_a_malformed_patch_is_rejected(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    _, slot = _first_editable(plan)
+
+    assert client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "replace"},  # no place_id
+    ).status_code == 422
+
+
+# --- ownership ---------------------------------------------------------------------------------
+
+
+def test_another_user_cannot_read_or_edit_the_plan(client, mixed_family, make_user):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    _, slot = _first_editable(plan)
+    intruder, _ = make_user("intruder@rihla.app")
+
+    assert client.get(f"/itineraries/{plan['id']}", headers=intruder).status_code == 404
+    assert client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=intruder,
+        json={"action": "remove"},
+    ).status_code == 404
+    assert client.get(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}/alternatives", headers=intruder
+    ).status_code == 404
+    assert client.post(
+        f"/itineraries/{plan['id']}/days/0/cheaper", headers=intruder
+    ).status_code == 404
+    assert client.get("/itineraries", headers=intruder).json() == []

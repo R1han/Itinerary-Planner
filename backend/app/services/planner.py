@@ -34,6 +34,16 @@ MAX_WAIT_MIN = 40
 MEAL_GRACE_MIN = 45
 # Per-day spend may exceed its even share by this much, as long as the trip total still fits.
 DAY_ENVELOPE_FLEX = 1.35
+# Score penalty per kilometre from the previous stop. Clustering decides which places belong to a
+# day; this decides the order within it, and is what stops a day hopping Abu Dhabi → Dubai →
+# Sharjah and spending more on taxis than on admission.
+PROXIMITY_PENALTY_PER_KM = 0.012
+# How far from the trip's start location a place may be and still be worth a day trip. The UAE is
+# small, so this still spans several emirates — it exists to stop a 7-year-old's birthday being
+# planned around a mountain two hours away because the scorer liked it.
+TRIP_RADIUS_KM = 140
+# Below this many reachable candidates the radius is ignored rather than leaving the day empty.
+MIN_REACHABLE = 20
 
 
 def to_minutes(hhmm: str) -> int:
@@ -152,6 +162,9 @@ class PlannedSlot:
     score: float
     cost: CostBreakdown
     locked: bool = False
+    # The persisted Slot row this came from, when loaded from the database. Carried through edits
+    # so ids stay stable — the client holds them for hover and selection across the strip and map.
+    row_id: int | None = None
 
     @property
     def start_time(self) -> str:
@@ -379,6 +392,28 @@ def _next_meal_start(profile: PartyProfile, cursor: int, filled: set[str]) -> in
     return min(upcoming) if upcoming else None
 
 
+def _cheapest_meal(candidates: Sequence[PlaceCandidate], profile: PartyProfile) -> float:
+    """What the party would pay at the cheapest reachable dining option in this pool."""
+    costs = [
+        slot_cost_breakdown(place, profile.attendees).total
+        for place in candidates
+        if place.category in DINING_CATEGORIES and attendees_clear_min_age(place, profile)
+    ]
+    return min(costs) if costs else 0.0
+
+
+def _meal_reserve(profile: PartyProfile, cursor: int, filled: set[str], unit: float) -> float:
+    """Budget to hold back for the meals still ahead today.
+
+    Without this, one expensive anchor venue eats the whole day envelope and every meal window is
+    then skipped for being unaffordable — which is how a plan ends up with a waterpark and no lunch.
+    """
+    ahead = sum(
+        1 for label, _, end in profile.meal_windows if label not in filled and end >= cursor
+    )
+    return ahead * unit
+
+
 def assemble_day(
     day_index: int,
     day_date: date,
@@ -401,7 +436,8 @@ def assemble_day(
     previous: tuple[float, float] = origin
     previous_position: int | None = None
 
-    pool = sorted(candidates, key=lambda p: scores.get(p.id, 0.0), reverse=True)
+    pool = list(candidates)
+    meal_unit = _cheapest_meal(pool, profile)
 
     while len(day.slots) < MAX_SLOTS_PER_DAY and cursor < profile.day_end:
         # A midday rest for young children is a gap in the schedule, not a slot.
@@ -414,7 +450,15 @@ def assemble_day(
         due_label = due[0] if due else None
         best: tuple[PlannedSlot, TravelInfo] | None = None
 
-        for place in pool:
+        # Re-rank from where we currently are, so the next stop is a good place that is also near.
+        ordered = sorted(
+            pool,
+            key=lambda p: scores.get(p.id, 0.0)
+            - PROXIMITY_PENALTY_PER_KM * haversine_km(previous[0], previous[1], p.lat, p.lng),
+            reverse=True,
+        )
+
+        for place in ordered:
             if place.id in used:
                 continue
             is_dining = place.category in DINING_CATEGORIES
@@ -442,7 +486,9 @@ def assemble_day(
                 continue
 
             cost = slot_cost_breakdown(place, profile.attendees, travel.est_cost)
-            if spent + cost.total > day_envelope * DAY_ENVELOPE_FLEX:
+            # Hold back enough for the meals still to come; a meal itself spends its own reserve.
+            reserve = 0.0 if is_dining else _meal_reserve(profile, cursor, filled_meals, meal_unit)
+            if spent + cost.total + reserve > day_envelope * DAY_ENVELOPE_FLEX:
                 continue
             if cost.total > remaining_total:
                 continue
@@ -522,6 +568,14 @@ def generate_plan(
     if not 1 <= num_days <= MAX_DAYS:
         raise ValueError(f"num_days must be between 1 and {MAX_DAYS}")
 
+    reachable = [
+        place
+        for place in candidates
+        if haversine_km(origin[0], origin[1], place.lat, place.lng) <= TRIP_RADIUS_KM
+    ]
+    if len(reachable) >= MIN_REACHABLE:
+        candidates = reachable
+
     scores = {p.id: score_place(p, profile, preferences) for p in candidates}
     ranked = sorted(candidates, key=lambda p: scores[p.id], reverse=True)
     buckets = cluster_by_proximity(ranked, num_days, origin)
@@ -536,18 +590,27 @@ def generate_plan(
         # should cost geographic tightness, never leave the day empty.
         pool = bucket if len(bucket) >= 4 else ranked
 
-        day = assemble_day(
-            day_index=day_index,
-            day_date=start_date + timedelta(days=day_index),
-            candidates=pool,
-            profile=profile,
-            travel_fn=travel_fn,
-            origin=origin,
-            day_envelope=envelope,
-            remaining_total=total_budget - plan.total_cost,
-            scores=scores,
-            used=used,
-        )
+        def build(candidate_pool):
+            return assemble_day(
+                day_index=day_index,
+                day_date=start_date + timedelta(days=day_index),
+                candidates=candidate_pool,
+                profile=profile,
+                travel_fn=travel_fn,
+                origin=origin,
+                day_envelope=envelope,
+                remaining_total=total_budget - plan.total_cost,
+                scores=scores,
+                used=used,
+            )
+
+        day = build(pool)
+        if not day.slots and pool is not ranked:
+            # This cluster is unreachable on the remaining budget — usually a far-flung group on a
+            # tight cap, where the drive alone exceeds the day's envelope. Geographic tightness is
+            # a preference; an empty day is a failure, so fall back to the whole pool.
+            day = build(ranked)
+
         plan.days.append(day)
 
     if not any(day.slots for day in plan.days):
@@ -559,8 +622,15 @@ def generate_plan(
 
 
 def day_theme(day: DayPlan) -> str:
-    """Human label for a day, from its dominant non-dining categories ('Waterpark & Aquarium')."""
-    if not day.slots:
+    """Human label for a day, from its dominant non-dining categories ('Waterpark & Wildlife')."""
+    return theme_from_categories(
+        [(slot.place.category, slot.end_min - slot.start_min) for slot in day.slots]
+    )
+
+
+def theme_from_categories(pairs: Sequence[tuple[str, int]]) -> str:
+    """Day theme from (category, minutes) pairs, so it works from planner objects or DB rows."""
+    if not pairs:
         return "Open day"
 
     pretty = {
@@ -579,15 +649,14 @@ def day_theme(day: DayPlan) -> str:
     }
 
     weights: dict[str, float] = {}
-    for slot in day.slots:
-        if slot.place.category in DINING_CATEGORIES:
+    for category, minutes in pairs:
+        if category in DINING_CATEGORIES:
             continue
-        minutes = slot.end_min - slot.start_min
-        weights[slot.place.category] = weights.get(slot.place.category, 0.0) + minutes
+        weights[category] = weights.get(category, 0.0) + minutes
 
     if not weights:  # a dining-only day
-        best = max(day.slots, key=lambda s: s.end_min - s.start_min)
-        return pretty.get(best.place.category, best.place.category.replace("_", " ").title())
+        category = max(pairs, key=lambda pair: pair[1])[0]
+        return pretty.get(category, category.replace("_", " ").title())
 
     top = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:2]
     labels = [pretty.get(category, category.replace("_", " ").title()) for category, _ in top]
@@ -606,6 +675,31 @@ def renumber(day: DayPlan) -> DayPlan:
             segment.from_position = old_to_new.get(segment.from_position, segment.from_position)
     day.segments.sort(key=lambda s: s.to_position)
     return day
+
+
+def reflow_day(
+    day: DayPlan, profile: PartyProfile, travel_fn: TravelFn, origin: tuple[float, float]
+) -> DayPlan:
+    """Push slots later until the day is internally consistent, preserving order and durations.
+
+    Used after a manual edit: moving one slot should cascade the rest of the day forward rather
+    than leave an overlap for the repair pass to resolve by deleting something the user kept.
+    """
+    ordered = sorted(day.slots, key=lambda s: s.start_min)
+    previous_end = profile.day_start
+    previous_coord = origin
+
+    for slot in ordered:
+        duration = slot.end_min - slot.start_min
+        leg = travel_fn(previous_coord[0], previous_coord[1], slot.place.lat, slot.place.lng)
+        earliest = previous_end + leg.duration_min
+        start = max(slot.start_min, earliest, slot.place.opens_at)
+        slot.start_min = start
+        slot.end_min = start + duration
+        previous_end = slot.end_min
+        previous_coord = (slot.place.lat, slot.place.lng)
+
+    return rebuild_segments(day, travel_fn, origin)
 
 
 def rebuild_segments(day: DayPlan, travel_fn: TravelFn, origin: tuple[float, float]) -> DayPlan:
