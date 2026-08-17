@@ -31,8 +31,10 @@ export function AppShell() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
-      if (useStore.getState().editingSlotId !== null) setEditingSlot(null)
-      else if (useStore.getState().panel) setPanel(null)
+      const state = useStore.getState()
+      if (state.editingSlotId !== null) setEditingSlot(null)
+      else if (state.pendingPreference) state.setPendingPreference(null)
+      else if (state.panel) setPanel(null)
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)

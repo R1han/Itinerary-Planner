@@ -61,6 +61,31 @@ function useAnchored(anchor: React.RefObject<HTMLElement>, open: boolean) {
 
 const DINING_CATEGORIES = new Set(['casual_dining', 'fine_dining'])
 
+/** Dismiss a popover when the pointer goes down anywhere outside it.
+ *
+ *  The anchor is excluded as well as the panel: the card's own action buttons toggle the editor,
+ *  and closing on their mousedown would fight the toggle on the click that follows.
+ */
+function useDismissOnOutsideClick(
+  refs: React.RefObject<HTMLElement | null>[],
+  onDismiss: () => void,
+) {
+  const latest = useRef(onDismiss)
+  latest.current = onDismiss
+
+  useEffect(() => {
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (refs.some((ref) => ref.current?.contains(target))) return
+      latest.current()
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    return () => document.removeEventListener('mousedown', onPointerDown)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, refs)
+}
+
 function weekday(dateIso: string): string {
   return new Date(`${dateIso}T00:00:00`).toLocaleDateString('en-GB', { weekday: 'short' })
 }
@@ -95,6 +120,7 @@ interface EditorProps {
 
 function SlotEditor({ slot, itineraryId, currency, onClose, anchor }: EditorProps) {
   const { panel, position } = useAnchored(anchor, true)
+  useDismissOnOutsideClick([panel, anchor], onClose)
   const applyDayPatch = useStore((s) => s.applyDayPatch)
   const setPendingPreference = useStore((s) => s.setPendingPreference)
   const setError = useStore((s) => s.setError)
@@ -265,6 +291,9 @@ function PreferenceToast({ anchor }: { anchor: React.RefObject<HTMLElement> }) {
   const pending = useStore((s) => s.pendingPreference)
   const setPending = useStore((s) => s.setPendingPreference)
   const setError = useStore((s) => s.setError)
+  // Dismissing without answering records nothing — the same outcome as "No", which is the safe
+  // default for a question about a lasting preference.
+  useDismissOnOutsideClick([panel], () => setPending(null))
 
   if (!pending) return null
 
