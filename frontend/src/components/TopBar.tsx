@@ -121,7 +121,7 @@ export function TopBar({ family }: Props) {
             </button>
             {(!llmAvailable || !mapsAvailable) && (
               <div className="menu__note">
-                {!llmAvailable && <div>Assistant offline — form planning still works.</div>}
+                {!llmAvailable && <div>Assistant unavailable — chat will not respond.</div>}
                 {!mapsAvailable && <div>Maps API offline — travel times are estimates.</div>}
               </div>
             )}

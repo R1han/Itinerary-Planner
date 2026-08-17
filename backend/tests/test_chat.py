@@ -1,7 +1,7 @@
-"""Chat orchestration: SSE framing, tool isolation, thread persistence and the LLM-down fallback.
+"""Chat orchestration: SSE framing, tool isolation and thread persistence.
 
-These run with no OPENAI_API_KEY, which is the fallback path — and also exactly the state of
-acceptance criterion 6. Tool behaviour is tested by calling the tools directly, so the assertions
+The model itself is stubbed — the suite must never make a billable call — so what is under test is
+everything around it. Tool behaviour is checked by calling the tools directly, so the assertions
 are about what a tool *does to the database*, not about what a model chose to say.
 """
 
@@ -25,6 +25,30 @@ def frames(response) -> list[dict]:
         for line in response.text.splitlines()
         if line.startswith("data: ")
     ]
+
+
+@pytest.fixture
+def stub_llm(monkeypatch):
+    """Replace the model call with deterministic frames.
+
+    The chat endpoint needs a working assistant now that there is no fallback, and the suite must
+    never make a billable call — so the one network-bound method is swapped out and everything
+    around it (framing, persistence, unread state, ownership) is exercised for real.
+    """
+    from app.services.orchestrator import ChatOrchestrator, sse
+
+    reply = "Here is a reply."
+
+    def fake_llm(self, user_message: str):
+        del user_message
+        for word in reply.split(" "):
+            yield sse("token", word + " ")
+        self.record("assistant", reply)
+        self.db.commit()
+        yield sse("done", {"conversation_id": self.conversation.id})
+
+    monkeypatch.setattr(ChatOrchestrator, "_llm", fake_llm)
+    return reply
 
 
 @pytest.fixture
@@ -197,7 +221,7 @@ def test_the_system_prompt_forbids_the_model_from_scheduling(db, orchestrator):
 # --- SSE endpoint, with the LLM down -----------------------------------------------------------
 
 
-def test_chat_streams_sse_frames_and_persists_the_thread(client, make_user):
+def test_chat_streams_sse_frames_and_persists_the_thread(client, make_user, stub_llm):
     headers, _ = make_user("sse@rihla.app")
     response = client.post("/chat", headers=headers, json={"message": "hello"})
 
@@ -216,31 +240,8 @@ def test_chat_streams_sse_frames_and_persists_the_thread(client, make_user):
     assert history[0]["content"] == "hello"
 
 
-def test_with_the_llm_down_upcoming_events_still_answer(client, make_user):
-    headers, _ = make_user("degraded@rihla.app")
-    client.post(
-        "/events",
-        headers=headers,
-        json={"title": "Aisha's birthday", "event_type": "birthday", "date": FUTURE},
-    )
 
-    response = client.post("/chat", headers=headers, json={"message": "What events are upcoming?"})
-    reply = "".join(e["data"] for e in frames(response) if e["type"] == "token")
-
-    assert "Aisha's birthday" in reply
-    assert "Want me to plan an itinerary for Aisha's birthday?" in reply
-    assert frames(response)[-1]["data"]["degraded"] is True
-
-
-def test_with_the_llm_down_planning_names_the_missing_intake_fields(client, make_user):
-    headers, _ = make_user("degraded2@rihla.app")
-    response = client.post("/chat", headers=headers, json={"message": "plan a trip for me"})
-    reply = "".join(e["data"] for e in frames(response) if e["type"] == "token")
-    assert "still need" in reply
-    assert "adults" in reply
-
-
-def test_messages_accumulate_in_the_same_thread(client, make_user):
+def test_messages_accumulate_in_the_same_thread(client, make_user, stub_llm):
     headers, _ = make_user("thread@rihla.app")
     first = client.post("/chat", headers=headers, json={"message": "hello"})
     conversation_id = frames(first)[0]["data"]["conversation_id"]
@@ -255,7 +256,7 @@ def test_messages_accumulate_in_the_same_thread(client, make_user):
 # --- threads and unread ------------------------------------------------------------------------
 
 
-def test_a_new_message_marks_the_thread_unread_until_it_is_seen(client, make_user):
+def test_a_new_message_marks_the_thread_unread_until_it_is_seen(client, make_user, stub_llm):
     headers, _ = make_user("unread@rihla.app")
     conversation_id = frames(client.post("/chat", headers=headers, json={"message": "hi"}))[0][
         "data"
@@ -268,7 +269,7 @@ def test_a_new_message_marks_the_thread_unread_until_it_is_seen(client, make_use
     assert client.get("/conversations", headers=headers).json()[0]["unread"] is False
 
 
-def test_threads_are_private_to_their_owner(client, make_user):
+def test_threads_are_private_to_their_owner(client, make_user, stub_llm):
     headers, _ = make_user("owner@rihla.app")
     intruder, _ = make_user("intruder@rihla.app")
     conversation_id = frames(client.post("/chat", headers=headers, json={"message": "secret"}))[0][
@@ -293,7 +294,7 @@ def test_chat_requires_authentication(client):
 # --- binding a thread to a plan ----------------------------------------------------------------
 
 
-def test_a_thread_can_be_renamed_and_bound_to_its_plan(client, make_user):
+def test_a_thread_can_be_renamed_and_bound_to_its_plan(client, make_user, stub_llm):
     """The rail shows the event's initial, so a generated plan renames its thread."""
     headers, _ = make_user("bind@rihla.app")
     conversation_id = frames(client.post("/chat", headers=headers, json={"message": "hi"}))[0][
@@ -310,7 +311,7 @@ def test_a_thread_can_be_renamed_and_bound_to_its_plan(client, make_user):
     assert client.get("/conversations", headers=headers).json()[0]["title"] == "Anniversary weekend"
 
 
-def test_a_thread_cannot_be_bound_to_another_users_plan(client, make_user, db):
+def test_a_thread_cannot_be_bound_to_another_users_plan(client, make_user, db, stub_llm):
     """Otherwise a thread could be used to read a plan its owner never created."""
     from app.models import Itinerary
 
@@ -452,3 +453,43 @@ def test_the_system_prompt_forbids_quoting_figures_from_memory(db, orchestrator)
     prompt = orchestrator().system_prompt()
     assert "Never quote a time, a price or a total from memory" in prompt
     assert "get_itinerary" in prompt
+
+
+def test_a_model_failure_surfaces_as_an_error_frame(client, make_user, monkeypatch):
+    """With no fallback, a failed assistant must be reported — never silently swallowed."""
+    from app.services.orchestrator import ChatOrchestrator
+
+    def boom(self, user_message: str):
+        raise RuntimeError("upstream is down")
+        yield  # pragma: no cover — makes this a generator
+
+    monkeypatch.setattr(ChatOrchestrator, "_llm", boom)
+
+    headers, _ = make_user("broken@rihla.app")
+    response = client.post("/chat", headers=headers, json={"message": "hello"})
+    events = frames(response)
+    types = [event["type"] for event in events]
+
+    assert response.status_code == 200, "the stream must not 500 mid-flight"
+    assert "error" in types
+    assert types[-1] == "done"
+    assert events[-1]["data"]["failed"] is True
+    assert "upstream is down" in next(e["data"]["message"] for e in events if e["type"] == "error")
+
+
+def test_the_users_message_is_kept_even_when_the_assistant_fails(client, make_user, monkeypatch):
+    """Losing what the user typed because the model fell over would be its own bug."""
+    from app.services.orchestrator import ChatOrchestrator
+
+    def boom(self, user_message: str):
+        raise RuntimeError("upstream is down")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(ChatOrchestrator, "_llm", boom)
+
+    headers, _ = make_user("kept@rihla.app")
+    response = client.post("/chat", headers=headers, json={"message": "remember this"})
+    conversation_id = frames(response)[0]["data"]["conversation_id"]
+
+    history = client.get(f"/conversations/{conversation_id}/messages", headers=headers).json()
+    assert [m["content"] for m in history] == ["remember this"]

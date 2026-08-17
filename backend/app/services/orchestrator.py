@@ -8,9 +8,8 @@ address another user even if a prompt tries to make it.
 The LLM never builds an itinerary. `generate_itinerary` calls the deterministic planner; the model
 only decides when to call it and how to phrase the result.
 
-With no OpenAI key — or when the API fails — this falls back to a rule-based responder that still
-answers the core intents and hands the user to the form-based intake, so the product keeps working
-(acceptance criterion 6).
+The assistant is a hard dependency: OPENAI_API_KEY is required, and a failed call surfaces as an
+error rather than degrading to a scripted responder.
 """
 
 from __future__ import annotations
@@ -506,17 +505,9 @@ class ChatOrchestrator:
     def stream(self, user_message: str) -> Iterator[str]:
         self.record("user", user_message)
         self.db.commit()
-
-        if not settings.openai_api_key:
-            yield from self._rule_based(user_message)
-            return
-
-        try:
-            yield from self._llm(user_message)
-        except Exception as exc:  # noqa: BLE001 — degrade, never 500 mid-stream
-            log.exception("chat stream failed; degrading to rule-based")
-            yield sse("notice", {"message": "The assistant is unavailable; using the basic planner."})
-            yield from self._rule_based(user_message, error=str(exc))
+        # A failure here propagates to the router, which turns it into an `error` frame. The
+        # assistant is a hard dependency, so a failure is reported rather than worked around.
+        yield from self._llm(user_message)
 
     def _llm(self, user_message: str) -> Iterator[str]:
         from openai import OpenAI
@@ -606,83 +597,3 @@ class ChatOrchestrator:
         yield sse("itinerary_updated", {"itinerary_id": self.touched_itinerary.id})
         yield sse("budget_updated", payload["budget"])
 
-    # --- fallback ----------------------------------------------------------------------------
-
-    def _rule_based(self, user_message: str, error: str | None = None) -> Iterator[str]:
-        """Keeps the product usable with the LLM down (acceptance criterion 6).
-
-        Deliberately narrow: it answers the two questions that matter without one, and otherwise
-        points at the form intake rather than pretending to converse.
-        """
-        text = user_message.lower()
-        reply: str
-
-        if re.search(r"\b(upcoming|coming up|events?|calendar|what.s next)\b", text):
-            events = self._get_upcoming_events({"horizon_days": 120})["events"]
-            if not events:
-                reply = "You have no upcoming events yet. Add one and I can plan around it."
-            else:
-                lines = [
-                    f"• {event['title']} — {event['date']} ({event['days_away']} days away)"
-                    + ("" if event["planned"] else " · not planned yet")
-                    for event in events
-                ]
-                unplanned = [event for event in events if not event["planned"]]
-                lines.append("")
-                if unplanned:
-                    lines.append(f"Want me to plan an itinerary for {unplanned[0]['title']}?")
-                reply = "Here's what's coming up:\n" + "\n".join(lines)
-
-        elif re.search(r"\b(summar|recap|what.s in|current plan|my plan|cost|total|budget)\b", text):
-            current = self._get_itinerary({})
-            if current.get("itinerary_id") is None:
-                reply = "There's no plan yet. Pick an event and a budget and I'll generate one."
-            else:
-                lines = [f"**{current['title']}** — {current['num_days']} days"]
-                for day in current["days"]:
-                    lines.append(
-                        f"\n**Day {day['day']} · {day['theme']}** — "
-                        f"{current['currency']} {day['subtotal']:,.0f}"
-                    )
-                    lines += [
-                        f"- {stop['start']}–{stop['end']} {stop['name']} "
-                        f"({current['currency']} {stop['cost']:,.0f})"
-                        for stop in day["stops"]
-                    ]
-                budget = current["budget"]
-                state = "over" if budget["over_budget"] else "left"
-                lines.append(
-                    f"\n**Total: {current['currency']} {budget['total']:,.0f}** of "
-                    f"{budget['cap']:,.0f} — {current['currency']} "
-                    f"{abs(budget['remaining']):,.0f} {state}."
-                )
-                reply = "\n".join(lines)
-
-        elif re.search(r"\b(plan|itinerary|trip)\b", text):
-            missing = itinerary_service.missing_intake_fields(self.db, self.user)
-            if missing:
-                reply = (
-                    "I can plan that, but I still need: "
-                    + ", ".join(field.replace("_", " ") for field in missing)
-                    + ". Fill those in and I'll build it."
-                )
-            else:
-                reply = (
-                    "The assistant is offline, so I can't chat this through — but planning still "
-                    "works. Pick an event and a budget in the panel and I'll generate it."
-                )
-        else:
-            reply = (
-                "The assistant is offline right now. You can still add events, set your family "
-                "details and generate a full itinerary from the panel — everything except the "
-                "conversation keeps working."
-            )
-            if error:
-                log.info("rule-based fallback after error: %s", error)
-
-        for chunk in re.findall(r"\S+\s*", reply):
-            yield sse("token", chunk)
-
-        self.record("assistant", reply)
-        self.db.commit()
-        yield sse("done", {"conversation_id": self.conversation.id, "degraded": True})

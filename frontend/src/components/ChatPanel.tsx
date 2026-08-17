@@ -197,9 +197,6 @@ export function ChatPanel() {
           case 'budget_updated':
             applyBudget(event.data)
             break
-          case 'notice':
-            setNotice(event.data.message)
-            break
           case 'error':
             setNotice(event.data.message)
             break

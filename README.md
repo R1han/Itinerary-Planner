@@ -5,8 +5,8 @@ with per-user family personalisation, long-term preference memory, budget tracki
 travel-time-aware scheduling.
 
 **Core principle: the LLM never builds the itinerary.** It extracts intent from chat and calls
-tools; a deterministic Python planner assembles and validates the schedule. The app keeps working
-with the assistant, the maps API, or both switched off.
+tools; a deterministic Python planner assembles and validates the schedule. Planning itself stays
+correct when the maps API is down.
 
 ---
 
@@ -42,7 +42,7 @@ account's likes influence the other's scoring.
 | Variable | Required | Absence means |
 |---|---|---|
 | `JWT_SECRET` | **yes** | A dev-only default is used; unsafe in production |
-| `OPENAI_API_KEY` | to seed | `app.seed` exits non-zero rather than seeding a catalog without embeddings. At runtime, chat degrades to form-based intake and retrieval to SQL keyword scoring |
+| `OPENAI_API_KEY` | **yes** | Required to seed (embeddings) and to run the assistant. Chat has no scripted fallback — a failed call is reported as an error |
 | `ORS_API_KEY` | no | Travel times fall back to haversine estimates, drawn as dashed `~35 min` segments |
 | `WEB_SEARCH_API_KEY` | no | Live one-off event lookup is skipped; seeded data only |
 | `LANGSMITH_API_KEY` | no | Tracing decorators become transparent no-ops |
@@ -91,7 +91,7 @@ segments ORS cannot route degrade to dashed estimates.
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest        # 179 tests, ~55s
+cd backend && .venv/bin/python -m pytest        # 179 tests, ~55s (the model is stubbed)
 cd frontend && npm run build                    # tsc + vite, clean
 ```
 
@@ -137,3 +137,8 @@ down a file cannot leave a half-applied import. Idempotent on `(user_id, title, 
 - **Web search needs both keys.** Tavily finds the pages; extracting an event name out of scraped
   page chrome needs comprehension, so without `OPENAI_API_KEY` the adapter returns nothing rather
   than feeding the planner regex noise.
+- **The assistant is a hard dependency.** Spec §1.11 and acceptance criterion 6 called for the app
+  to keep working with the LLM switched off, via a scripted responder. That was built and then
+  removed at the project's request, on the basis that the key will always be present. Chat now
+  reports a failure rather than working around it. The planner, the validator, the budget and the
+  form-based plan intake are all unaffected — none of them ever called the model.

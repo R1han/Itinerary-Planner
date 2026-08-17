@@ -1,8 +1,8 @@
 /** Events CRUD, family/preferences, and the form-based plan intake.
  *
  *  None of these screens exist in the design mock — the mock covers the workspace only. They are
- *  built from the same tokens rather than a second visual language, and the plan form is the
- *  documented fallback when the assistant is unavailable (spec §8, acceptance criterion 6).
+ *  built from the same tokens rather than a second visual language. The plan form is a first-class
+ *  way to generate a trip without conversing, not a fallback.
  */
 
 import { useEffect, useState } from 'react'
