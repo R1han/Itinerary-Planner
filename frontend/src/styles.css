@@ -745,6 +745,89 @@ a:hover {
   color: var(--ink);
 }
 
+/* The assistant's activity trace: one row per tool call. Deliberately quiet — it is context for
+ * the reply, not the reply itself, so it sits at the same indent as a bubble but reads lighter. */
+.trace {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-left: 39px;
+}
+
+.trace__row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--ink-5);
+  padding: 3px 0;
+}
+
+.trace__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  flex: none;
+  color: var(--ink-38);
+  align-self: center;
+}
+
+/* The cog turns while its tool is still running, and stops when the row resolves. */
+.trace__row:not(.trace__row--done) .trace__icon {
+  animation: trace-spin 2.4s linear infinite;
+}
+
+@keyframes trace-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.trace__row--done .trace__icon {
+  color: var(--teal);
+}
+
+.trace__row--failed .trace__icon {
+  color: var(--coral-dark);
+}
+
+.trace__label {
+  font-weight: 600;
+  color: var(--ink-6);
+}
+
+.trace__detail {
+  color: var(--ink-45);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace__outcome {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--teal-tint);
+  color: var(--teal);
+  font-weight: 600;
+  font-size: 11px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.trace__row--failed .trace__outcome {
+  background: var(--coral-tint-2);
+  color: var(--coral-dark);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trace__row .trace__icon {
+    animation: none;
+  }
+}
+
 .suggestions {
   display: flex;
   flex-wrap: wrap;

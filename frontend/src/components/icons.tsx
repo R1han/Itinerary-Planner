@@ -208,6 +208,24 @@ export function Trash({ size = 14, color = '#B4552E' }: IconProps) {
   )
 }
 
+export function Check({ size = 13, color }: IconProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke={stroke(color)}
+      strokeWidth="2.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M5 12.5l4.5 4.5L19 7.5" />
+    </svg>
+  )
+}
+
 export function Close({ size = 15, color }: IconProps) {
   return (
     <svg

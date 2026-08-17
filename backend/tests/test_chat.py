@@ -515,3 +515,122 @@ def test_a_blocked_intake_is_surfaced_to_the_client(client, make_user, monkeypat
 
     checklist = next(e for e in events if e["type"] == "intake_required")
     assert "adults" in checklist["data"]["missing_fields"]
+
+
+# --- the activity trace ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "label", "detail"),
+    [
+        (
+            "save_family_details",
+            {"adults": 2, "children_ages": [6, 13], "dislikes": ["loud rides"]},
+            "Saving your family details",
+            "2 adults · 2 children aged 6, 13 · dislikes loud rides",
+        ),
+        ("save_family_details", {"adults": 1}, "Saving your family details", "1 adult"),
+        ("get_upcoming_events", {"horizon_days": 30}, "Checking your calendar", "next 30 days"),
+        ("get_upcoming_events", {}, "Checking your calendar", "next 60 days"),
+        (
+            "generate_itinerary",
+            {"days": 3, "budget": 2500, "prayer_breaks": True},
+            "Building your itinerary",
+            "3 days · AED 2,500 · with prayer breaks",
+        ),
+        ("get_itinerary", {}, "Reading the current plan", None),
+        (
+            "record_preference",
+            {"kind": "dislike", "subject": "long queues"},
+            "Noting a preference",
+            "dislikes long queues",
+        ),
+        (
+            "create_event",
+            {"title": "Aisha's birthday", "date": "2026-08-29"},
+            "Adding an event",
+            "Aisha's birthday · 2026-08-29",
+        ),
+    ],
+)
+def test_a_tool_call_is_described_in_plain_language(name, args, label, detail):
+    from app.services.orchestrator import describe_tool_call
+
+    assert describe_tool_call(name, args) == (label, detail)
+
+
+def test_an_unknown_tool_still_gets_a_readable_label():
+    from app.services.orchestrator import describe_tool_call
+
+    assert describe_tool_call("some_new_tool", {}) == ("Some new tool", None)
+
+
+def test_describing_a_call_never_raises_on_odd_arguments():
+    """The trace is cosmetic; malformed arguments must not take the stream down with them."""
+    from app.services.orchestrator import describe_tool_call
+
+    for args in ({}, {"adults": None}, {"children_ages": [None]}, {"budget": "lots"}):
+        label, _ = describe_tool_call("generate_itinerary", args)
+        assert label
+        describe_tool_call("save_family_details", args)
+
+
+@pytest.mark.parametrize(
+    ("name", "result", "outcome"),
+    [
+        ("get_upcoming_events", {"events": [1, 2, 3]}, "3 events"),
+        ("get_upcoming_events", {"events": [1]}, "1 event"),
+        ("generate_itinerary", {"total": 1574.41, "cap": 2500}, "AED 1,574 of AED 2,500"),
+        (
+            "generate_itinerary",
+            {"error": "intake_incomplete", "missing_fields": ["adults", "start_location"]},
+            "needs adults, start location",
+        ),
+        ("get_itinerary", {"itinerary": None}, "no plan yet"),
+        # The populated shape carries itinerary_id and no "itinerary" key at all — the reason the
+        # first version of this reported "no plan yet" for every successful read.
+        (
+            "get_itinerary",
+            {"itinerary_id": 4, "days": [1, 2, 3], "budget": {"total": 1559.98}},
+            "3 days · AED 1,560",
+        ),
+        ("create_event", {"created": True}, "added"),
+        ("create_event", {"created": False}, "already on your calendar"),
+        ("record_preference", {"recorded": True}, "noted"),
+    ],
+)
+def test_a_tool_result_is_summarised_for_the_trace(name, result, outcome):
+    from app.services.orchestrator import summarise_tool_result
+
+    assert summarise_tool_result(name, result) == outcome
+
+
+def test_the_stream_pairs_every_tool_frame_with_a_result(client, make_user, monkeypatch):
+    """A row that starts and never resolves reads as a hang."""
+    from app.services.orchestrator import ChatOrchestrator, describe_tool_call, sse
+    from app.services.orchestrator import summarise_tool_result as summarise
+
+    def fake_llm(self, user_message: str):
+        del user_message
+        args = {"horizon_days": 30}
+        label, detail = describe_tool_call("get_upcoming_events", args)
+        yield sse("tool", {"id": "c1", "name": "get_upcoming_events", "label": label, "detail": detail})
+        result = self.call_tool("get_upcoming_events", args)
+        yield sse("tool_done", {"id": "c1", "outcome": summarise("get_upcoming_events", result), "failed": False})
+        self.record("assistant", "Nothing coming up.")
+        self.db.commit()
+        yield sse("done", {"conversation_id": self.conversation.id})
+
+    monkeypatch.setattr(ChatOrchestrator, "_llm", fake_llm)
+
+    headers, _ = make_user("trace@rihla.app")
+    events = frames(client.post("/chat", headers=headers, json={"message": "what's on?"}))
+
+    started = [e for e in events if e["type"] == "tool"]
+    finished = [e for e in events if e["type"] == "tool_done"]
+
+    assert len(started) == len(finished) == 1
+    assert started[0]["data"]["label"] == "Checking your calendar"
+    assert started[0]["data"]["detail"] == "next 30 days"
+    assert finished[0]["data"]["id"] == started[0]["data"]["id"]
+    assert finished[0]["data"]["outcome"] == "0 events"

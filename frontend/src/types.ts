@@ -197,12 +197,26 @@ export interface ChatMessage {
 export type StreamEvent =
   | { type: 'conversation'; data: { conversation_id: number; title: string } }
   | { type: 'token'; data: string }
-  | { type: 'tool'; data: { name: string } }
+  | {
+      type: 'tool'
+      data: { id: string; name: string; label: string; detail: string | null }
+    }
+  | { type: 'tool_done'; data: { id: string; outcome: string; failed: boolean } }
   | { type: 'itinerary_updated'; data: { itinerary_id: number } }
   | { type: 'budget_updated'; data: Budget }
   | { type: 'intake_required'; data: { missing_fields: string[] } }
   | { type: 'error'; data: { message: string } }
   | { type: 'done'; data: { conversation_id: number; failed?: boolean } }
+
+/** One row in the chat's activity trace: what the assistant is doing and with what inputs. */
+export interface ToolActivity {
+  id: string
+  name: string
+  label: string
+  detail: string | null
+  outcome: string | null
+  failed: boolean
+}
 
 export interface IntakeError {
   error: 'intake_incomplete'

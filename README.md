@@ -66,7 +66,7 @@ React + TypeScript (Vite)                    FastAPI
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest        # 180 tests, ~55s (the model is stubbed)
+cd backend && .venv/bin/python -m pytest        # 200 tests, ~55s (the model is stubbed)
 cd frontend && npm run build                    # tsc + vite, clean
 ```
 

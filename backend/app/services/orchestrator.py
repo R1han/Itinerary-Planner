@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Iterator
 from datetime import date, timedelta
 
@@ -162,6 +161,102 @@ TOOLS = [
 def sse(event_type: str, data) -> str:
     """One Server-Sent Event frame."""
     return f"data: {json.dumps({'type': event_type, 'data': data}, default=str)}\n\n"
+
+
+def _count(items, singular: str, plural: str | None = None) -> str:
+    n = len(items)
+    return f"{n} {singular if n == 1 else (plural or singular + 's')}"
+
+
+def _money(amount, currency: str = "AED") -> str:
+    try:
+        return f"{currency} {float(amount):,.0f}"
+    except (TypeError, ValueError):
+        return f"{currency} —"
+
+
+def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
+    """A human label and a short summary of the inputs, for the activity row in the chat.
+
+    Written here rather than in the client: the server already knows what these arguments mean,
+    and phrasing them in one place keeps the wording testable and the client free of a second
+    copy of the domain vocabulary.
+    """
+    if name == "save_family_details":
+        bits: list[str] = []
+        adults = args.get("adults")
+        if adults:
+            bits.append(_count([None] * int(adults), "adult"))
+        ages = [a for a in (args.get("children_ages") or []) if a is not None]
+        if ages:
+            bits.append(f"{_count(ages, 'child', 'children')} aged {', '.join(str(a) for a in ages)}")
+        if args.get("likes"):
+            bits.append("likes " + ", ".join(str(x) for x in args["likes"][:3]))
+        if args.get("dislikes"):
+            bits.append("dislikes " + ", ".join(str(x) for x in args["dislikes"][:3]))
+        return "Saving your family details", " · ".join(bits) or None
+
+    if name == "create_event":
+        detail = " · ".join(str(x) for x in (args.get("title"), args.get("date")) if x)
+        return "Adding an event", detail or None
+
+    if name == "get_upcoming_events":
+        return "Checking your calendar", f"next {int(args.get('horizon_days', 60))} days"
+
+    if name == "generate_itinerary":
+        bits = []
+        if args.get("days"):
+            bits.append(f"{int(args['days'])} days")
+        if args.get("budget"):
+            bits.append(_money(args["budget"]))
+        if args.get("start_date"):
+            bits.append(f"from {args['start_date']}")
+        if args.get("prayer_breaks"):
+            bits.append("with prayer breaks")
+        return "Building your itinerary", " · ".join(bits) or None
+
+    if name == "get_itinerary":
+        return "Reading the current plan", None
+
+    if name == "record_preference":
+        kind = str(args.get("kind", "like"))
+        subject = str(args.get("subject", "")).strip()
+        verb = "likes" if kind == "like" else "dislikes"
+        return "Noting a preference", f"{verb} {subject}" if subject else None
+
+    return name.replace("_", " ").capitalize(), None
+
+
+def summarise_tool_result(name: str, result: dict) -> str:
+    """One phrase describing what the tool did, so the row resolves instead of hanging."""
+    if not isinstance(result, dict):
+        return "done"
+
+    if result.get("error") == "intake_incomplete":
+        missing = ", ".join(str(f).replace("_", " ") for f in result.get("missing_fields", []))
+        return f"needs {missing}" if missing else "more detail needed"
+    if result.get("error"):
+        return str(result["error"])[:120]
+
+    if name == "get_upcoming_events":
+        return _count(result.get("events", []), "event")
+    if name == "generate_itinerary":
+        return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
+    if name == "get_itinerary":
+        # Keyed on itinerary_id, not on an "itinerary" key: the populated shape has no such key,
+        # so `.get("itinerary") is None` was true in both cases and every successful read was
+        # labelled "no plan yet" while the model was in fact working from real figures.
+        if result.get("itinerary_id") is None:
+            return "no plan yet"
+        budget = result.get("budget") or {}
+        return f"{_count(result.get('days', []), 'day')} · {_money(budget.get('total'))}"
+    if name == "create_event":
+        return "added" if result.get("created") else "already on your calendar"
+    if name == "save_family_details":
+        return "saved"
+    if name == "record_preference":
+        return "noted"
+    return "done"
 
 
 class ChatOrchestrator:
@@ -573,9 +668,23 @@ class ChatOrchestrator:
                     arguments = json.loads(call["arguments"] or "{}")
                 except json.JSONDecodeError:
                     arguments = {}
-                yield sse("tool", {"name": call["name"]})
+                label, detail = describe_tool_call(call["name"], arguments)
+                yield sse(
+                    "tool",
+                    {"id": call["id"], "name": call["name"], "label": label, "detail": detail},
+                )
+
                 result = self.call_tool(call["name"], arguments)
                 self.db.commit()
+
+                yield sse(
+                    "tool_done",
+                    {
+                        "id": call["id"],
+                        "outcome": summarise_tool_result(call["name"], result),
+                        "failed": bool(isinstance(result, dict) and result.get("error")),
+                    },
+                )
 
                 # Surface a blocked intake to the client as well as to the model, so the chat can
                 # render the numbered checklist from the design. The model will also ask in prose;

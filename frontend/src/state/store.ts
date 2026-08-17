@@ -10,6 +10,7 @@ import type {
   Day,
   Itinerary,
   Suggestion,
+  ToolActivity,
   User,
 } from '../types'
 
@@ -36,6 +37,7 @@ interface State {
   messages: ChatMessage[]
   streaming: boolean
   streamedText: string
+  toolActivity: ToolActivity[]
   notice: string | null
 
   // selection shared by strip and map
@@ -67,6 +69,9 @@ interface Actions {
   appendMessage: (message: ChatMessage) => void
   setStreaming: (streaming: boolean) => void
   setStreamedText: (updater: (previous: string) => string) => void
+  startToolActivity: (activity: Omit<ToolActivity, 'outcome' | 'failed'>) => void
+  finishToolActivity: (id: string, outcome: string, failed: boolean) => void
+  clearToolActivity: () => void
   setNotice: (notice: string | null) => void
 
   setSelectedDay: (day: number) => void
@@ -94,6 +99,7 @@ export const useStore = create<State & Actions>((set, get) => ({
   messages: [],
   streaming: false,
   streamedText: '',
+  toolActivity: [],
   notice: null,
 
   selectedDay: 0,
@@ -216,7 +222,7 @@ export const useStore = create<State & Actions>((set, get) => ({
   },
 
   async selectConversation(id) {
-    set({ conversationId: id, streamedText: '', notice: null })
+    set({ conversationId: id, streamedText: '', toolActivity: [], notice: null })
     try {
       const [messages] = await Promise.all([api.messages(id), api.markSeen(id)])
       set({
@@ -260,6 +266,22 @@ export const useStore = create<State & Actions>((set, get) => ({
 
   setStreamedText(updater) {
     set({ streamedText: updater(get().streamedText) })
+  },
+
+  startToolActivity(activity) {
+    set({ toolActivity: [...get().toolActivity, { ...activity, outcome: null, failed: false }] })
+  },
+
+  finishToolActivity(id, outcome, failed) {
+    set({
+      toolActivity: get().toolActivity.map((entry) =>
+        entry.id === id ? { ...entry, outcome, failed } : entry,
+      ),
+    })
+  },
+
+  clearToolActivity() {
+    set({ toolActivity: [] })
   },
 
   setNotice(notice) {

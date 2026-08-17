@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { api, streamChat } from '../api/client'
 import { useStore } from '../state/store'
 import type { ChatMessage, StreamEvent } from '../types'
-import { Arrow, Chevron, Sparkle } from './icons'
+import { Arrow, Check, Chevron, Gear, Sparkle } from './icons'
 import { Markdown } from './Markdown'
 
 /** The mock renders each day theme as a coloured chip; the palette cycles per day. */
@@ -38,6 +38,36 @@ function Bubble({ message }: { message: ChatMessage }) {
       <div className="bubble bubble--assistant">
         <Markdown>{message.content}</Markdown>
       </div>
+    </div>
+  )
+}
+
+/** What the assistant is doing, and with what inputs — one row per tool call.
+ *
+ *  Tool calls are otherwise invisible: the assistant goes quiet for several seconds while a plan
+ *  is built, and this is the difference between "thinking" and "stuck". Labels and outcomes come
+ *  from the server, which already knows what the arguments mean. */
+function ToolTrace() {
+  const activity = useStore((s) => s.toolActivity)
+  if (!activity.length) return null
+
+  return (
+    <div className="trace" role="status" aria-label="Assistant activity">
+      {activity.map((entry) => (
+        <div
+          key={entry.id}
+          className={`trace__row${entry.outcome ? ' trace__row--done' : ''}${
+            entry.failed ? ' trace__row--failed' : ''
+          }`}
+        >
+          <span className="trace__icon">
+            {entry.outcome ? <Check size={12} /> : <Gear size={12} />}
+          </span>
+          <span className="trace__label">{entry.label}</span>
+          {entry.detail && <span className="trace__detail">{entry.detail}</span>}
+          {entry.outcome && <span className="trace__outcome">{entry.outcome}</span>}
+        </div>
+      ))}
     </div>
   )
 }
@@ -142,6 +172,9 @@ export function ChatPanel() {
   const setStreaming = useStore((s) => s.setStreaming)
   const streamedText = useStore((s) => s.streamedText)
   const setStreamedText = useStore((s) => s.setStreamedText)
+  const startToolActivity = useStore((s) => s.startToolActivity)
+  const finishToolActivity = useStore((s) => s.finishToolActivity)
+  const clearToolActivity = useStore((s) => s.clearToolActivity)
   const notice = useStore((s) => s.notice)
   const setNotice = useStore((s) => s.setNotice)
   const loadItinerary = useStore((s) => s.loadItinerary)
@@ -157,6 +190,9 @@ export function ChatPanel() {
   const active = conversations.find((c) => c.id === conversationId)
   const others = conversations.filter((c) => c.id !== conversationId)
   const unreadCount = others.filter((c) => c.unread).length
+  // The trace belongs to the turn it describes, so it renders under the last thing the user said
+  // — above the reply, whether that reply is still streaming or already finished.
+  const lastUserIndex = messages.map((m) => m.role).lastIndexOf('user')
 
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: 'smooth' })
@@ -169,6 +205,7 @@ export function ChatPanel() {
     setDraft('')
     setNotice(null)
     setIntakeFields([])
+    clearToolActivity()
     appendMessage({
       id: Date.now(),
       role: 'user',
@@ -190,6 +227,12 @@ export function ChatPanel() {
           case 'token':
             assistant += event.data
             setStreamedText((previous) => previous + event.data)
+            break
+          case 'tool':
+            startToolActivity(event.data)
+            break
+          case 'tool_done':
+            finishToolActivity(event.data.id, event.data.outcome, event.data.failed)
             break
           case 'itinerary_updated':
             void loadItinerary(event.data.itinerary_id)
@@ -285,8 +328,11 @@ export function ChatPanel() {
           </div>
         )}
 
-        {messages.map((message) => (
-          <Bubble key={message.id} message={message} />
+        {messages.map((message, index) => (
+          <Fragment key={message.id}>
+            <Bubble message={message} />
+            {index === lastUserIndex && <ToolTrace />}
+          </Fragment>
         ))}
 
         {streaming && <StreamingBubble text={streamedText} />}
