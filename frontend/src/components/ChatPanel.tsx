@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { api, streamChat } from '../api/client'
 import { useStore } from '../state/store'
 import type { ChatMessage, StreamEvent } from '../types'
-import { Arrow, Chevron, Plus, Sparkle } from './icons'
+import { Arrow, Chevron, Sparkle } from './icons'
+import { Markdown } from './Markdown'
 
 /** The mock renders each day theme as a coloured chip; the palette cycles per day. */
 function DayChips() {
@@ -35,7 +36,7 @@ function Bubble({ message }: { message: ChatMessage }) {
         <Sparkle size={13} />
       </div>
       <div className="bubble bubble--assistant">
-        <p style={{ whiteSpace: 'pre-wrap' }}>{message.content}</p>
+        <Markdown>{message.content}</Markdown>
       </div>
     </div>
   )
@@ -48,10 +49,10 @@ function StreamingBubble({ text }: { text: string }) {
         <Sparkle size={13} />
       </div>
       <div className="bubble bubble--assistant">
-        <p style={{ whiteSpace: 'pre-wrap' }}>
-          {text}
-          <span className="caret" />
-        </p>
+        {/* Partial markdown mid-stream renders as literal text until its syntax closes, which is
+            the least surprising thing it can do while tokens are still arriving. */}
+        <Markdown>{text}</Markdown>
+        <span className="caret" />
       </div>
     </div>
   )
@@ -332,7 +333,6 @@ export function ChatPanel() {
 
       <div className="composer">
         <div className="composer__box">
-          <Plus size={18} color="rgba(31,42,42,.4)" />
           <input
             value={draft}
             onChange={(event) => setDraft(event.target.value)}

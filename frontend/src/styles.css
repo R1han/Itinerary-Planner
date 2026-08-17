@@ -567,6 +567,110 @@ a:hover {
   }
 }
 
+/* Assistant messages arrive as markdown. Everything here is scaled down: a bubble is a small
+ * surface, so an <h3> that shouts would break the conversation's rhythm. */
+.md > *:first-child {
+  margin-top: 0;
+}
+
+.md > *:last-child {
+  margin-bottom: 0;
+}
+
+.md p {
+  margin: 0 0 8px;
+}
+
+.md__h {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.md ul,
+.md ol {
+  margin: 6px 0 8px;
+  padding-left: 20px;
+}
+
+.md li {
+  margin: 3px 0;
+}
+
+.md li::marker {
+  color: var(--ink-45);
+}
+
+.md strong {
+  font-weight: 700;
+}
+
+.md em {
+  font-style: italic;
+}
+
+.md code {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 0.86em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--track);
+}
+
+.md pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--track);
+  overflow-x: auto;
+}
+
+.md pre code {
+  padding: 0;
+  background: none;
+}
+
+.md blockquote {
+  margin: 8px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--ink-16);
+  color: var(--ink-65);
+}
+
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--ink-12);
+  margin: 12px 0;
+}
+
+.md__scroll {
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.md table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--ink-12);
+  padding: 5px 9px;
+  text-align: left;
+}
+
+.md th {
+  background: var(--track);
+  font-weight: 700;
+}
+
+/* The caret follows the rendered markdown rather than sitting inside a paragraph. */
+.bubble--assistant .md + .caret {
+  vertical-align: -2px;
+}
+
 .intake {
   display: flex;
   flex-direction: column;
