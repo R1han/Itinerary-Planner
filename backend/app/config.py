@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     ors_api_key: str | None = None
     ors_timeout_seconds: float = 2.0
 
+    # --- web search (optional; live one-off events only) -------------------------
+    web_search_api_key: str | None = None
+
     # --- observability (LangSmith; entirely optional) ----------------------------
     langsmith_api_key: str | None = None
     langsmith_project: str = "rihla-itinerary-planner"

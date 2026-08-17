@@ -44,6 +44,7 @@ account's likes influence the other's scoring.
 | `JWT_SECRET` | **yes** | A dev-only default is used; unsafe in production |
 | `OPENAI_API_KEY` | to seed | `app.seed` exits non-zero rather than seeding a catalog without embeddings. At runtime, chat degrades to form-based intake and retrieval to SQL keyword scoring |
 | `ORS_API_KEY` | no | Travel times fall back to haversine estimates, drawn as dashed `~35 min` segments |
+| `WEB_SEARCH_API_KEY` | no | Live one-off event lookup is skipped; seeded data only |
 | `LANGSMITH_API_KEY` | no | Tracing decorators become transparent no-ops |
 | `VITE_MAPTILER_KEY` | no | The map falls back to OpenStreetMap tiles under the same palette filter |
 
@@ -79,14 +80,14 @@ cannot send an `Authorization` header.
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest        # 154 tests, ~50s
+cd backend && .venv/bin/python -m pytest        # 164 tests, ~50s
 cd frontend && npm run build                    # tsc + vite, clean
 ```
 
 Coverage includes the scheduler (overlaps, budget caps, opening hours, venues open past midnight,
 age constraints, meal placement), the travel provider (cache hit, timeout → haversine fallback),
 slot patching (neighbours' segments recomputed, whole-day revalidation, server-recomputed budget),
-per-user isolation, and seven hypothesis properties.
+per-user isolation, the web search adapter, and seven hypothesis properties.
 
 ## CLI: seeding one user's events
 
