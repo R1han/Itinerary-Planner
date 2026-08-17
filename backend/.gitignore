@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+rihla.db
+rihla.db-wal
+rihla.db-shm
+chroma/
+.pytest_cache/

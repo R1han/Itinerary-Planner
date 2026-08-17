@@ -1,0 +1,30 @@
+{
+  "demo1@rihla.app": [
+    {
+      "title": "Aisha's 7th birthday",
+      "event_type": "birthday",
+      "date": "2026-08-29",
+      "notes": "loves animals, afraid of loud rides"
+    },
+    {
+      "title": "Wedding anniversary",
+      "event_type": "anniversary",
+      "date": "2026-09-14",
+      "notes": "dinner, just the two of us"
+    },
+    {
+      "title": "Cousins visiting from India",
+      "event_type": "family_visit",
+      "date": "2026-10-02",
+      "notes": "4 days, teens aged 14 and 16"
+    }
+  ],
+  "demo2@rihla.app": [
+    {
+      "title": "Anniversary weekend",
+      "event_type": "anniversary",
+      "date": "2026-09-20",
+      "notes": "two nights, no children, beach and fine dining"
+    }
+  ]
+}
