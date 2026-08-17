@@ -110,6 +110,10 @@ def seed_places(db: Session) -> int:
                 close_time=row.get("close_time", "22:00"),
                 avg_duration_min=row.get("avg_duration_min", 90),
                 tags=row.get("tags", []),
+                # Omitted in places.json when false/empty, which keeps the data file readable.
+                indoor=bool(row.get("indoor", False)),
+                booking_required=bool(row.get("booking_required", False)),
+                closed_months=row.get("closed_months", []),
                 kid_score=row.get("kid_score", 0.5),
                 teen_score=row.get("teen_score", 0.5),
                 romance_score=row.get("romance_score", 0.5),

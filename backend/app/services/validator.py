@@ -34,6 +34,7 @@ MAX_REPAIR_PASSES = 24
 SLOT_OVERLAP = "slot_overlap"
 TRAVEL_TIME_VIOLATED = "travel_time_violated"
 VENUE_CLOSED = "venue_closed"
+VENUE_CLOSED_SEASONALLY = "venue_closed_seasonally"
 MIN_AGE_NOT_MET = "min_age_not_met"
 BUDGET_EXCEEDED = "budget_exceeded"
 TOO_MANY_DAYS = "too_many_days"
@@ -76,6 +77,17 @@ def validate_day(day: DayPlan, profile: PartyProfile) -> list[Violation]:
                     day.day_index,
                     f"{place.name} is open {place.open_time}–{place.close_time} but the slot runs "
                     f"{to_hhmm(slot.start_min)}–{to_hhmm(slot.end_min)}",
+                    slot.position,
+                )
+            )
+
+        if not place.open_in_month(day.day_date.month):
+            violations.append(
+                Violation(
+                    VENUE_CLOSED_SEASONALLY,
+                    day.day_index,
+                    f"{place.name} is closed in "
+                    f"{day.day_date.strftime('%B')}",
                     slot.position,
                 )
             )

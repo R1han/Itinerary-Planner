@@ -20,13 +20,18 @@ from sqlalchemy.orm import Session
 
 from ..models import Place
 from . import vectors
-from .planner import PartyProfile, PlaceCandidate
+from .planner import TRIP_RADIUS_KM, PartyProfile, PlaceCandidate, haversine_km
 from .tracing import traced
 
 log = logging.getLogger(__name__)
 
-SHORTLIST_SIZE = 60
-SEMANTIC_POOL = 140
+SHORTLIST_SIZE = 80
+SEMANTIC_POOL = 200
+# Places held back for affordability rather than relevance. Similarity ranking is blind to price,
+# so on a large catalog the free beaches and cheap cafes stop making the shortlist at all — and
+# the planner then "gives up" on a tight budget when substitutions were available the whole time.
+CHEAP_RESERVE_DINING = 4
+CHEAP_RESERVE_OTHER = 10
 
 _STOPWORDS = frozenset(
     """a an and are as at be but by for from has have i in is it its of on or our that the their
@@ -52,6 +57,9 @@ def to_candidate(place: Place, similarity: float = 0.0) -> PlaceCandidate:
         close_time=place.close_time,
         avg_duration_min=place.avg_duration_min,
         tags=tuple(place.tags or ()),
+        indoor=bool(place.indoor),
+        booking_required=bool(place.booking_required),
+        closed_months=tuple(place.closed_months or ()),
         kid_score=place.kid_score,
         teen_score=place.teen_score,
         romance_score=place.romance_score,
@@ -117,11 +125,18 @@ def retrieve_candidates(
     limit: int = SHORTLIST_SIZE,
     max_price_per_adult: float | None = None,
     emirates: Sequence[str] | None = None,
+    origin: tuple[float, float] | None = None,
+    radius_km: float = TRIP_RADIUS_KM,
 ) -> list[PlaceCandidate]:
-    """Semantic pool → SQL hard filters → shortlist, ordered by similarity then breadth.
+    """Semantic pool → hard filters → shortlist, ordered by similarity then breadth.
 
-    The shortlist deliberately keeps a spread of categories: handing the planner sixty aquariums
-    because the query mentioned animals would starve it of meals and budget relief.
+    Geography is applied BEFORE shortlisting, not after. The planner also enforces a trip radius,
+    but by then the shortlist has already been chosen — so on a large catalog its slots get spent
+    on places two hours away and the day is left without a reachable lunch. Filtering here means
+    every shortlisted candidate is somewhere the trip could actually go.
+
+    The shortlist also keeps a spread of categories: handing the planner eighty aquariums because
+    the query mentioned animals would starve it of meals and budget relief.
     """
     statement = select(Place).where(Place.min_age <= profile.youngest_age)
     if emirates:
@@ -130,6 +145,16 @@ def retrieve_candidates(
         statement = statement.where(Place.price_adult <= max_price_per_adult)
 
     places = list(db.scalars(statement))
+    if origin is not None:
+        reachable = [
+            place
+            for place in places
+            if haversine_km(origin[0], origin[1], place.lat, place.lng) <= radius_km
+        ]
+        # Only honour the radius if it leaves a workable catalog; a remote start location should
+        # produce a longer drive, not an empty plan.
+        if len(reachable) >= limit:
+            places = reachable
     if not places:
         return []
 
@@ -162,7 +187,34 @@ def retrieve_candidates(
         chosen = {c.id for c in shortlist}
         shortlist.extend(c for c in ranked if c.id not in chosen)
 
-    return shortlist[:limit]
+    shortlist = shortlist[:limit]
+    return _with_budget_relief(shortlist, candidates)
+
+
+def _with_budget_relief(shortlist: list[PlaceCandidate], all_candidates: list[PlaceCandidate]):
+    """Guarantee the cheapest options survive shortlisting.
+
+    The catalog is built so that every category has budget entries, precisely so a tight cap is
+    met by substitution rather than failure (spec §10). That property is only useful if those
+    entries actually reach the planner, so the cheapest few are added back regardless of how they
+    ranked on similarity.
+    """
+    from .planner import DINING_CATEGORIES
+
+    chosen = {c.id for c in shortlist}
+
+    def cheapest(pool, count):
+        return sorted(pool, key=lambda c: (c.price_adult, c.price_child))[:count]
+
+    dining = [c for c in all_candidates if c.category in DINING_CATEGORIES]
+    other = [c for c in all_candidates if c.category not in DINING_CATEGORIES]
+
+    for candidate in cheapest(dining, CHEAP_RESERVE_DINING) + cheapest(other, CHEAP_RESERVE_OTHER):
+        if candidate.id not in chosen:
+            shortlist.append(candidate)
+            chosen.add(candidate.id)
+
+    return shortlist
 
 
 def query_for(profile: PartyProfile, event_title: str = "", notes: str = "") -> str:

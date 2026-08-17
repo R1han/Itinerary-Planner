@@ -152,6 +152,7 @@ class EventOut(ORMModel):
     date: dt.date
     notes: str | None
     planned: bool
+    place_id: int | None = None
 
 
 # --- places ----------------------------------------------------------------------------------
@@ -171,6 +172,9 @@ class PlaceOut(ORMModel):
     close_time: str
     avg_duration_min: int
     tags: list[str]
+    indoor: bool
+    booking_required: bool
+    closed_months: list[int]
     image_url: str | None
     category_icon: str | None
     description: str

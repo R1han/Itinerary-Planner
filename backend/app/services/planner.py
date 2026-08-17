@@ -32,12 +32,21 @@ MAX_WAIT_MIN = 40
 # A meal may start a little after its window closes, but not hours later: a "lunch" that a long
 # drive pushes to 15:50 is not lunch, and would misreport the day's shape to the user.
 MEAL_GRACE_MIN = 45
+# A meal becomes due slightly before its window opens. Without this, whatever is chosen at 11:57
+# starts at 12:20 and runs to 14:02, swallowing the lunch window whole — and lunch is then
+# recorded as missed despite nothing having eaten it.
+MEAL_LOOKAHEAD_MIN = 30
 # Per-day spend may exceed its even share by this much, as long as the trip total still fits.
 DAY_ENVELOPE_FLEX = 1.35
 # Score penalty per kilometre from the previous stop. Clustering decides which places belong to a
 # day; this decides the order within it, and is what stops a day hopping Abu Dhabi → Dubai →
 # Sharjah and spending more on taxis than on admission.
 PROXIMITY_PENALTY_PER_KM = 0.012
+# UAE summer. Between these hours in these months, an air-conditioned venue is worth a nudge —
+# the spec calls malls and indoor attractions the "midday heat fallback".
+HOT_MONTHS = frozenset({5, 6, 7, 8, 9})
+HEAT_WINDOW = (11 * 60, 16 * 60)
+INDOOR_HEAT_BONUS = 0.35
 # How far from the trip's start location a place may be and still be worth a day trip. The UAE is
 # small, so this still spans several emirates — it exists to stop a 7-year-old's birthday being
 # planned around a mountain two hours away because the scorer liked it.
@@ -97,10 +106,16 @@ class PlaceCandidate:
     close_time: str = "22:00"
     avg_duration_min: int = 90
     tags: tuple[str, ...] = ()
+    indoor: bool = False
+    booking_required: bool = False
+    closed_months: tuple[int, ...] = ()
     kid_score: float = 0.5
     teen_score: float = 0.5
     romance_score: float = 0.5
     similarity: float = 0.0
+
+    def open_in_month(self, month: int) -> bool:
+        return month not in self.closed_months
 
     @property
     def opens_at(self) -> int:
@@ -329,6 +344,33 @@ def attendees_clear_min_age(place: PlaceCandidate, profile: PartyProfile) -> boo
 # --- 3. geographic clustering ------------------------------------------------------------------
 
 
+def ensure_dining(
+    bucket: list[PlaceCandidate], dining_pool: Sequence[PlaceCandidate], minimum: int = 3
+) -> list[PlaceCandidate]:
+    """Top a day's cluster up with nearby restaurants if it has too few.
+
+    Clustering is geographic and blind to category, so a cluster can legitimately come out with no
+    dining in it at all — and that day then gets no lunch and no dinner, because the meal windows
+    have nothing to choose from. The nearest restaurants to that cluster are added back.
+    """
+    if not bucket:
+        return bucket
+
+    have = [p for p in bucket if p.category in DINING_CATEGORIES]
+    if len(have) >= minimum:
+        return bucket
+
+    present = {p.id for p in bucket}
+    centre_lat = sum(p.lat for p in bucket) / len(bucket)
+    centre_lng = sum(p.lng for p in bucket) / len(bucket)
+
+    nearest = sorted(
+        (p for p in dining_pool if p.id not in present),
+        key=lambda p: haversine_km(centre_lat, centre_lng, p.lat, p.lng),
+    )
+    return bucket + nearest[: minimum - len(have)]
+
+
 def cluster_by_proximity(
     candidates: Sequence[PlaceCandidate], num_days: int, origin: tuple[float, float]
 ) -> list[list[PlaceCandidate]]:
@@ -375,7 +417,7 @@ def cluster_by_proximity(
 def _meal_due(profile: PartyProfile, cursor: int, filled: set[str]) -> tuple[str, int, int] | None:
     for window in profile.meal_windows:
         label, start, end = window
-        if label not in filled and start <= cursor <= end:
+        if label not in filled and start - MEAL_LOOKAHEAD_MIN <= cursor <= end:
             return window
     return None
 
@@ -440,8 +482,11 @@ def assemble_day(
     meal_unit = _cheapest_meal(pool, profile)
 
     while len(day.slots) < MAX_SLOTS_PER_DAY and cursor < profile.day_end:
-        # A midday rest for young children is a gap in the schedule, not a slot.
-        if not rest_taken and cursor >= 13 * 60:
+        # A midday rest for young children is a gap in the schedule, not a slot. It must yield to
+        # a meal that is currently due: taking the rest first pushed the cursor past the end of
+        # the lunch window, which then counted as missed — so a family with a small child got a
+        # nap instead of lunch, every single day.
+        if not rest_taken and cursor >= 13 * 60 and _meal_due(profile, cursor, filled_meals) is None:
             cursor += 60
             rest_taken = True
             continue
@@ -450,11 +495,14 @@ def assemble_day(
         due_label = due[0] if due else None
         best: tuple[PlannedSlot, TravelInfo] | None = None
 
-        # Re-rank from where we currently are, so the next stop is a good place that is also near.
+        # Re-rank from where we currently are, so the next stop is a good place that is also
+        # near, and prefer somewhere air-conditioned if this is a summer midday.
+        hot = day_date.month in HOT_MONTHS and HEAT_WINDOW[0] <= cursor <= HEAT_WINDOW[1]
         ordered = sorted(
             pool,
             key=lambda p: scores.get(p.id, 0.0)
-            - PROXIMITY_PENALTY_PER_KM * haversine_km(previous[0], previous[1], p.lat, p.lng),
+            - PROXIMITY_PENALTY_PER_KM * haversine_km(previous[0], previous[1], p.lat, p.lng)
+            + (INDOOR_HEAT_BONUS if hot and p.indoor else 0.0),
             reverse=True,
         )
 
@@ -469,6 +517,10 @@ def assemble_day(
             if profile.evening_bias and place.category == "fine_dining" and cursor < 17 * 60:
                 continue
             if not attendees_clear_min_age(place, profile):
+                continue
+            # A venue shut for the season cannot be scheduled at all — this is a correctness
+            # filter, not a preference.
+            if not place.open_in_month(day_date.month):
                 continue
 
             travel = travel_fn(previous[0], previous[1], place.lat, place.lng)
@@ -579,6 +631,8 @@ def generate_plan(
     scores = {p.id: score_place(p, profile, preferences) for p in candidates}
     ranked = sorted(candidates, key=lambda p: scores[p.id], reverse=True)
     buckets = cluster_by_proximity(ranked, num_days, origin)
+    dining_pool = [p for p in ranked if p.category in DINING_CATEGORIES]
+    buckets = [ensure_dining(bucket, dining_pool) for bucket in buckets]
 
     plan = Plan(total_budget=total_budget, currency=currency)
     used: set[int] = set()

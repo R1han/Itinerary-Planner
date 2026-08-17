@@ -155,6 +155,7 @@ def generate(
         db,
         context.profile,
         query_for(context.profile, event.title if event else "", event.notes if event else ""),
+        origin=context.origin,
     )
 
     travel_service = TravelService(db)
@@ -173,6 +174,7 @@ def generate(
         currency=currency,
     )
 
+    plan = pin_event_venue(db, plan, event, context, travel_fn)
     plan = route_for_real(plan, context, travel_fn)
 
     if prayer_breaks:
@@ -195,12 +197,66 @@ def generate(
     db.add(itinerary)
     db.flush()
 
+    for day in plan.days:
+        for slot in day.slots:
+            slot.locked = False
+
     persist_plan(db, itinerary, plan)
     if event is not None:
         event.planned = True
     db.commit()
     db.refresh(itinerary)
     return itinerary
+
+
+def pin_event_venue(
+    db: Session, plan: Plan, event: Event | None, context: PlanContext, travel_fn
+) -> Plan:
+    """Put the event's own venue into the day the event falls on.
+
+    A concert on the 20th is the reason for the trip, so the planner should not be free to score
+    it away. The slot is locked, which means the repair pass trims around it rather than dropping
+    it — the opposite of how every other slot is treated.
+    """
+    if event is None or event.place_id is None or not plan.days:
+        return plan
+
+    day_index = (event.date - plan.days[0].day_date).days
+    if not 0 <= day_index < len(plan.days):
+        return plan
+
+    day = plan.days[day_index]
+    if any(slot.place.id == event.place_id for slot in day.slots):
+        return plan
+
+    row = db.get(Place, event.place_id)
+    if row is None:
+        return plan
+
+    venue = to_candidate(row)
+    if not all(person.age >= venue.min_age for person in context.profile.attendees):
+        log.info("event venue %s excluded: the party does not clear min_age", venue.name)
+        return plan
+
+    start = max(venue.opens_at, context.profile.day_start)
+    duration = min(venue.avg_duration_min, context.profile.max_slot_min)
+    if start + duration > venue.closes_at:
+        return plan
+
+    day.slots.append(
+        PlannedSlot(
+            place=venue,
+            day_index=day_index,
+            position=len(day.slots),
+            start_min=start,
+            end_min=start + duration,
+            score=99.0,  # never the weakest slot, so repair trims around it
+            cost=slot_cost_breakdown(venue, context.profile.attendees),
+            locked=True,
+        )
+    )
+    reflow_day(day, context.profile, travel_fn, context.origin)
+    return plan
 
 
 def route_for_real(plan: Plan, context: PlanContext, travel_fn) -> Plan:
@@ -533,7 +589,9 @@ def _candidates_for_gap(
     context: PlanContext,
     exclude_place_ids: set[int],
 ) -> list[PlaceCandidate]:
-    candidates = retrieve_candidates(db, context.profile, query_for(context.profile))
+    candidates = retrieve_candidates(
+        db, context.profile, query_for(context.profile), origin=context.origin
+    )
     return [c for c in candidates if c.id not in exclude_place_ids]
 
 

@@ -17,7 +17,7 @@ correct when the maps API is down.
 cd backend
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env          # set JWT_SECRET and OPENAI_API_KEY
-.venv/bin/python -m app.seed  # 164 places, two demo accounts, their events + embeddings
+.venv/bin/python -m app.seed  # 351 places, two demo accounts, their events + embeddings
 .venv/bin/python -m uvicorn app.main:app --reload
 
 # 2. Frontend, in a second terminal
@@ -99,6 +99,9 @@ down a file cannot leave a half-applied import. Idempotent on `(user_id, title, 
 - **The map is real geography, not the illustration.** MapTiler's `basic-v2` tiles are recoloured
   toward the design's cream and teal, and the pins, routes, chips and popovers are drawn to match —
   but tiles cannot reproduce hand-drawn road ribbons or lettering.
+- **Seasonal closures are modelled, not merely flagged.** Seventeen venues carry `closed_months`
+  — Global Village runs October to April, Miracle Garden November to May — and the planner will
+  not schedule into them. A boolean "seasonal" flag could only have produced a warning.
 - **Some coordinates are unroutable.** ORS returns 404 for a handful of beach and island points
   with no road access; those legs fall back to dashed estimates, which is the intended behaviour
   rather than a failure.

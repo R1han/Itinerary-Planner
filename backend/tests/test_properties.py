@@ -201,10 +201,14 @@ def test_meal_slots_only_ever_appear_in_meal_windows(catalog, party):
         catalog, profile, distance_travel(), start_date=TOMORROW, num_days=2,
         total_budget=8_000.0, origin=ORIGIN,
     )
-    windows = [(start, end) for _, start, end in profile.meal_windows]
+    # A meal may begin a little before its window opens (so it is not squeezed out by whatever
+    # was chosen just beforehand) and a little after it closes (travel), but not hours away.
+    from app.services.planner import MEAL_LOOKAHEAD_MIN
+
+    windows = [(start - MEAL_LOOKAHEAD_MIN, end + 90) for _, start, end in profile.meal_windows]
     for day in plan.days:
         for slot in day.slots:
             if slot.place.category in DINING_CATEGORIES:
-                assert any(start <= slot.start_min <= end + 90 for start, end in windows), (
+                assert any(start <= slot.start_min <= end for start, end in windows), (
                     f"{slot.place.name} at {slot.start_time} is outside every meal window"
                 )

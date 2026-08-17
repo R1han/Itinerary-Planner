@@ -122,8 +122,13 @@ class Event(Base):
     date: Mapped[date] = mapped_column(Date, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
     planned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Set when an event happens at a known venue — a concert, a festival. The planner pins that
+    # place into the matching day, which is what makes a live event schedulable rather than just
+    # a calendar note.
+    place_id: Mapped[int | None] = mapped_column(ForeignKey("places.id", ondelete="SET NULL"))
 
     user: Mapped[User] = relationship(back_populates="events")
+    place: Mapped["Place | None"] = relationship()
 
 
 class Place(Base):
@@ -147,6 +152,13 @@ class Place(Base):
     close_time: Mapped[str] = mapped_column(String(5), default="22:00")
     avg_duration_min: Mapped[int] = mapped_column(Integer, default=90)
     tags: Mapped[list] = mapped_column(JSON, default=list)
+    # Facets the planner filters on, promoted out of `tags` because free text cannot be queried.
+    indoor: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    booking_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Months (1-12) the venue is shut. Empty means year-round. A great many UAE outdoor
+    # attractions close for high summer, and a boolean "seasonal" flag could only warn about it —
+    # a month list lets the planner avoid scheduling a trip into a closed venue at all.
+    closed_months: Mapped[list] = mapped_column(JSON, default=list)
     kid_score: Mapped[float] = mapped_column(Float, default=0.5)
     teen_score: Mapped[float] = mapped_column(Float, default=0.5)
     romance_score: Mapped[float] = mapped_column(Float, default=0.5)

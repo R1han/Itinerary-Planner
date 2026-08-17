@@ -86,6 +86,21 @@ def embed(texts: list[str]) -> list[list[float]]:
 
 
 def place_document(place) -> str:
-    """The text embedded per place: name + description + tags (spec §5)."""
+    """The text embedded per place: name + description + tags (spec §5).
+
+    The facets are spelled out in words rather than left as booleans, because that is what a
+    query like "somewhere indoors for the afternoon" actually matches against.
+    """
     tags = " ".join(place.tags or [])
-    return f"{place.name}. {place.description} Tags: {tags}. Category: {place.category}. Located in {place.emirate}."
+    facets = []
+    if getattr(place, "indoor", False):
+        facets.append("indoor and air-conditioned")
+    if getattr(place, "booking_required", False):
+        facets.append("advance booking required")
+    if getattr(place, "closed_months", None):
+        facets.append("seasonal, closed part of the year")
+    facet_text = f" {'. '.join(facets)}." if facets else ""
+    return (
+        f"{place.name}. {place.description} Tags: {tags}. "
+        f"Category: {place.category}. Located in {place.emirate}.{facet_text}"
+    )

@@ -359,3 +359,101 @@ def test_summary_splits_activities_food_and_travel():
     assert summary["over_budget"] is False
     assert len(summary["per_day"]) == 2
     assert sum(summary["per_day"]) == pytest.approx(summary["total"], abs=0.05)
+
+
+# --- seasonal closure, heat and rest ------------------------------------------------------------
+
+
+def test_a_venue_closed_that_month_is_never_scheduled():
+    """A correctness filter, not a preference: the venue is shut."""
+    from datetime import date as _date
+
+    summer_shut = place(1, "Global Village", "mall", price_adult=25, open_time="16:00",
+                        close_time="23:00", closed_months=(5, 6, 7, 8, 9), kid_score=0.99)
+    open_all_year = place(2, "Aquarium", "aquarium", price_adult=100, open_time="10:00",
+                          close_time="22:00", kid_score=0.5)
+    profile = build_profile(family(2, (7,)), "birthday")
+
+    august = generate_plan(
+        [summer_shut, open_all_year], profile, fixed_travel(10), start_date=_date(2026, 8, 10),
+        num_days=1, total_budget=5000.0, origin=ORIGIN,
+    )
+    december = generate_plan(
+        [summer_shut, open_all_year], profile, fixed_travel(10), start_date=_date(2026, 12, 10),
+        num_days=1, total_budget=5000.0, origin=ORIGIN,
+    )
+
+    assert "Global Village" not in {s.place.name for d in august.days for s in d.slots}
+    assert "Global Village" in {s.place.name for d in december.days for s in d.slots}
+
+
+def test_the_validator_flags_a_seasonally_closed_slot():
+    from datetime import date as _date
+
+    from app.services.validator import VENUE_CLOSED_SEASONALLY, validate_day
+    from app.services.budget import slot_cost_breakdown
+    from app.services.planner import DayPlan, PlannedSlot
+
+    shut = place(1, "Miracle Garden", "park", closed_months=(6, 7, 8, 9),
+                 open_time="09:00", close_time="21:00")
+    attendees = family(2)
+    day = DayPlan(day_index=0, day_date=_date(2026, 7, 15))
+    day.slots = [
+        PlannedSlot(place=shut, day_index=0, position=0, start_min=600, end_min=720,
+                    score=1.0, cost=slot_cost_breakdown(shut, attendees))
+    ]
+    codes = {v.code for v in validate_day(day, build_profile(attendees))}
+    assert VENUE_CLOSED_SEASONALLY in codes
+
+
+def test_a_summer_midday_prefers_somewhere_air_conditioned():
+    """Spec §10 calls malls and indoor attractions the midday heat fallback."""
+    from datetime import date as _date
+
+    outdoor = place(1, "Open Park", "park", price_adult=10, open_time="08:00",
+                    close_time="20:00", kid_score=0.6)
+    indoor = place(2, "Cool Mall", "mall", price_adult=10, open_time="08:00",
+                   close_time="20:00", kid_score=0.6, indoor=True)
+    profile = build_profile(family(2, (7,)), "birthday")
+
+    july = generate_plan([outdoor, indoor], profile, fixed_travel(10),
+                         start_date=_date(2026, 7, 10), num_days=1,
+                         total_budget=5000.0, origin=ORIGIN)
+    booked = [s.place.name for d in july.days for s in d.slots]
+    midday = [s for d in july.days for s in d.slots if 11 * 60 <= s.start_min <= 16 * 60]
+    assert booked, "expected a plan"
+    if midday:
+        assert any(s.place.indoor for s in midday), "no air-conditioned option taken at midday"
+
+
+def test_a_due_meal_beats_the_midday_rest():
+    """The rest used to fire at 13:00 and push the cursor past the lunch window, so a family with
+    a small child got a nap instead of lunch every single day."""
+    catalog = _catalog()
+    profile = build_profile(family(2, (5,)), "birthday")
+    assert profile.needs_midday_rest is True
+
+    plan = generate_plan(catalog, profile, fixed_travel(10), start_date=TOMORROW,
+                         num_days=1, total_budget=4000.0, origin=ORIGIN)
+    meals = [s for d in plan.days for s in d.slots if s.place.category in DINING_CATEGORIES]
+    assert meals, "the midday rest swallowed the lunch window"
+
+
+def test_a_cluster_without_restaurants_is_topped_up():
+    """Clustering is geographic and blind to category, so a day can come out with no dining."""
+    from app.services.planner import ensure_dining
+
+    cluster = [place(i, f"Sight {i}", "park", lat=25.2 + i * 0.01, lng=55.2) for i in range(1, 6)]
+    dining = [place(50 + i, f"Cafe {i}", "casual_dining", lat=25.9, lng=55.9) for i in range(3)]
+
+    assert not [p for p in cluster if p.category in DINING_CATEGORIES]
+    topped = ensure_dining(cluster, dining, minimum=3)
+    assert len([p for p in topped if p.category in DINING_CATEGORIES]) == 3
+    assert all(p in topped for p in cluster), "the original cluster must be preserved"
+
+
+def test_ensure_dining_leaves_a_cluster_that_already_has_enough_alone():
+    from app.services.planner import ensure_dining
+
+    cluster = [place(i, f"Cafe {i}", "casual_dining") for i in range(1, 5)]
+    assert ensure_dining(cluster, [], minimum=3) is cluster
