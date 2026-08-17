@@ -55,6 +55,19 @@ export function Plus({ size = 16, color }: IconProps) {
   )
 }
 
+// An eight-tooth cog, generated geometrically rather than drawn by hand so the teeth sit on an
+// even pitch. The mock's settings glyph was a circle with radiating spokes, which reads as a
+// brightness control rather than settings.
+const COG_PATH =
+  'M18.84 10.50L21.23 10.87A9.30 9.30 0 0 1 21.23 13.13L18.84 13.50A7.00 7.00 0 0 1 17.90 15.77' +
+  'L19.33 17.73A9.30 9.30 0 0 1 17.73 19.33L15.77 17.90A7.00 7.00 0 0 1 13.50 18.84L13.13 21.23' +
+  'A9.30 9.30 0 0 1 10.87 21.23L10.50 18.84A7.00 7.00 0 0 1 8.23 17.90L6.27 19.33' +
+  'A9.30 9.30 0 0 1 4.67 17.73L6.10 15.77A7.00 7.00 0 0 1 5.16 13.50L2.77 13.13' +
+  'A9.30 9.30 0 0 1 2.77 10.87L5.16 10.50A7.00 7.00 0 0 1 6.10 8.23L4.67 6.27' +
+  'A9.30 9.30 0 0 1 6.27 4.67L8.23 6.10A7.00 7.00 0 0 1 10.50 5.16L10.87 2.77' +
+  'A9.30 9.30 0 0 1 13.13 2.77L13.50 5.16A7.00 7.00 0 0 1 15.77 6.10L17.73 4.67' +
+  'A9.30 9.30 0 0 1 19.33 6.27L17.90 8.23A7.00 7.00 0 0 1 18.84 10.50Z'
+
 export function Gear({ size = 16, color }: IconProps) {
   return (
     <svg
@@ -63,12 +76,12 @@ export function Gear({ size = 16, color }: IconProps) {
       viewBox="0 0 24 24"
       fill="none"
       stroke={stroke(color)}
-      strokeWidth="1.7"
-      strokeLinecap="round"
+      strokeWidth="1.6"
+      strokeLinejoin="round"
       aria-hidden="true"
     >
-      <circle cx="12" cy="12" r="3.2" />
-      <path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6L18 18M18 6l-1.4 1.4M7.4 16.6L6 18" />
+      <path d={COG_PATH} />
+      <circle cx="12" cy="12" r="3.1" />
     </svg>
   )
 }
