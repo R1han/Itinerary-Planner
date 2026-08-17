@@ -23,3 +23,8 @@ frontend/dist/
 
 # Hypothesis example database (machine-local)
 backend/.hypothesis/
+
+# Playwright MCP artefacts
+.playwright-mcp/
+*.png
+frontend/tsconfig.tsbuildinfo

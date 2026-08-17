@@ -284,3 +284,53 @@ def test_threads_are_private_to_their_owner(client, make_user):
 
 def test_chat_requires_authentication(client):
     assert client.post("/chat", json={"message": "hi"}).status_code == 401
+
+
+# --- binding a thread to a plan ----------------------------------------------------------------
+
+
+def test_a_thread_can_be_renamed_and_bound_to_its_plan(client, make_user):
+    """The rail shows the event's initial, so a generated plan renames its thread."""
+    headers, _ = make_user("bind@rihla.app")
+    conversation_id = frames(client.post("/chat", headers=headers, json={"message": "hi"}))[0][
+        "data"
+    ]["conversation_id"]
+
+    response = client.patch(
+        f"/conversations/{conversation_id}",
+        headers=headers,
+        json={"title": "Anniversary weekend"},
+    )
+    assert response.status_code == 200
+    assert response.json()["title"] == "Anniversary weekend"
+    assert client.get("/conversations", headers=headers).json()[0]["title"] == "Anniversary weekend"
+
+
+def test_a_thread_cannot_be_bound_to_another_users_plan(client, make_user, db):
+    """Otherwise a thread could be used to read a plan its owner never created."""
+    from app.models import Itinerary
+
+    owner_headers, owner = make_user("planowner@rihla.app")
+    other_headers, other = make_user("other@rihla.app")
+
+    plan = Itinerary(
+        user_id=owner["id"], title="Private", start_date=date.today() + timedelta(days=3),
+        num_days=2, total_budget=1000.0,
+    )
+    db.add(plan)
+    db.commit()
+
+    conversation_id = frames(client.post("/chat", headers=other_headers, json={"message": "hi"}))[0][
+        "data"
+    ]["conversation_id"]
+
+    assert client.patch(
+        f"/conversations/{conversation_id}",
+        headers=other_headers,
+        json={"itinerary_id": plan.id},
+    ).status_code == 404
+
+    # And the owner cannot reach into someone else's thread either.
+    assert client.patch(
+        f"/conversations/{conversation_id}", headers=owner_headers, json={"title": "hijacked"}
+    ).status_code == 404

@@ -367,6 +367,12 @@ class ConversationCreate(BaseModel):
     event_id: int | None = None
 
 
+class ConversationUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    itinerary_id: int | None = None
+    event_id: int | None = None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     conversation_id: int | None = None
