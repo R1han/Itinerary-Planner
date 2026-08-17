@@ -1,0 +1,1140 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Rihla Works</title>
+
+<style>
+  /* ── Tokens ────────────────────────────────────────────────────────────────
+     Palette and type are lifted from Rihla's own design system (the cream,
+     teal and coral of the workspace UI) rather than invented, so the document
+     reads as part of the product it describes.
+     Light is the complete set on bare :root; dark redefines tokens only. */
+  :root {
+    --ground: #f6f0e6;
+    --surface: #fffcf7;
+    --sunken: #efe7d9;
+    --line: rgba(27, 39, 38, 0.14);
+    --line-soft: rgba(27, 39, 38, 0.08);
+
+    --ink: #1b2726;
+    --ink-2: rgba(27, 39, 38, 0.72);
+    --ink-3: rgba(27, 39, 38, 0.52);
+
+    --teal: #0f6b66;
+    --teal-soft: rgba(15, 107, 102, 0.1);
+    --coral: #c25634;
+    --coral-soft: rgba(194, 86, 52, 0.12);
+    --amber: #9a6f16;
+    --amber-soft: rgba(154, 111, 22, 0.14);
+
+    --display: 'Iowan Old Style', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+    --body: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+    --rail: 250px;
+    --measure: 70ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme='light']) {
+      --ground: #141d1c;
+      --surface: #1d2928;
+      --sunken: #101817;
+      --line: rgba(234, 227, 214, 0.16);
+      --line-soft: rgba(234, 227, 214, 0.09);
+
+      --ink: #eae3d6;
+      --ink-2: rgba(234, 227, 214, 0.74);
+      --ink-3: rgba(234, 227, 214, 0.5);
+
+      --teal: #6fbdb6;
+      --teal-soft: rgba(111, 189, 182, 0.14);
+      --coral: #f08a63;
+      --coral-soft: rgba(240, 138, 99, 0.16);
+      --amber: #e0a93c;
+      --amber-soft: rgba(224, 169, 60, 0.16);
+    }
+  }
+
+  :root[data-theme='dark'] {
+    --ground: #141d1c;
+    --surface: #1d2928;
+    --sunken: #101817;
+    --line: rgba(234, 227, 214, 0.16);
+    --line-soft: rgba(234, 227, 214, 0.09);
+
+    --ink: #eae3d6;
+    --ink-2: rgba(234, 227, 214, 0.74);
+    --ink-3: rgba(234, 227, 214, 0.5);
+
+    --teal: #6fbdb6;
+    --teal-soft: rgba(111, 189, 182, 0.14);
+    --coral: #f08a63;
+    --coral-soft: rgba(240, 138, 99, 0.16);
+    --amber: #e0a93c;
+    --amber-soft: rgba(224, 169, 60, 0.16);
+  }
+
+  /* ── Base ──────────────────────────────────────────────────────────────── */
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--teal); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { color: var(--coral); }
+  :focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; border-radius: 3px; }
+
+  code, kbd { font-family: var(--mono); font-size: 0.86em; }
+  :not(pre) > code {
+    background: var(--sunken);
+    padding: 0.12em 0.4em;
+    border-radius: 4px;
+    color: var(--ink);
+  }
+
+  /* ── Shell ─────────────────────────────────────────────────────────────── */
+  .shell {
+    display: grid;
+    grid-template-columns: var(--rail) minmax(0, 1fr);
+    /* Grid items default to min-width:auto, which refuses to shrink below their content.
+       A 520px-wide table inside would then push the whole page sideways. */
+    gap: 0;
+    max-width: 1240px;
+    margin: 0 auto;
+  }
+
+  .rail {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 40px 22px 40px 28px;
+    border-right: 1px solid var(--line-soft);
+  }
+
+  .rail__brand {
+    font-family: var(--display);
+    font-size: 25px;
+    line-height: 1.15;
+    margin: 0 0 4px;
+  }
+
+  .rail__sub {
+    font-size: 12px;
+    color: var(--ink-3);
+    margin: 0 0 26px;
+  }
+
+  .rail nav { display: flex; flex-direction: column; gap: 1px; }
+
+  .rail nav a {
+    font-size: 13.5px;
+    color: var(--ink-2);
+    text-decoration: none;
+    padding: 5px 9px;
+    border-radius: 6px;
+    border-left: 2px solid transparent;
+  }
+
+  .rail nav a:hover { background: var(--teal-soft); color: var(--teal); }
+
+  main {
+    min-width: 0;
+    padding: 56px 40px 120px;
+    max-width: calc(var(--measure) + 80px);
+  }
+
+  .rail { min-width: 0; }
+
+  /* ── Type ──────────────────────────────────────────────────────────────── */
+  h1 {
+    font-family: var(--display);
+    font-size: clamp(34px, 6vw, 52px);
+    line-height: 1.05;
+    font-weight: 400;
+    margin: 0 0 14px;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+
+  h2 {
+    font-family: var(--display);
+    font-size: clamp(23px, 3.6vw, 30px);
+    line-height: 1.2;
+    font-weight: 400;
+    margin: 0 0 12px;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    margin: 26px 0 8px;
+  }
+
+  p { margin: 0 0 14px; max-width: var(--measure); }
+  ul, ol { margin: 0 0 14px; padding-left: 20px; max-width: var(--measure); }
+  li { margin: 5px 0; }
+  li::marker { color: var(--ink-3); }
+  strong { font-weight: 650; }
+
+  .lede {
+    font-size: 18.5px;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 10px;
+  }
+
+  section { padding: 42px 0; border-top: 1px solid var(--line-soft); }
+  section:first-of-type { border-top: 0; padding-top: 0; }
+
+  /* ── Components ────────────────────────────────────────────────────────── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+    gap: 1px;
+    background: var(--line-soft);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 24px 0;
+  }
+
+  .stat { background: var(--surface); padding: 16px 18px; }
+  .stat b {
+    display: block;
+    font-family: var(--display);
+    font-size: 27px;
+    font-weight: 400;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat span {
+    display: block;
+    font-size: 11.5px;
+    color: var(--ink-3);
+    margin-top: 5px;
+    letter-spacing: 0.02em;
+  }
+
+  .scroll { overflow-x: auto; margin: 18px 0; border-radius: 10px; border: 1px solid var(--line-soft); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 520px; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  th {
+    background: var(--sunken);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td code { white-space: nowrap; }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  pre {
+    background: var(--sunken);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    margin: 16px 0;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; }
+
+  .note {
+    border-left: 3px solid var(--teal);
+    background: var(--teal-soft);
+    padding: 13px 16px;
+    border-radius: 0 8px 8px 0;
+    margin: 18px 0;
+    font-size: 14.5px;
+  }
+  .note--warn { border-left-color: var(--coral); background: var(--coral-soft); }
+  .note--fix { border-left-color: var(--amber); background: var(--amber-soft); }
+  .note p:last-child { margin-bottom: 0; }
+  .note__label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 5px;
+    color: var(--ink-3);
+  }
+
+  /* Build order is a genuine sequence, so it is numbered. Nothing else is. */
+  .phases { list-style: none; padding: 0; counter-reset: phase; }
+  .phases li {
+    counter-increment: phase;
+    position: relative;
+    padding: 0 0 0 46px;
+    margin: 0 0 20px;
+  }
+  .phases li::before {
+    content: counter(phase);
+    position: absolute;
+    left: 0;
+    top: 1px;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: var(--teal);
+    color: var(--ground);
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .phases b { display: block; font-size: 15px; }
+  .phases span { color: var(--ink-2); font-size: 14.5px; }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--teal-soft);
+    color: var(--teal);
+    white-space: nowrap;
+  }
+  .pill--coral { background: var(--coral-soft); color: var(--coral); }
+  .pill--amber { background: var(--amber-soft); color: var(--amber); }
+
+  .flow {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.9;
+    background: var(--surface);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    padding: 18px;
+    overflow-x: auto;
+    margin: 18px 0;
+    white-space: pre;
+    color: var(--ink-2);
+  }
+
+  footer {
+    border-top: 1px solid var(--line-soft);
+    padding: 28px 0 0;
+    font-size: 13.5px;
+    color: var(--ink-3);
+  }
+
+  /* ── Mobile ────────────────────────────────────────────────────────────── */
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+
+    .rail {
+      position: static;
+      height: auto;
+      border-right: 0;
+      border-bottom: 1px solid var(--line-soft);
+      padding: 24px 20px 18px;
+      background: var(--surface);
+    }
+    .rail__sub { margin-bottom: 14px; }
+    .rail nav {
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .rail nav a {
+      border: 1px solid var(--line-soft);
+      border-left-width: 1px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      padding: 4px 11px;
+    }
+
+    main { padding: 30px 20px 80px; }
+    section { padding: 30px 0; }
+    body { font-size: 15.5px; }
+    .lede { font-size: 17px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="shell">
+  <aside class="rail">
+    <p class="rail__brand">How Rihla Works</p>
+    <p class="rail__sub">Engineering notes · UAE itinerary planner</p>
+    <nav aria-label="Contents">
+      <a href="#overview">Overview</a>
+      <a href="#shape">The shape</a>
+      <a href="#order">Build order</a>
+      <a href="#data">Database tables</a>
+      <a href="#backend">Backend, file by file</a>
+      <a href="#planner">The planner in depth</a>
+      <a href="#values">Tuned values &amp; why</a>
+      <a href="#prefs">Preferences &amp; memory</a>
+      <a href="#retrieval">Retrieval &amp; vectors</a>
+      <a href="#travel">Travel times</a>
+      <a href="#chat">Chat orchestration</a>
+      <a href="#frontend">Frontend, file by file</a>
+      <a href="#packages">Packages &amp; why</a>
+      <a href="#testing">Testing</a>
+      <a href="#bugs">Bugs worth knowing</a>
+      <a href="#limits">Known limits</a>
+    </nav>
+  </aside>
+
+  <main>
+    <section id="overview">
+      <p class="eyebrow">Engineering notes</p>
+      <h1>How Rihla works</h1>
+      <p class="lede">
+        Rihla plans complete multi-day itineraries — at most five days, UAE only — around the
+        events already on your calendar. This is a walkthrough of every file, what it does, and
+        why the numbers inside it are the numbers they are.
+      </p>
+
+      <div class="stats">
+        <div class="stat"><b>206</b><span>tests passing</span></div>
+        <div class="stat"><b>351</b><span>seeded places</span></div>
+        <div class="stat"><b>11</b><span>database tables</span></div>
+        <div class="stat"><b>~5.3k</b><span>lines of Python</span></div>
+        <div class="stat"><b>~2.4k</b><span>lines of TS/TSX</span></div>
+        <div class="stat"><b>16</b><span>commits</span></div>
+      </div>
+
+      <p>
+        One idea governs the whole system: <strong>the language model never builds the
+        itinerary.</strong> It reads intent from chat and calls tools; a deterministic Python
+        planner assembles and validates the schedule. That split is what makes the output
+        testable — you can run a thousand random party profiles through the planner and assert
+        the validator always passes, which you cannot do with a model.
+      </p>
+    </section>
+
+    <section id="shape">
+      <h2>The shape</h2>
+      <p>
+        A React workspace on the left of the screen talks to a FastAPI backend. SQLite is the
+        source of truth; ChromaDB holds embeddings for semantic search only, and is never
+        authoritative.
+      </p>
+
+      <div class="flow">React + TypeScript (Vite)              FastAPI
+├─ ChatPanel      the only way to plan  ├─ orchestrator.py   OpenAI function calling
+├─ MapView        react-leaflet         ├─ planner.py        deterministic, pure
+├─ ItineraryStrip day tabs → slot cards ├─ validator.py      constraint checker + repair
+├─ SlotEditor     replace/adjust/remove ├─ retrieval.py      Chroma → SQL filters
+└─ BudgetPanel    server-computed only  ├─ travel.py         ORS → cache → haversine
+                                        ├─ budget.py         age-tier pricing
+                                        ├─ memory.py         per-user Chroma memory
+                                        └─ repo.py           the scoping choke point
+
+                        SQLite (truth) + ChromaDB (semantic)</div>
+
+      <div class="note">
+        <span class="note__label">Load-bearing decision</span>
+        <p>
+          <code>repo.py</code> is the only module that queries user-owned tables. Every function
+          takes <code>user_id</code> from the auth dependency, cross-user access returns
+          <strong>404 rather than 403</strong> — a 403 would confirm the row exists — and asking
+          it for a shared table raises <code>TypeError</code>. A choke point only works if going
+          around it is awkward and misusing it fails loudly.
+        </p>
+      </div>
+    </section>
+
+    <section id="order">
+      <h2>Build order</h2>
+      <p>
+        These phases are a real sequence — each depends on the one before — which is why they are
+        numbered here and nothing else in this document is.
+      </p>
+
+      <ol class="phases">
+        <li>
+          <b>Schema, auth, scoping, seed data</b>
+          <span>Auth first, so every later router is written user-scoped from the start rather than retrofitted.</span>
+        </li>
+        <li>
+          <b>Planner engine and validator</b>
+          <span>Written test-first and kept pure — no database session, no HTTP client, no clock.</span>
+        </li>
+        <li>
+          <b>Travel provider, budget allocator, itinerary API</b>
+          <span>OpenRouteService with a shared cache and a silent haversine fallback.</span>
+        </li>
+        <li>
+          <b>Chat orchestration, threads, Chroma memory</b>
+          <span>Tools that write only the calling user's rows, and per-plan chat threads with unread state.</span>
+        </li>
+        <li>
+          <b>The workspace UI</b>
+          <span>Built to the Claude Design mock: thread rail, map, itinerary strip, pinned budget bar.</span>
+        </li>
+        <li>
+          <b>Web search adapter and docs</b>
+          <span>Optional garnish for live one-off events; fails silently to seeded data.</span>
+        </li>
+        <li>
+          <b>Catalog expansion and facet columns</b>
+          <span>164 → 351 places, richer descriptions, and the facets the planner filters on promoted to real columns.</span>
+        </li>
+      </ol>
+    </section>
+
+    <section id="data">
+      <h2>Database tables</h2>
+      <p>
+        Eleven tables. Two are <strong>shared</strong> and deliberately have no
+        <code>user_id</code> — the places catalog is the same for everyone, and place-to-place
+        travel is user-agnostic so one cache benefits all users. Everything else is per-user.
+      </p>
+
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>Table</th><th>Cols</th><th>Owner</th><th>What it holds</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>users</code></td><td class="num">9</td><td><span class="pill">root</span></td><td>Email, bcrypt hash, home base coordinates, default budget and currency.</td></tr>
+            <tr><td><code>family_members</code></td><td class="num">5</td><td><span class="pill">per-user</span></td><td>One row per person: <code>role</code> (adult/child) and age. Drives the whole party profile.</td></tr>
+            <tr><td><code>preferences</code></td><td class="num">8</td><td><span class="pill">per-user</span></td><td>Likes and dislikes with a <code>source</code> of <code>stated</code> or <code>slot_edit</code>, plus a strength.</td></tr>
+            <tr><td><code>events</code></td><td class="num">8</td><td><span class="pill">per-user</span></td><td>Calendar entries. <code>place_id</code> links an event to a venue so it can be scheduled.</td></tr>
+            <tr><td><code>itineraries</code></td><td class="num">13</td><td><span class="pill">per-user</span></td><td>A plan: dates, day count, budget cap, start coordinates, status.</td></tr>
+            <tr><td><code>slots</code></td><td class="num">9</td><td><span class="pill">inherited</span></td><td>One stop. Owned through its itinerary — never queried without joining it.</td></tr>
+            <tr><td><code>travel_segments</code></td><td class="num">11</td><td><span class="pill">inherited</span></td><td>The drive into a slot, with route geometry and an <code>estimated</code> flag.</td></tr>
+            <tr><td><code>conversations</code></td><td class="num">8</td><td><span class="pill">per-user</span></td><td>One chat thread per plan. <code>updated_at</code> vs <code>last_seen_at</code> gives the unread dot.</td></tr>
+            <tr><td><code>messages</code></td><td class="num">6</td><td><span class="pill">inherited</span></td><td>Chat history, owned through its conversation.</td></tr>
+            <tr><td><code>places</code></td><td class="num">23</td><td><span class="pill pill--amber">shared</span></td><td>The catalog. Same for everyone, so no <code>user_id</code>.</td></tr>
+            <tr><td><code>travel_cache</code></td><td class="num">9</td><td><span class="pill pill--amber">shared</span></td><td>Keyed <code>(from_place, to_place, mode)</code>. A finite place set means demos become cache hits.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Why one <code>places</code> table and not one per type</h3>
+      <p>
+        A <code>category</code> column discriminates twelve kinds — park, waterpark, theme park,
+        museum, aquarium, beach, adventure, casual dining, fine dining, mall, show, cruise — and
+        the planner treats every one identically. It needs coordinates, price bands, hours,
+        <code>min_age</code>, duration and three fit scores; nothing else. Splitting into
+        <code>restaurants</code> / <code>parks</code> / <code>beaches</code> would force a
+        polymorphic foreign key from <code>slots</code>, UNION queries in retrieval and per-type
+        branches in scoring, for no gain.
+      </p>
+      <p>
+        Genuinely type-specific attributes live in the <code>tags</code> JSON array. The three the
+        planner needs to <em>filter</em> on were promoted to real columns, because free text
+        cannot be queried:
+      </p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Column</th><th>Type</th><th>What it changes</th></tr></thead>
+          <tbody>
+            <tr><td><code>indoor</code></td><td>bool</td><td>A summer midday prefers somewhere air-conditioned.</td></tr>
+            <tr><td><code>booking_required</code></td><td>bool</td><td>Surfaced up front rather than discovered at the door.</td></tr>
+            <tr><td><code>closed_months</code></td><td>int[]</td><td>A correctness filter — the venue is shut.</td></tr>
+            <tr><td><code>price_bands</code></td><td>JSON</td><td>Age-tier pricing, checked in order.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <span class="note__label">Why a month list, not a boolean</span>
+        <p>
+          Global Village runs October to April; Miracle Garden November to May. A boolean
+          <code>seasonal</code> flag could only ever produce a warning. A list of closed months
+          lets the planner refuse to schedule into a shut venue at all — seventeen places carry
+          one, and an August plan books none of them.
+        </p>
+      </div>
+
+      <h3>Age-tier pricing</h3>
+      <p>
+        Most UAE venues charge a child rate for 3–12 and an adult rate above that, but plenty
+        differ. <code>price_bands</code> is checked in order, and falls back to the flat
+        child/adult split when absent:
+      </p>
+      <pre><code>[{"max_age": 2,    "price": 0},     // infants free
+ {"max_age": 12,   "price": 155},   // child rate
+ {"max_age": null, "price": 199}]   // everyone else</code></pre>
+      <p>
+        This is what makes a 13-year-old correctly pay the adult rate, and what decides whether
+        the <em>"1 child free (under 3)"</em> chip appears on a slot card at all.
+      </p>
+    </section>
+
+    <section id="backend">
+      <h2>Backend, file by file</h2>
+
+      <h3>Foundations</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>File</th><th class="num">Lines</th><th>Job</th></tr></thead>
+          <tbody>
+            <tr><td><code>config.py</code></td><td class="num">63</td><td>All environment reading, via pydantic-settings. Every third-party key is optional at load time so the app can boot without them.</td></tr>
+            <tr><td><code>db.py</code></td><td class="num">44</td><td>SQLite engine and session. Enables WAL (concurrent reads during SSE streaming) and <code>PRAGMA foreign_keys=ON</code>, which SQLite leaves off by default.</td></tr>
+            <tr><td><code>models.py</code></td><td class="num">294</td><td>SQLAlchemy 2.0 models with <code>CHECK</code> constraints declared, not just documented.</td></tr>
+            <tr><td><code>schemas.py</code></td><td class="num">385</td><td>Pydantic v2 boundary validation — the outer wall.</td></tr>
+            <tr><td><code>auth.py</code></td><td class="num">67</td><td>bcrypt hashing, JWT issue/verify, and the <code>get_current_user</code> dependency.</td></tr>
+            <tr><td><code>repo.py</code></td><td class="num">103</td><td>The single scoping choke point for every user-owned table.</td></tr>
+            <tr><td><code>main.py</code></td><td class="num">54</td><td>App, CORS, routers, and a <code>/health</code> endpoint reporting which integrations are live.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <code>schemas.py</code> rejects impossible requests before any service sees them: more
+        than five days, a date in the past, coordinates outside the UAE bounding box
+        (lat 22.5–26.5, lng 51.0–56.6), a negative budget. The model is never the validator.
+      </p>
+
+      <div class="note note--fix">
+        <span class="note__label">A subtle trap</span>
+        <p>
+          <code>schemas.py</code> uses <code>import datetime as dt</code> rather than
+          <code>from datetime import date</code>. With <code>from __future__ import
+          annotations</code>, a field named <code>date</code> shadows the <em>type</em>
+          <code>date</code> in every later annotation, and <code>date | None</code> resolves to
+          <code>None | None</code> — a <code>TypeError</code> at import.
+        </p>
+      </div>
+
+      <h3>Services</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>File</th><th class="num">Lines</th><th>Job</th></tr></thead>
+          <tbody>
+            <tr><td><code>planner.py</code></td><td class="num">784</td><td>The deterministic core. Pure — travel is injected as a callable.</td></tr>
+            <tr><td><code>validator.py</code></td><td class="num">228</td><td>Constraint checker and bounded repair loop.</td></tr>
+            <tr><td><code>budget.py</code></td><td class="num">186</td><td>Age-tier pricing and all budget arithmetic. Pure.</td></tr>
+            <tr><td><code>travel.py</code></td><td class="num">220</td><td>ORS → shared cache → haversine, plus the two callables the planner consumes.</td></tr>
+            <tr><td><code>retrieval.py</code></td><td class="num">240</td><td>Chroma semantic query, then hard filters, then a category-spread shortlist.</td></tr>
+            <tr><td><code>memory.py</code></td><td class="num">148</td><td>Per-user preference memory. The only module touching that Chroma collection.</td></tr>
+            <tr><td><code>itinerary.py</code></td><td class="num">839</td><td>Everything between the database and the pure planner: gather, generate, persist, edit.</td></tr>
+            <tr><td><code>orchestrator.py</code></td><td class="num">715</td><td>OpenAI function calling, the six tools, and SSE framing.</td></tr>
+            <tr><td><code>prayer.py</code></td><td class="num">74</td><td>Prayer-break insertion from a static monthly table.</td></tr>
+            <tr><td><code>websearch.py</code></td><td class="num">232</td><td>Tavily search plus LLM extraction into validated event rows.</td></tr>
+            <tr><td><code>vectors.py</code></td><td class="num">106</td><td>Low-level Chroma client and the embedding call.</td></tr>
+            <tr><td><code>tracing.py</code></td><td class="num">94</td><td>Optional LangSmith tracing, made a no-op at the seam.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Notable functions</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Function</th><th>Does</th></tr></thead>
+          <tbody>
+            <tr><td><code>build_profile(attendees, event_type)</code></td><td>Turns who is going and why into scoring weights and a day shape.</td></tr>
+            <tr><td><code>score_place(place, profile, prefs)</code></td><td><code>w_semantic·similarity + profile_fit + w_pref·preference</code>.</td></tr>
+            <tr><td><code>cluster_by_proximity(...)</code></td><td>Greedy farthest-point seeding, one cluster per day. No numpy, no random seed.</td></tr>
+            <tr><td><code>ensure_dining(bucket, pool)</code></td><td>Tops a cluster up with nearby restaurants when it has too few.</td></tr>
+            <tr><td><code>assemble_day(...)</code></td><td>The greedy day loop: travel, hours, meals, budget, rest.</td></tr>
+            <tr><td><code>validate_plan(plan, profile)</code></td><td>Returns a list of typed <code>Violation</code>s, never a boolean.</td></tr>
+            <tr><td><code>repair_plan(...)</code></td><td>Drops the weakest offending slot, rebuilds segments, re-validates. Bounded at 24 passes.</td></tr>
+            <tr><td><code>slot_cost_breakdown(place, attendees, travel_in)</code></td><td>Produces the exact cost chips the UI renders.</td></tr>
+            <tr><td><code>TravelService.estimate_fn()</code></td><td>Network-free estimates for ranking candidates.</td></tr>
+            <tr><td><code>TravelService.travel_fn(places)</code></td><td>Real routing for the legs actually chosen.</td></tr>
+            <tr><td><code>pin_event_venue(...)</code></td><td>Locks an event's own venue into the day it falls on.</td></tr>
+            <tr><td><code>describe_tool_call(name, args)</code></td><td>Turns tool arguments into the chat's activity row.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="planner">
+      <h2>The planner in depth</h2>
+      <p>
+        <code>planner.py</code> has no database session, no HTTP client and no clock. Travel
+        arrives as <code>travel_fn(from_lat, from_lng, to_lat, to_lng) -&gt; TravelInfo</code>.
+        That purity is what makes running hundreds of property-test examples cheap enough to do
+        on every commit.
+      </p>
+
+      <h3>The party profile</h3>
+      <p>
+        Weights come from the party, never from the model. Four branches, chosen in order:
+      </p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Party</th><th>Weights</th><th>Day shape</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Anniversary, adults only</td>
+              <td><code>romance 1.0</code></td>
+              <td>11:00–23:30, 3h slots, evening-biased, fine dining after 17:00</td>
+            </tr>
+            <tr>
+              <td>Any child under 8</td>
+              <td><code>kid 1.0</code></td>
+              <td>09:00–19:30, 2h slots, midday rest, early dinner</td>
+            </tr>
+            <tr>
+              <td>Children, none under 8</td>
+              <td><code>teen 1.0</code></td>
+              <td>09:30–22:00, 5h slots, no rest</td>
+            </tr>
+            <tr>
+              <td>Adults, other occasion</td>
+              <td><code>teen 0.6 · romance 0.5</code></td>
+              <td>09:30–22:30, 4h slots</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>A worked example</h3>
+      <p>
+        Two adults, children aged 7 and 13, Abu Dhabi start, three days, AED 3,500, in August:
+      </p>
+
+      <div class="flow">1. retrieve   351 places → within 140 km of start → 229
+                → Chroma similarity on "young children, animals, gentle indoor"
+                → category-capped shortlist of 80 + 14 cheapest reserved
+3. cluster    3 geographic buckets, nearest-to-home first
+              each topped up to ≥3 restaurants
+4. assemble   day 1, cursor 09:00
+              09:20 Al Bateen Beach     (free, kid_score 0.88)
+              11:35 Galleria Al Maryah  (indoor — it is 40 °C outside)
+              13:17 Shakespeare and Co  (lunch window is due; rest yields to it)
+              15:40 Louvre Abu Dhabi    (indoor, under-18s free)
+              18:02 Beirut Restaurant   (dinner window)
+5. route      10 chosen legs sent to OpenRouteService; the other ~800
+              candidate comparisons never left the process
+6. validate   no overlaps · travel honoured · venues open · ages clear · ≤ cap
+              → AED 3,481 of 3,500</div>
+
+      <p>
+        Each candidate is re-ranked from the <em>current</em> position at every step, so the next
+        stop is a good place that is also nearby:
+      </p>
+      <pre><code>score(place)
+  − 0.012 × km_from_current_position     # proximity penalty
+  + 0.35  if hot_midday and place.indoor # summer heat bonus</code></pre>
+    </section>
+
+    <section id="values">
+      <h2>Tuned values &amp; why</h2>
+      <p>
+        Every constant below was chosen for a reason, and most were corrected after watching real
+        plans come out wrong.
+      </p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Constant</th><th class="num">Value</th><th>Why this value</th></tr></thead>
+          <tbody>
+            <tr><td><code>MAX_DAYS</code></td><td class="num">5</td><td>Product constraint, enforced in Pydantic and again as a SQL <code>CHECK</code>.</td></tr>
+            <tr><td><code>MAX_SLOTS_PER_DAY</code></td><td class="num">6</td><td>Beyond six stops a day stops being a holiday.</td></tr>
+            <tr><td><code>MAX_WAIT_MIN</code></td><td class="num">40</td><td>How long it is reasonable to idle outside a venue waiting for it to open.</td></tr>
+            <tr><td><code>MEAL_GRACE_MIN</code></td><td class="num">45</td><td>A meal may start a little after its window; a "lunch" a long drive pushes to 15:50 is not lunch.</td></tr>
+            <tr><td><code>MEAL_LOOKAHEAD_MIN</code></td><td class="num">30</td><td>A meal becomes due slightly early, so it is not squeezed out by whatever was chosen just beforehand.</td></tr>
+            <tr><td><code>DAY_ENVELOPE_FLEX</code></td><td class="num">1.35</td><td>A day may exceed its even share by 35% provided the trip total still fits — days are not equal.</td></tr>
+            <tr><td><code>PROXIMITY_PENALTY_PER_KM</code></td><td class="num">0.012</td><td>100 km costs ~1.2 score points, roughly one full quality grade. Cut travel from 56% of spend to 21%.</td></tr>
+            <tr><td><code>TRIP_RADIUS_KM</code></td><td class="num">140</td><td>Spans several emirates in a country this size, while excluding a mountain two hours away.</td></tr>
+            <tr><td><code>HOT_MONTHS</code></td><td class="num">5–9</td><td>UAE summer. Combined with an 11:00–16:00 window and a <code>+0.35</code> indoor bonus.</td></tr>
+            <tr><td><code>ROAD_FACTOR</code></td><td class="num">1.3</td><td>Straight-line distance × 1.3 approximates real road distance.</td></tr>
+            <tr><td><code>CITY_KMH / INTERCITY_KMH</code></td><td class="num">45 / 90</td><td>Split at 40 km — beyond that a trip is mostly highway.</td></tr>
+            <tr><td><code>PARKING_BUFFER_MIN</code></td><td class="num">10</td><td>Parking and walking in, added to every estimate.</td></tr>
+            <tr><td><code>taxi_aed_per_km</code></td><td class="num">2.5</td><td>Roughly the UAE metered rate. Shown as its own budget line.</td></tr>
+            <tr><td><code>SHORTLIST_SIZE</code></td><td class="num">80</td><td>Enough breadth for a five-day plan without handing the planner all 351 places.</td></tr>
+            <tr><td><code>CHEAP_RESERVE</code></td><td class="num">4 + 10</td><td>Cheapest dining and non-dining held back regardless of rank, so a tight cap is met by substitution.</td></tr>
+            <tr><td><code>MAX_REPAIR_PASSES</code></td><td class="num">24</td><td>A bound, not a target. Beyond it the plan is emptied with a warning rather than left subtly wrong.</td></tr>
+            <tr><td><code>ors_timeout_seconds</code></td><td class="num">2.0</td><td>A maps API is not allowed to make a user wait; past two seconds, estimate instead.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="prefs">
+      <h2>Preferences &amp; memory</h2>
+      <p>
+        Preferences have two origins, and the difference matters. A <code>stated</code> preference
+        comes from the user saying so. A <code>slot_edit</code> preference is inferred from
+        behaviour — you swapped a stop out — and is only recorded <strong>after you
+        confirm it</strong>, via the dark toast that appears under the edited card.
+      </p>
+
+      <div class="flow">You replace a stop
+   └─ PATCH /itineraries/{id}/slots/{slot_id}
+   └─ toast: "Avoid adventure in future plans?"   ← never written until answered
+        ├─ Yes → preferences(kind=dislike, source=slot_edit, strength=0.7)
+        │         └─ MemoryService.remember_preference → Chroma, tagged user_id
+        └─ No  → nothing recorded at all</div>
+
+      <h3>How a preference changes a plan</h3>
+      <p>
+        <code>preference_signal()</code> matches a preference against a place by category, or by
+        any word longer than three characters appearing in its name, category or tags. The signal
+        is then folded into the score:
+      </p>
+      <pre><code>signal += strength                # a like
+signal -= strength × 1.4          # a dislike
+
+score = w_semantic·similarity + profile_fit + 0.45 × signal</code></pre>
+
+      <div class="note">
+        <span class="note__label">Asymmetry on purpose</span>
+        <p>
+          A dislike is weighted <strong>1.4× harder</strong> than an equal-strength like. Avoiding
+          a stop someone will hate matters more than including one more they will merely enjoy —
+          a bad slot ruins an afternoon, a missing good one does not.
+        </p>
+      </div>
+
+      <h3>The isolation guarantee</h3>
+      <p>
+        <code>MemoryService</code> is constructed with a <code>user_id</code> and is the only
+        module that touches the <code>preference_memory</code> collection. Every query carries
+        <code>where={"user_id": ...}</code>, injected once, in one place — an unfiltered
+        cross-user read is not expressible from a route handler.
+      </p>
+      <p>
+        Document ids are namespaced <code>u{user}-pref-{id}</code> so two users' rows cannot
+        collide, and recall re-checks the returned metadata anyway. That check should be
+        unreachable; a leak here would be a privacy bug, so it is verified rather than trusted.
+      </p>
+
+      <div class="note note--warn">
+        <span class="note__label">Never authoritative</span>
+        <p>
+          Chroma is an accelerator. If embeddings are unavailable, <code>recall()</code> falls
+          back to the user's own strongest SQL rows and the product carries on. SQLite is always
+          the source of truth.
+        </p>
+      </div>
+
+      <h3>One meal category exception</h3>
+      <p>
+        The "avoid this in future" prompt is suppressed for dining categories. The planner
+        <em>has</em> to schedule lunch and dinner, so "avoid dining in future plans" is advice it
+        could never act on.
+      </p>
+    </section>
+
+    <section id="retrieval">
+      <h2>Retrieval &amp; vectors</h2>
+      <p>
+        Two Chroma collections: <code>places</code> (shared, no user filter by design) and
+        <code>preference_memory</code> (per-user, always filtered). Both are embedded with
+        <code>text-embedding-3-small</code>.
+      </p>
+
+      <p>What gets embedded per place is deliberate:</p>
+      <pre><code>f"{name}. {description} Tags: {tags}. "
+f"Category: {category}. Located in {emirate}. "
+f"{'indoor and air-conditioned. ' if indoor else ''}"</code></pre>
+
+      <p>
+        The facets are spelled out in words rather than left as booleans, because that is what a
+        query like <em>"somewhere indoors for the afternoon"</em> actually matches against.
+      </p>
+
+      <h3>Why descriptions were rewritten</h3>
+      <p>
+        The original catalog averaged 96-character descriptions. Every one was rewritten to
+        ~223 characters, naming who a place suits, what it feels like and when to go. Short text
+        embeds weakly; this was the single largest lever on retrieval quality, and it improved the
+        original entries as much as the new ones.
+      </p>
+
+      <p>The pipeline, in order:</p>
+      <div class="flow">1. SQL hard filters   min_age ≤ youngest attendee, optional emirate and price
+2. Trip radius        ≤ 140 km from start — applied BEFORE shortlisting
+3. Semantic query     Chroma top-200 by cosine similarity
+4. Category spread    ≤ 13 per category, so 80 aquariums cannot crowd out meals
+5. Budget relief      cheapest 4 dining + 10 other, added back regardless of rank</div>
+
+      <div class="note note--fix">
+        <span class="note__label">Order matters</span>
+        <p>
+          Steps 2 and 3 used to be reversed. Shortlisting before filtering meant the 80 slots were
+          spent on places two hours away, and a day could end up with no reachable lunch at all.
+          The planner also enforces a radius — but by then the shortlist has already been chosen.
+        </p>
+      </div>
+    </section>
+
+    <section id="travel">
+      <h2>Travel times</h2>
+      <p>
+        Three layers, tried in order: <strong>OpenRouteService</strong> for a real route,
+        the <strong>shared cache</strong> for a pair already looked up, and
+        <strong>haversine</strong> as a floor that never fails.
+      </p>
+      <pre><code>road_km  = straight_line × 1.3
+speed    = 90 km/h if straight_line > 40 km else 45 km/h
+minutes  = road_km / speed × 60 + 10        # parking buffer
+cost     = road_km × 2.5                    # AED, its own budget line</code></pre>
+
+      <p>
+        A fallback leg is marked <code>estimated=true</code>, which the UI renders as
+        <em>"~35 min"</em> with a dashed polyline. The map is honest about what it does not know.
+      </p>
+
+      <div class="note">
+        <span class="note__label">Estimates are never cached</span>
+        <p>
+          Only real routes are written to <code>travel_cache</code>. Caching a guess would freeze
+          it in place and stop a later successful ORS call from ever improving on it.
+        </p>
+      </div>
+
+      <h3>Two callables, one service</h3>
+      <p>
+        The planner asks "how far is this one?" for every candidate at every step — hundreds of
+        pairs per trip, of which a dozen survive. Routing all of them exhausted the free tier's
+        40-requests-per-minute limit, and most segments came back rate-limited.
+      </p>
+      <ul>
+        <li><code>estimate_fn()</code> — network-free haversine, used for <em>ranking</em>. Relative distance is all a comparison needs.</li>
+        <li><code>travel_fn(places)</code> — real routing, used only for the legs actually chosen, then re-validated because a real route is usually slower than the estimate.</li>
+      </ul>
+      <p>One three-day plan went from several hundred API calls to about ten.</p>
+    </section>
+
+    <section id="chat">
+      <h2>Chat orchestration</h2>
+      <p>
+        The orchestrator is constructed with the authenticated user, loads that user's family,
+        preferences and vector memory into its system context, and exposes six tools.
+        <strong>No tool schema contains a <code>user_id</code> parameter</strong> — the model
+        cannot address another user however it is prompted, and a test asserts exactly that.
+      </p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Tool</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>save_family_details</code></td><td>Replaces family_members, records likes and dislikes.</td></tr>
+            <tr><td><code>create_event</code></td><td>Adds a calendar entry. Idempotent on (user, title, date).</td></tr>
+            <tr><td><code>get_upcoming_events</code></td><td>Powers "what events are upcoming?" and the offer to plan.</td></tr>
+            <tr><td><code>generate_itinerary</code></td><td>Calls the deterministic planner. Refused if intake is incomplete.</td></tr>
+            <tr><td><code>get_itinerary</code></td><td>Reads current plan state. <span class="pill pill--coral">beyond spec</span></td></tr>
+            <tr><td><code>record_preference</code></td><td>Files a like or dislike mentioned in passing.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note note--fix">
+        <span class="note__label">Why get_itinerary exists</span>
+        <p>
+          The five specified tools can all create or change things; none could <em>read a plan
+          back</em>. Asked to summarise, the model could only describe whatever a previous tool
+          result left in its context — which goes stale the moment a slot is edited. It reported a
+          total of AED 2,127 while the budget bar beside it read AED 1,560. The system prompt now
+          forbids quoting a figure from memory.
+        </p>
+      </div>
+
+      <h3>Streaming</h3>
+      <p>
+        <code>POST /chat</code> emits typed SSE frames: <code>conversation</code>,
+        <code>token</code>, <code>tool</code>, <code>tool_done</code>,
+        <code>intake_required</code>, <code>itinerary_updated</code>,
+        <code>budget_updated</code>, <code>error</code>, <code>done</code>. The right pane
+        re-renders while the assistant is still talking.
+      </p>
+      <p>
+        The browser reads this with <code>fetch</code> and a <code>ReadableStream</code>, not
+        <code>EventSource</code> — <code>EventSource</code> cannot send an
+        <code>Authorization</code> header.
+      </p>
+      <p>
+        Tool calls render as activity rows with their inputs, phrased server-side because the
+        server already knows what the arguments mean:
+      </p>
+      <pre><code>✓ Checking your calendar   next 60 days           3 events
+✓ Building your itinerary  3 days · AED 2,500     AED 1,574 of AED 2,500
+✓ Noting a preference      dislikes long queues   noted</code></pre>
+    </section>
+
+    <section id="frontend">
+      <h2>Frontend, file by file</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>File</th><th class="num">Lines</th><th>Job</th></tr></thead>
+          <tbody>
+            <tr><td><code>styles.css</code></td><td class="num">2005</td><td>The design system as CSS custom properties. Every component consumes tokens; no loose hex.</td></tr>
+            <tr><td><code>ItineraryStrip.tsx</code></td><td class="num">531</td><td>Day tabs, slot cards, travel connectors, the slot editor and the preference toast.</td></tr>
+            <tr><td><code>ChatPanel.tsx</code></td><td class="num">407</td><td>Streaming bubbles, markdown, the intake checklist, tool trace, suggestion chips.</td></tr>
+            <tr><td><code>state/store.ts</code></td><td class="num">321</td><td>Zustand. Holds session, plan, and the selection shared by strip and map.</td></tr>
+            <tr><td><code>SidePanels.tsx</code></td><td class="num">316</td><td>Events CRUD and family/preferences. Not in the mock; built from the same tokens.</td></tr>
+            <tr><td><code>icons.tsx</code></td><td class="num">281</td><td>Inline SVGs, one module so stroke weights stay consistent.</td></tr>
+            <tr><td><code>MapView.tsx</code></td><td class="num">229</td><td>react-leaflet, MapTiler tiles under a palette filter, teardrop pins, route polylines.</td></tr>
+            <tr><td><code>types.ts</code></td><td class="num">230</td><td>Mirrors the Pydantic schemas. Hand-written — the API surface is fixed.</td></tr>
+            <tr><td><code>api/client.ts</code></td><td class="num">220</td><td>The one place a bearer token is attached and a 401 is handled.</td></tr>
+            <tr><td><code>TopBar.tsx</code></td><td class="num">136</td><td>Brand, the coral "Planning:" event chip, party summary, settings menu.</td></tr>
+            <tr><td><code>AuthPage.tsx</code></td><td class="num">136</td><td>Sign in and register, with one-tap demo accounts.</td></tr>
+            <tr><td><code>BudgetPanel.tsx</code></td><td class="num">96</td><td>Trip total, stacked category bar, per-day bars, remaining. Server figures only.</td></tr>
+            <tr><td><code>AppShell.tsx</code></td><td class="num">97</td><td>Layout, panel routing, and Escape closing the innermost surface first.</td></tr>
+            <tr><td><code>ThreadRail.tsx</code></td><td class="num">60</td><td>The 62px rail: new plan, one avatar per thread, unread dots.</td></tr>
+            <tr><td><code>Thumb.tsx</code></td><td class="num">59</td><td>Place image with a category-illustration fallback, so a card can never show a broken image.</td></tr>
+            <tr><td><code>Markdown.tsx</code></td><td class="num">46</td><td>Renders assistant replies. React elements, never an HTML string.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <span class="note__label">One stacking rule worth remembering</span>
+        <p>
+          Leaflet gives its panes and controls z-indexes up to 1000. Without
+          <code>z-index: 0; isolation: isolate</code> on the map container, those compete directly
+          with the app's popovers — and the map paints straight over the slot editor, which is
+          correctly positioned the whole time and simply invisible.
+        </p>
+      </div>
+    </section>
+
+    <section id="packages">
+      <h2>Packages &amp; why</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Package</th><th>Chosen because</th></tr></thead>
+          <tbody>
+            <tr><td><code>fastapi</code> + <code>uvicorn</code></td><td>Native async for SSE streaming, and Pydantic validation built into the routing layer.</td></tr>
+            <tr><td><code>sqlalchemy 2.0</code></td><td>Typed <code>Mapped[]</code> columns; the seed CLI goes through the same models so constraints are exercised.</td></tr>
+            <tr><td><code>pydantic-settings</code></td><td>One typed settings object; every key optional at load so the app boots without them.</td></tr>
+            <tr><td><code>passlib[bcrypt]</code> + <code>bcrypt 4.0.1</code></td><td>Pinned — passlib 1.7.4 raises a spurious <code>__about__</code> error against bcrypt ≥ 4.1.</td></tr>
+            <tr><td><code>python-jose</code></td><td>JWT signing and verification.</td></tr>
+            <tr><td><code>chromadb</code></td><td>Embedded persistent client, no separate service. Metadata filtering is what enforces per-user memory.</td></tr>
+            <tr><td><code>openai</code></td><td>Chat with function calling, and <code>text-embedding-3-small</code>.</td></tr>
+            <tr><td><code>httpx</code></td><td>Per-request timeouts, which the ORS 2-second budget depends on.</td></tr>
+            <tr><td><code>hypothesis</code></td><td>Property tests: random parties and budgets, asserting the validator always passes.</td></tr>
+            <tr><td><code>langsmith</code></td><td>Optional tracing. A transparent no-op without a key.</td></tr>
+            <tr><td><code>react-leaflet</code> + <code>leaflet</code></td><td>Real map with full control over pins, polylines and popups.</td></tr>
+            <tr><td><code>zustand</code></td><td>Cross-component selection state without a provider tree or reducer boilerplate.</td></tr>
+            <tr><td><code>react-markdown</code> + <code>remark-gfm</code></td><td>Builds React elements rather than an HTML string, so model output cannot inject markup. Hand-rolling would mean owning the escaping on an untrusted path.</td></tr>
+            <tr><td><code>vite</code></td><td>Fast dev server and a dev proxy, so the browser sees one origin.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="testing">
+      <h2>Testing</h2>
+      <p>
+        206 tests in about 56 seconds. The model is stubbed throughout — the suite never makes a
+        billable call.
+      </p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Suite</th><th class="num">Lines</th><th>Covers</th></tr></thead>
+          <tbody>
+            <tr><td><code>test_chat.py</code></td><td class="num">636</td><td>Tool isolation, SSE framing, thread persistence, unread state, activity phrasing.</td></tr>
+            <tr><td><code>test_planner.py</code></td><td class="num">459</td><td>Profiles, scoring, clustering, pricing, seasonal closure, heat, meal-vs-rest.</td></tr>
+            <tr><td><code>test_itineraries.py</code></td><td class="num">458</td><td>Intake gating, generation, slot editing, action chips, ownership.</td></tr>
+            <tr><td><code>test_validator.py</code></td><td class="num">262</td><td>Deliberately broken plans — the reason a broken one never reaches a user.</td></tr>
+            <tr><td><code>test_travel.py</code></td><td class="num">240</td><td>ORS parsing, cache hits, timeout → haversine fallback.</td></tr>
+            <tr><td><code>test_properties.py</code></td><td class="num">214</td><td>Seven hypothesis properties over random parties, catalogs and budgets.</td></tr>
+            <tr><td><code>test_isolation.py</code></td><td class="num">214</td><td>Cross-user 404s, Chroma scoping, unauthenticated 401s.</td></tr>
+            <tr><td><code>test_websearch.py</code></td><td class="num">165</td><td>Validation gate, silent failure, events-not-places.</td></tr>
+            <tr><td><code>test_seed_events.py</code></td><td class="num">148</td><td>CLI behaviour: unknown email, idempotency, all-or-nothing batches.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note note--warn">
+        <span class="note__label">Two traps the suite itself fell into</span>
+        <p>
+          <strong>It wrote to the real database.</strong> <code>get_settings()</code> is
+          <code>lru_cache</code>d and pytest imports test modules <em>before</em> session fixtures
+          run, so a <code>scope="session"</code> override landed too late. Fixed at conftest module
+          scope, with an assertion guarding the regression.
+        </p>
+        <p>
+          <strong>It made billable API calls.</strong> conftest <em>popped</em> the keys from
+          <code>os.environ</code> — but Settings also reads <code>backend/.env</code>, and an
+          absent variable does not override a value present in a file. They are now blanked, and a
+          fixture fails loudly if any key is live during a run.
+        </p>
+      </div>
+    </section>
+
+    <section id="bugs">
+      <h2>Bugs worth knowing</h2>
+      <p>
+        These are recorded because each one was invisible until something specific exposed it.
+      </p>
+
+      <h3>The nap instead of lunch</h3>
+      <p>
+        For a family with a child under 8, the midday rest fired at 13:00 and pushed the cursor
+        past the 14:00 lunch window, which then counted as <em>missed</em>. They got a rest
+        instead of lunch, every single day. Teen plans had six meals; the same catalog gave a
+        young family one. A due meal now takes precedence over the rest.
+      </p>
+
+      <h3>Meals priced out of existence</h3>
+      <p>
+        One expensive anchor — Ski Dubai at AED 1,341 — consumed the day's envelope, so every
+        meal window then failed its affordability check. Budget is now reserved for the meals
+        still ahead before any non-dining slot is accepted.
+      </p>
+
+      <h3>Slot ids that moved</h3>
+      <p>
+        <code>persist_plan</code> deleted and reinserted rows, so removing slot 2 renumbered the
+        survivors into ids 1, 2, 3 — and the client's <code>selectedSlotId</code> then pointed at a
+        <em>different</em> slot. Rows are now updated in place via a <code>row_id</code> carried on
+        the planner's dataclass.
+      </p>
+
+      <h3>A label that contradicted the app</h3>
+      <p>
+        The tool trace read <em>"Reading the current plan → no plan yet"</em> while the assistant
+        correctly quoted AED 1,559.98 beside it. The summariser tested
+        <code>result.get("itinerary")</code>, but the populated shape carries
+        <code>itinerary_id</code> and no <code>"itinerary"</code> key at all — so every successful
+        read was labelled as an empty one. Making the assistant's work visible is what surfaced it.
+      </p>
+    </section>
+
+    <section id="limits">
+      <h2>Known limits</h2>
+      <ul>
+        <li><strong>The map is real geography, not the illustration.</strong> MapTiler tiles are recoloured toward the design's cream and teal, but tiles cannot reproduce hand-drawn road ribbons or lettering.</li>
+        <li><strong>Prayer times are approximate.</strong> A static monthly UAE table, ±10 minutes — well inside the slack of a 20-minute gap.</li>
+        <li><strong>Place photos are placeholders.</strong> <code>image_url</code> is seeded null and cards render a per-category illustration, so a card can never show a broken image.</li>
+        <li><strong>Some coordinates are unroutable.</strong> ORS returns 404 for a few beach and island points with no road access; those legs fall back to dashed estimates by design.</li>
+        <li><strong>The assistant is a hard dependency.</strong> The scripted no-LLM fallback was built and then removed by decision, on the basis that the key will always be present. This drops the spec's foolproof guarantee, and is recorded rather than left as a silent contradiction.</li>
+        <li><strong>Prices and hours are plausible, not authoritative.</strong> Coordinates are real so routing is genuine; the figures are illustrative.</li>
+      </ul>
+    </section>
+
+    <footer>
+      <p>
+        Rihla — UAE event-based itinerary planner. Built with React, TypeScript, FastAPI, SQLite
+        and ChromaDB. Source lives in <code>backend/</code> and <code>frontend/</code>; this
+        document is <code>docs/architecture.html</code>.
+      </p>
+    </footer>
+  </main>
+</div>
