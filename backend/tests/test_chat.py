@@ -49,13 +49,17 @@ def orchestrator(db):
 
 def test_the_spec_tools_are_all_exposed():
     names = {tool["function"]["name"] for tool in TOOLS}
-    assert names == {
+    spec_tools = {
         "save_family_details",
         "create_event",
         "get_upcoming_events",
         "generate_itinerary",
         "record_preference",
     }
+    assert spec_tools <= names, f"missing: {spec_tools - names}"
+    # get_itinerary is beyond spec §8: without a way to READ a plan, the assistant could only
+    # describe one from stale context and would contradict the budget bar next to it.
+    assert names == spec_tools | {"get_itinerary"}
 
 
 def test_no_tool_schema_exposes_a_user_id():
@@ -334,3 +338,117 @@ def test_a_thread_cannot_be_bound_to_another_users_plan(client, make_user, db):
     assert client.patch(
         f"/conversations/{conversation_id}", headers=owner_headers, json={"title": "hijacked"}
     ).status_code == 404
+
+
+# --- reading the current plan ------------------------------------------------------------------
+
+
+@pytest.fixture
+def planned(client, make_user, db):
+    """A user with a real generated plan, and their auth headers."""
+    from pathlib import Path
+
+    from app.models import Place
+    from app.seed import default_price_bands
+
+    rows = json.loads(
+        (Path(__file__).resolve().parent.parent / "app" / "data" / "places.json").read_text()
+    )
+    for row in rows:
+        db.add(
+            Place(
+                name=row["name"], emirate=row["emirate"], lat=row["lat"], lng=row["lng"],
+                category=row["category"], price_adult=row.get("price_adult", 0),
+                price_child=row.get("price_child", 0),
+                price_bands=row.get("price_bands") or default_price_bands(row),
+                min_age=row.get("min_age", 0), open_time=row.get("open_time", "09:00"),
+                close_time=row.get("close_time", "22:00"),
+                avg_duration_min=row.get("avg_duration_min", 90), tags=row.get("tags", []),
+                kid_score=row.get("kid_score", 0.5), teen_score=row.get("teen_score", 0.5),
+                romance_score=row.get("romance_score", 0.5), description="",
+            )
+        )
+    db.commit()
+
+    headers, user = make_user("planner@rihla.app")
+    client.put(
+        "/family",
+        headers=headers,
+        json={"members": [{"role": "adult", "age": 34}, {"role": "child", "age": 8}]},
+    )
+    plan = client.post(
+        "/itineraries/generate",
+        headers=headers,
+        json={
+            "start_date": FUTURE, "num_days": 2, "total_budget": 2500.0,
+            "start_lat": 25.2048, "start_lng": 55.2708,
+        },
+    ).json()
+    return headers, user, plan
+
+
+def test_get_itinerary_is_exposed_as_a_tool():
+    assert "get_itinerary" in {tool["function"]["name"] for tool in TOOLS}
+
+
+def test_get_itinerary_reports_no_plan_before_one_exists(db, orchestrator):
+    assert orchestrator().call_tool("get_itinerary", {})["itinerary"] is None
+
+
+def test_get_itinerary_matches_what_the_budget_bar_shows(client, planned, db):
+    """The whole point: the assistant must read current state, not recall it."""
+    headers, user, plan = planned
+    from app.models import Conversation, User
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id, itinerary_id=plan["id"])
+    db.add(conversation)
+    db.commit()
+
+    read = ChatOrchestrator(db, row, conversation).call_tool("get_itinerary", {})
+
+    assert read["itinerary_id"] == plan["id"]
+    assert read["budget"]["total"] == plan["budget"]["total"]
+    assert read["budget"]["cap"] == plan["budget"]["cap"]
+    assert read["budget"]["remaining"] == plan["budget"]["remaining"]
+    assert [d["subtotal"] for d in read["days"]] == [d["subtotal"] for d in plan["days"]]
+    assert [s["name"] for d in read["days"] for s in d["stops"]] == [
+        s["place"]["name"] for d in plan["days"] for s in d["slots"]
+    ]
+
+
+def test_get_itinerary_reflects_an_edit_rather_than_the_original(client, planned, db):
+    """A stale recap is exactly the bug this tool exists to prevent."""
+    from app.models import Conversation, User
+
+    headers, _, plan = planned
+    day = next(d for d in plan["days"] if d["slots"])
+    slot = day["slots"][0]
+
+    client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}", headers=headers, json={"action": "remove"}
+    )
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id, itinerary_id=plan["id"])
+    db.add(conversation)
+    db.commit()
+
+    read = ChatOrchestrator(db, row, conversation).call_tool("get_itinerary", {})
+    fresh = client.get(f"/itineraries/{plan['id']}", headers=headers).json()
+
+    assert read["budget"]["total"] == fresh["budget"]["total"]
+    assert read["budget"]["total"] != plan["budget"]["total"], "the tool returned the stale total"
+    assert slot["place"]["name"] not in [s["name"] for d in read["days"] for s in d["stops"]]
+
+
+def test_get_itinerary_cannot_read_another_users_plan(client, planned, db, orchestrator):
+    _, _, plan = planned
+    intruder = orchestrator("intruder@rihla.app")
+    assert intruder.call_tool("get_itinerary", {"itinerary_id": plan["id"]})["itinerary"] is None
+
+
+def test_the_system_prompt_forbids_quoting_figures_from_memory(db, orchestrator):
+    prompt = orchestrator().system_prompt()
+    assert "Never quote a time, a price or a total from memory" in prompt
+    assert "get_itinerary" in prompt

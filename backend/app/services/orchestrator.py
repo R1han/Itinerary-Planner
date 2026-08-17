@@ -123,6 +123,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_itinerary",
+            "description": (
+                "Read the CURRENT state of a plan — its days, stops, times and budget. Call this "
+                "before describing or summarising a plan. Figures change whenever the user edits "
+                "a slot, asks for a cheaper day or adds prayer breaks, so anything remembered "
+                "from earlier in the conversation may already be stale."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "itinerary_id": {
+                        "type": "integer",
+                        "description": "Omit for the plan currently open beside the chat.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_preference",
             "description": "Record a like or dislike the user mentions in passing.",
             "parameters": {
@@ -179,6 +200,10 @@ class ChatOrchestrator:
             "You do NOT build itineraries yourself. Call generate_itinerary and a deterministic "
             "planner does the scheduling; describe what it returns, never invent times, prices or "
             "places.\n\n"
+            "Never quote a time, a price or a total from memory. Call get_itinerary and read the "
+            "current figures first — the user edits slots, swaps stops and asks for cheaper days "
+            "between messages, so anything you saw earlier in this conversation may already be "
+            "wrong, and the real numbers are on screen next to you.\n\n"
             f"Today is {date.today().isoformat()}.\n"
             f"Signed in as: {self.user.name}\n"
             f"Family: {family_text}\n"
@@ -228,6 +253,7 @@ class ChatOrchestrator:
             "create_event": self._create_event,
             "get_upcoming_events": self._get_upcoming_events,
             "generate_itinerary": self._generate_itinerary,
+            "get_itinerary": self._get_itinerary,
             "record_preference": self._record_preference,
         }.get(name)
         if handler is None:
@@ -381,6 +407,70 @@ class ChatOrchestrator:
             "total": payload["budget"]["total"],
             "cap": payload["budget"]["cap"],
             "remaining": payload["budget"]["remaining"],
+        }
+
+    def _resolve_itinerary(self, itinerary_id: int | None = None) -> Itinerary | None:
+        """Find a plan for THIS user. Every branch filters by user_id, including the explicit id."""
+        owned = self.db.query(Itinerary).filter(Itinerary.user_id == self.user.id)
+
+        if itinerary_id is not None:
+            return owned.filter(Itinerary.id == int(itinerary_id)).one_or_none()
+
+        if self.conversation.itinerary_id:
+            attached = owned.filter(Itinerary.id == self.conversation.itinerary_id).one_or_none()
+            if attached is not None:
+                return attached
+
+        return owned.order_by(Itinerary.updated_at.desc()).first()
+
+    def _get_itinerary(self, args: dict) -> dict:
+        """The plan as it stands right now, straight from the same payload the UI renders.
+
+        Without this the model can only describe a plan from whatever a previous tool call left in
+        its context — which goes stale the moment a slot is edited or a day is made cheaper, and it
+        then reports totals that contradict the budget bar sitting next to it.
+        """
+        itinerary = self._resolve_itinerary(args.get("itinerary_id"))
+        if itinerary is None:
+            return {"itinerary": None, "note": "No plan has been generated yet."}
+
+        payload = itinerary_service.itinerary_payload(self.db, itinerary)
+        budget = payload["budget"]
+        return {
+            "itinerary_id": itinerary.id,
+            "title": payload["title"],
+            "start_date": payload["start_date"],
+            "num_days": payload["num_days"],
+            "currency": payload["currency"],
+            "days": [
+                {
+                    "day": day["day_index"] + 1,
+                    "date": day["date"],
+                    "theme": day["theme"],
+                    "subtotal": day["subtotal"],
+                    "driving_min": day["driving_total_min"],
+                    "stops": [
+                        {
+                            "name": slot["place"].name,
+                            "category": slot["place"].category,
+                            "start": slot["start_time"],
+                            "end": slot["end_time"],
+                            "cost": slot["cost_breakdown"].get("total", 0),
+                        }
+                        for slot in day["slots"]
+                    ],
+                }
+                for day in payload["days"]
+            ],
+            "budget": {
+                "total": budget["total"],
+                "cap": budget["cap"],
+                "remaining": budget["remaining"],
+                "over_budget": budget["over_budget"],
+                "activities": budget["categories"]["activities"],
+                "food": budget["categories"]["food"],
+                "travel": budget["categories"]["travel"],
+            },
         }
 
     def _record_preference(self, args: dict) -> dict:
@@ -542,6 +632,31 @@ class ChatOrchestrator:
                 if unplanned:
                     lines.append(f"Want me to plan an itinerary for {unplanned[0]['title']}?")
                 reply = "Here's what's coming up:\n" + "\n".join(lines)
+
+        elif re.search(r"\b(summar|recap|what.s in|current plan|my plan|cost|total|budget)\b", text):
+            current = self._get_itinerary({})
+            if current.get("itinerary_id") is None:
+                reply = "There's no plan yet. Pick an event and a budget and I'll generate one."
+            else:
+                lines = [f"**{current['title']}** — {current['num_days']} days"]
+                for day in current["days"]:
+                    lines.append(
+                        f"\n**Day {day['day']} · {day['theme']}** — "
+                        f"{current['currency']} {day['subtotal']:,.0f}"
+                    )
+                    lines += [
+                        f"- {stop['start']}–{stop['end']} {stop['name']} "
+                        f"({current['currency']} {stop['cost']:,.0f})"
+                        for stop in day["stops"]
+                    ]
+                budget = current["budget"]
+                state = "over" if budget["over_budget"] else "left"
+                lines.append(
+                    f"\n**Total: {current['currency']} {budget['total']:,.0f}** of "
+                    f"{budget['cap']:,.0f} — {current['currency']} "
+                    f"{abs(budget['remaining']):,.0f} {state}."
+                )
+                reply = "\n".join(lines)
 
         elif re.search(r"\b(plan|itinerary|trip)\b", text):
             missing = itinerary_service.missing_intake_fields(self.db, self.user)

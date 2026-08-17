@@ -74,6 +74,11 @@ loudly instead of silently returning everything.
 That is what makes the hypothesis property tests — random party profiles, catalogs and budgets,
 asserting the validator always passes — cheap enough to run on every commit.
 
+**The assistant reads the plan, it does not remember it.** `get_itinerary` returns the same
+payload the budget bar renders, and the system prompt forbids quoting a time, price or total from
+memory — otherwise a recap describes the plan as it was several edits ago and contradicts the
+figures on screen beside it.
+
 **SSE is consumed with `fetch` + `ReadableStream`, not `EventSource`,** because `EventSource`
 cannot send an `Authorization` header.
 
@@ -86,7 +91,7 @@ segments ORS cannot route degrade to dashed estimates.
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest        # 173 tests, ~55s
+cd backend && .venv/bin/python -m pytest        # 179 tests, ~55s
 cd frontend && npm run build                    # tsc + vite, clean
 ```
 
