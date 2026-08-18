@@ -352,6 +352,16 @@ _TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "24h HH:MM. Required when action is adjust.",
                     },
+                    "allow_reorder": {
+                        "type": "boolean",
+                        "description": (
+                            "Only after the user has agreed the day's schedule may move. When "
+                            "nothing of the asked-for kind is open at that stop's hour, the "
+                            "server checks the whole day and comes back naming a place and a "
+                            "time; put that to the user and retry with this true if they agree. "
+                            "The stops after it shift later. Never set it pre-emptively."
+                        ),
+                    },
                     "allow_overrun": {
                         "type": "boolean",
                         "description": (
@@ -371,13 +381,32 @@ _TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "record_preference",
-            "description": "Record a like or dislike the user mentions in passing.",
+            "description": (
+                "Record a like or dislike the user mentions, whether they ask you to or not. "
+                "Call it alongside whatever else the message needs — 'I don't like kayaking' is "
+                "an edit AND a preference, and doing only the edit forgets it by the next "
+                "session."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "kind": {"type": "string", "enum": ["like", "dislike"]},
-                    "subject": {"type": "string"},
-                    "category": {"type": "string"},
+                    "subject": {
+                        "type": "string",
+                        "description": (
+                            "What they said, in their words — 'kayaking', 'seafood', 'Ski "
+                            "Dubai'. Matched against place names and tags, so the noun matters "
+                            "more than the sentence."
+                        ),
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "Only when the dislike is of the WHOLE kind of place. It rules out "
+                            "every place in that category, so 'I don't like kayaking' takes no "
+                            "category — that would bar every adventure they have left."
+                        ),
+                    },
                 },
                 "required": ["kind", "subject"],
             },
@@ -753,10 +782,13 @@ class ChatOrchestrator:
             "set_transport, add_stop and edit_stop. To swap one stop for a different kind of "
             "place use edit_stop with action='replace' and a category — never remove it and hope; "
             "removing leaves the day one stop short. Name the stop the way the user did and edit_stop will "
-            "find it; there are no ids to fetch or remember. If a replace "
-            "comes back needing confirmation, the only thing standing in the way is the day "
-            "running later than planned — tell the user which place it is and when it ends, ask "
-            "them, and only then retry with allow_overrun. Do NOT reach for generate_itinerary to work "
+            "find it; there are no ids to fetch or remember. A replace that comes "
+            "back needing confirmation has already found something; what it needs is permission. "
+            "window_overrun means the day would finish later than planned — say which place and "
+            "when it ends. day_reorder means nothing of that kind is open at that stop's hour but "
+            "something is earlier, so the day would re-time around it — say which place, how long "
+            "it runs, and that the later stops shift. Ask, wait for the answer, and only "
+            "then retry with allow_overrun or allow_reorder. Do not set either unasked. Do NOT reach for generate_itinerary to work "
             "around an edit: it builds a replacement plan from scratch and throws the current one "
             "away. Once a conversation has a plan the server refuses to rebuild it unless you pass "
             "replace_existing, and rightly so: an edit that cannot be made is a reason to say so "
@@ -796,6 +828,12 @@ class ChatOrchestrator:
             "have been given, and pass its event_id exactly as listed. Do not guess an id: the "
             "plan is titled after the event you name, so the wrong one mislabels the whole trip. "
             "get_upcoming_events is only for looking further ahead than the list above.\n\n"
+"Likes and dislikes are worth recording the moment they are said, and a message can be "
+            "two things at once: \"I don't like kayaking\" is an edit to make AND a preference "
+            "to keep, so call record_preference in the same turn as the edit. Doing only the "
+            "edit fixes today's plan and forgets the reason by the next session, which is how "
+            "the same thing gets suggested again. Record what they actually said and leave "
+            "`category` unset unless they dislike the entire kind of place.\n\n"
             "Everything listed above is already on file — never ask the user to repeat it. Ask "
             "only for what is genuinely missing: usually just the budget and the dates, and an "
             "event's own date is a fine default start date. When you have enough, call "
@@ -1291,7 +1329,16 @@ class ChatOrchestrator:
                 start_time=args.get("start_time"),
                 category=args.get("category"),
                 allow_overrun=bool(_arg(args, "allow_overrun", False)),
+                allow_reorder=bool(_arg(args, "allow_reorder", False)),
             )
+        except itinerary_service.DayReorderRequired as exc:
+            # Before WindowOverrunRequired only because both are ValueErrors and order decides.
+            return {
+                "needs_confirmation": "day_reorder",
+                "place": exc.place_name,
+                "duration_min": exc.duration_min,
+                "ask": str(exc),
+            }
         except itinerary_service.WindowOverrunRequired as exc:
             # Not an `error`: nothing failed, the server needs an answer. Returned before the
             # plain ValueError branch because it is one.

@@ -43,6 +43,7 @@ from .planner import (
     PlannedSlot,
     PreferenceSignal,
     TravelInfo,
+    DINING_CATEGORIES,
     DINNER_ONLY,
     FULL_DAY,
     MAX_HOP_KM,
@@ -705,6 +706,106 @@ def _candidates_for_gap(
     return [c for c in candidates if c.id not in exclude_place_ids]
 
 
+def _meals_eaten(profile: PartyProfile, day: DayPlan) -> str:
+    """"a lunch and a dinner" — what a day has already booked, for a refusal that explains."""
+    eaten = [
+        f"a {role}"
+        for slot in sorted(day.slots, key=lambda s: s.start_min)
+        if slot.place.category in DINING_CATEGORIES
+        and (role := meal_role(profile, slot.start_min, slot.end_min))
+    ]
+    if not eaten:
+        return "no meals"
+    return " and ".join([", ".join(eaten[:-1]), eaten[-1]] if len(eaten) > 1 else eaten)
+
+
+def meal_role(profile: PartyProfile, start_min: int, end_min: int) -> str | None:
+    """Which meal this time range would be — "lunch", "dinner", or None for neither.
+
+    `profile.meal_windows` is what the generator plans around, so reading it here is what stops
+    an edit from quietly dismantling the structure generation built.
+    """
+    for label, opens, closes in profile.meal_windows:
+        if start_min < closes and end_min > opens:
+            return label
+    return None
+
+
+def free_meal_windows(
+    profile: PartyProfile, day: DayPlan, *, ignore_position: int | None = None
+) -> set[str]:
+    """The meals this day has not eaten yet, ignoring one slot that is about to change."""
+    taken = {
+        role
+        for slot in day.slots
+        if slot.position != ignore_position
+        and slot.place.category in DINING_CATEGORIES
+        and (role := meal_role(profile, slot.start_min, slot.end_min))
+    }
+    return {label for label, _, _ in profile.meal_windows} - taken
+
+
+def _placements_in_day(
+    context: PlanContext,
+    day: DayPlan,
+    candidates: list[PlaceCandidate],
+    *,
+    travel_fn,
+    spare: float,
+    free_meals: set[str],
+    allow_shift: bool = False,
+) -> list[tuple[float, int, PlaceCandidate, Placement, CostBreakdown]]:
+    """Every way a candidate could sit in this day, ranked by what it costs the day.
+
+    Every insertion point: before the first stop, between each pair, and after the last. Shared
+    by "add a stop" and by a replace that has to re-time the day, so the two can never disagree
+    about what fits where.
+
+    Dining is the one category that is not free to land anywhere. The generator treats it as a
+    role — `assemble_day` builds around meal windows and refuses dining when filling an activity
+    slot — and edits used to treat it as a plain category, which is how a day ended up with three
+    restaurants in a row. A restaurant goes in a meal window that is still free, or nowhere.
+    """
+    ordered = sorted(day.slots, key=lambda s: s.start_min)
+    considered: list[tuple[float, int, PlaceCandidate, Placement, CostBreakdown]] = []
+
+    for index in range(len(ordered) + 1):
+        previous = ordered[index - 1] if index > 0 else None
+        following = ordered[index] if index < len(ordered) else None
+        from_point = (previous.place.lat, previous.place.lng) if previous else context.origin
+        earliest = previous.end_min if previous else context.profile.day_start
+        latest = following.start_min if following else context.profile.day_end
+
+        for candidate in candidates:
+            # `allow_shift` stops the NEXT stop being a wall: it may move later, which is what
+            # "the day re-times around it" means. The day's own end still binds, so re-timing
+            # cannot quietly turn a day out into a night out.
+            fit = placement_for(
+                candidate, context, travel_fn,
+                earliest=earliest,
+                latest=context.profile.day_end if allow_shift else latest,
+                from_point=from_point,
+                following=None if allow_shift else following,
+                day_month=day.day_date.month,
+                from_origin=previous is None,
+            )
+            if fit is None:
+                continue
+            if candidate.category in DINING_CATEGORIES:
+                role = meal_role(context.profile, fit.start_min, fit.end_min)
+                if role is None or role not in free_meals:
+                    continue
+            cost = slot_cost_breakdown(candidate, context.profile.attendees, fit.inbound.est_cost)
+            if cost.total > spare:
+                continue
+            # Prefer the stop that adds the least travel, then the better-scoring place.
+            detour = geographic_penalty(candidate, from_point, context.origin)
+            rank = detour - 20.0 * score_place(candidate, context.profile, context.preferences)
+            considered.append((rank, index, candidate, fit, cost))
+
+    return considered
+
+
 # The words people use for a category where they differ from the category itself. Not a synonym
 # engine — just the handful the transcripts actually produced. "shopping" for a `mall` is the one
 # that went wrong three times running.
@@ -794,6 +895,7 @@ def placement_for(
     following: PlannedSlot | None,
     day_month: int,
     ignore_window: bool = False,
+    from_origin: bool = False,
 ) -> Placement | None:
     """Fit one candidate into one gap, or None if it cannot go there.
 
@@ -811,7 +913,14 @@ def placement_for(
         return None
     if not candidate.open_in_month(day_month):
         return None
-    if haversine_km(from_point[0], from_point[1], candidate.lat, candidate.lng) > MAX_HOP_KM:
+    # The cap is on the hop BETWEEN stops — "this far from the last one is a different trip, not
+    # the next thing to do". The drive from home is not that hop, and `assemble_day` has always
+    # exempted it (`previous_position is not None`). Applying it here anyway meant no edit could
+    # ever put a first stop where generation had happily put one: an Abu Dhabi day built 130 km
+    # from home could not have its opening stop swapped, added to, or re-timed into.
+    if not from_origin and haversine_km(
+        from_point[0], from_point[1], candidate.lat, candidate.lng
+    ) > MAX_HOP_KM:
         return None
 
     inbound = travel_fn(from_point[0], from_point[1], candidate.lat, candidate.lng)
@@ -883,6 +992,7 @@ def alternatives_for_slot(
             candidate, context, travel_fn,
             earliest=earliest, latest=latest, from_point=origin, following=following,
             day_month=day.day_date.month, ignore_window=ignore_window,
+            from_origin=previous is None,
         )
         if fit is None:
             continue
@@ -928,6 +1038,72 @@ class WindowOverrunRequired(ValueError):
         self.ends_at = ends_at
 
 
+def _retimed_placement(
+    db: Session,
+    context: PlanContext,
+    plan: Plan,
+    day: DayPlan,
+    target: PlannedSlot,
+    category: str,
+    travel_service,
+    free_meals: set[str],
+) -> tuple[PlaceCandidate, Placement, CostBreakdown] | None:
+    """The best place of this kind anywhere in the day, with the target slot free to move.
+
+    The target is lifted out for the search — it is the slot being replaced, so its hours are not
+    a constraint on its own replacement — and put straight back. Nothing is persisted from here;
+    the caller either applies the answer or raises with the plan untouched.
+    """
+    # The target's own place stays in `booked`: a replace that reselects what is already there
+    # is not a replace.
+    booked = {slot.place.id for d in plan.days for slot in d.slots}
+    candidates = [
+        c for c in _candidates_for_gap(db, context, booked) if c.category == category
+    ]
+    if not candidates:
+        return None
+
+    day.slots.remove(target)
+    try:
+        considered = _placements_in_day(
+            context, day, candidates,
+            travel_fn=travel_service.estimate_fn(),
+            spare=plan.total_budget - plan.total_cost,
+            free_meals=free_meals,
+            allow_shift=True,
+        )
+    finally:
+        day.slots.append(target)
+        day.slots.sort(key=lambda slot: slot.start_min)
+
+    if not considered:
+        return None
+    _, _, candidate, fit, cost = min(considered, key=lambda row: row[0])
+    return candidate, fit, cost
+
+
+class DayReorderRequired(ValueError):
+    """Nothing of this kind can occupy that slot's hours, but something can if the day re-times.
+
+    A ValueError like its sibling, so handlers already wrapped around `patch_slot` still catch
+    it. What it carries is the distinction the old refusal could not make: a stop's place in the
+    clock is not what the user asked about. "Swap the shopping for an adventure" is a request
+    about the day, and every adventure in range being shut at 20:35 is a fact about the hour.
+    """
+
+    def __init__(self, category: str, place_name: str, duration_min: int) -> None:
+        hours = duration_min / 60
+        length = f"{hours:.0f} hours" if hours >= 1.5 else f"{duration_min} minutes"
+        super().__init__(
+            f"Nothing of that kind is open at this stop's hour. {place_name} works, but it runs "
+            f"{length} and has to sit earlier in the day, so the stops after it shift later. Ask "
+            f"the user whether the schedule may move, then retry with allow_reorder=true."
+        )
+        self.category = category
+        self.place_name = place_name
+        self.duration_min = duration_min
+
+
 def _best_alternative(
     db: Session,
     itinerary: Itinerary,
@@ -966,6 +1142,7 @@ def patch_slot(
     start_time: str | None = None,
     category: str | None = None,
     allow_overrun: bool = False,
+    allow_reorder: bool = False,
 ) -> tuple[Plan, PlanContext, int]:
     """Replace / adjust / remove one slot, re-solving only that gap.
 
@@ -987,6 +1164,10 @@ def patch_slot(
     target = next((s for s in day.slots if s.position == position), None)
     if target is None:
         raise ValueError("Slot not found in the loaded plan")
+    stops_before = len(day.slots)
+    # Raised only once the reflow has proved the re-time actually works. Asking first and
+    # refusing after the user says yes is worse than not asking.
+    pending_reorder: DayReorderRequired | None = None
 
     travel_service = _travel_service(db, itinerary, context)
 
@@ -1001,60 +1182,105 @@ def patch_slot(
         target.end_min = target.start_min + duration
 
     elif action == "replace":
+        # Set when the day was re-timed around the new stop, which places it itself — the common
+        # tail below would otherwise drag it back to the outgoing stop's hour.
+        retimed_in_place = False
+
         if place_id is None:
             if not category:
                 raise ValueError("replace requires place_id or category")
             label = category.replace("_", " ")
-            chosen = _best_alternative(db, itinerary, user, slot_row, category)
-            if chosen is None:
+
+            # Dining is a role, not a slot filler: a restaurant belongs in a meal window this day
+            # has not used yet. Checked before searching, so an 8pm show is not swapped for a
+            # second dinner merely because a restaurant happens to be open at 8pm.
+            free_meals = free_meal_windows(context.profile, day, ignore_position=position)
+            fits_a_meal = (
+                category not in DINING_CATEGORIES
+                or meal_role(context.profile, target.start_min, target.end_min) in free_meals
+            )
+
+            def here(**relaxed):
+                return (
+                    _best_alternative(db, itinerary, user, slot_row, category, **relaxed)
+                    if fits_a_meal
+                    else None
+                )
+
+            chosen = here()
+            if chosen is not None:
+                place_id = chosen["place"].id
+            elif (by_window := here(ignore_window=True)) is not None:
                 # "Nothing fits" is five different answers wearing one coat — the window, the
                 # budget, the age gate, the distance cap, or a catalog with none of that kind.
                 # Naming the wrong one sends the user off adjusting something that was never the
                 # problem, so relax one constraint at a time and let whichever unblocks the
-                # search name itself. Distinct from the message above on purpose: "you did not
-                # say what to put here" needs a different answer again.
-                by_window = _best_alternative(
-                    db, itinerary, user, slot_row, category, ignore_window=True
-                )
-                if by_window is None:
-                    by_budget = _best_alternative(
-                        db, itinerary, user, slot_row, category, ignore_budget=True
-                    )
-                    if by_budget is not None:
-                        # Same arithmetic as `alternatives_for_slot`: what is left over once this
-                        # slot's own cost is handed back.
-                        spare = plan.total_budget - plan.total_cost + target.cost.total
-                        raise ValueError(
-                            f"The cheapest {label} that fits this slot is "
-                            f"{by_budget['place'].name} at "
-                            f"{by_budget['cost_breakdown']['total']:.0f} "
-                            f"{itinerary.currency}, and only {spare:.0f} {itinerary.currency} of "
-                            f"the budget is unspent. Time is not the problem here."
-                        )
-                    raise ValueError(
-                        f"No {label} can go in this slot at all — nothing of that kind in range "
-                        f"is open then, suitable for the party, and within budget. Neither a "
-                        f"later finish nor a bigger budget would change it."
-                    )
+                # search name itself.
                 if not allow_overrun:
                     raise WindowOverrunRequired(
                         label, by_window["place"].name, by_window["end_time"]
                     )
-                chosen = by_window
-            place_id = chosen["place"].id
-        place_row = db.get(Place, place_id)
-        if place_row is None:
-            raise ValueError("Unknown place")
+                place_id = by_window["place"].id
+            elif (by_budget := here(ignore_budget=True)) is not None:
+                # Same arithmetic as `alternatives_for_slot`: what is left once this slot's own
+                # cost is handed back.
+                spare = plan.total_budget - plan.total_cost + target.cost.total
+                raise ValueError(
+                    f"The cheapest {label} that fits this slot is {by_budget['place'].name} at "
+                    f"{by_budget['cost_breakdown']['total']:.0f} {itinerary.currency}, and only "
+                    f"{spare:.0f} {itinerary.currency} of the budget is unspent. Time is not the "
+                    f"problem here."
+                )
+            else:
+                # Everything above asked what fits HERE — in the hours this stop happens to
+                # occupy. That is not what was asked. Every other slot is locked so an edit
+                # cannot cascade, which is right for "move this half an hour later" and wrong for
+                # "swap this kind for that kind": a category carries opening hours, and opening
+                # hours decide when it can happen at all. So ask the day, not the slot.
+                retimed = _retimed_placement(
+                    db, context, plan, day, target, category, travel_service, free_meals
+                )
+                if retimed is None:
+                    if not fits_a_meal:
+                        raise ValueError(
+                            f"This day already has {_meals_eaten(context.profile, day)}, and this "
+                            f"stop is not at a mealtime — swapping it for a {label} would make it "
+                            f"the day's third sit-down meal. Replace one of the meals instead."
+                        )
+                    raise ValueError(
+                        f"No {label} can go anywhere in this day — nothing of that kind in range "
+                        f"is open, suitable for the party, and within budget. Neither a later "
+                        f"finish nor a bigger budget would change it."
+                    )
+                candidate, fit, cost = retimed
+                if not allow_reorder:
+                    # Applied anyway, then raised after the repair pass below has had its say —
+                    # the probe only knows the stop fits, not what shifting the day does to the
+                    # stops behind it.
+                    pending_reorder = DayReorderRequired(
+                        label, candidate.name, fit.end_min - fit.start_min
+                    )
+                # Position is derived from start_min by `rebuild_segments`, so moving the slot in
+                # the clock is the whole of moving it in the day.
+                target.place = candidate
+                target.start_min, target.end_min = fit.start_min, fit.end_min
+                target.cost = cost
+                retimed_in_place = True
 
-        candidate = to_candidate(place_row)
-        if not all(person.age >= candidate.min_age for person in context.profile.attendees):
-            raise ValueError(f"{candidate.name} requires age {candidate.min_age}+")
+        if not retimed_in_place:
+            place_row = db.get(Place, place_id)
+            if place_row is None:
+                raise ValueError("Unknown place")
 
-        target.place = candidate
-        duration = min(candidate.avg_duration_min, context.profile.max_slot_min)
-        target.start_min = max(target.start_min, candidate.opens_at)
-        target.end_min = target.start_min + duration
-        target.cost = slot_cost_breakdown(candidate, context.profile.attendees)
+            candidate = to_candidate(place_row)
+            if not all(person.age >= candidate.min_age for person in context.profile.attendees):
+                raise ValueError(f"{candidate.name} requires age {candidate.min_age}+")
+
+            target.place = candidate
+            duration = min(candidate.avg_duration_min, context.profile.max_slot_min)
+            target.start_min = max(target.start_min, candidate.opens_at)
+            target.end_min = target.start_min + duration
+            target.cost = slot_cost_breakdown(candidate, context.profile.attendees)
     else:
         raise ValueError(f"Unknown action {action!r}")
 
@@ -1072,12 +1298,23 @@ def patch_slot(
     # `repair_plan` resolves a violation by dropping a slot, and the edited one is the only
     # unlocked candidate — so a replacement that breaks the day gets deleted instead of applied.
     # Nothing is persisted yet, so raising here leaves the plan exactly as the user last saw it.
-    if action == "replace" and not any(
-        slot.place.id == place_id for d in plan.days for slot in d.slots
-    ):
-        raise ValueError(
-            f"{db.get(Place, place_id).name} could not be fitted here without breaking the day."
-        )
+    if action == "replace":
+        placed = [slot.place.name for slot in plan.days[day_index].slots]
+        if place_id is not None and not any(
+            slot.place.id == place_id for d in plan.days for slot in d.slots
+        ):
+            raise ValueError(
+                f"{db.get(Place, place_id).name} could not be fitted here without breaking "
+                f"the day."
+            )
+        if len(placed) < stops_before:
+            raise ValueError(
+                f"Making room for that would cost the day a stop — it ends up with "
+                f"{len(placed)} instead of {stops_before}. Remove something first if that is "
+                f"what you want."
+            )
+        if pending_reorder is not None:
+            raise pending_reorder
 
     for other_day in plan.days:
         for slot in other_day.slots:
@@ -1113,38 +1350,20 @@ def add_stop(
         raise ValueError(f"Nothing available in {category!r}." if category else "Nothing available.")
 
     travel_service = _travel_service(db, itinerary, context)
-    travel_fn = travel_service.estimate_fn()
-    spare = plan.total_budget - plan.total_cost
-    ordered = sorted(day.slots, key=lambda s: s.start_min)
-
-    # Every insertion point: before the first stop, between each pair, and after the last.
-    considered: list[tuple[float, int, PlaceCandidate, Placement, CostBreakdown]] = []
-    for index in range(len(ordered) + 1):
-        previous = ordered[index - 1] if index > 0 else None
-        following = ordered[index] if index < len(ordered) else None
-        from_point = (
-            (previous.place.lat, previous.place.lng) if previous else context.origin
-        )
-        earliest = previous.end_min if previous else context.profile.day_start
-        latest = following.start_min if following else context.profile.day_end
-
-        for candidate in candidates:
-            fit = placement_for(
-                candidate, context, travel_fn,
-                earliest=earliest, latest=latest, from_point=from_point, following=following,
-                day_month=day.day_date.month,
-            )
-            if fit is None:
-                continue
-            cost = slot_cost_breakdown(candidate, context.profile.attendees, fit.inbound.est_cost)
-            if cost.total > spare:
-                continue
-            # Prefer the stop that adds the least travel, then the better-scoring place.
-            detour = geographic_penalty(candidate, from_point, context.origin)
-            rank = detour - 20.0 * score_place(candidate, context.profile, context.preferences)
-            considered.append((rank, index, candidate, fit, cost))
+    considered = _placements_in_day(
+        context, day, candidates,
+        travel_fn=travel_service.estimate_fn(),
+        spare=plan.total_budget - plan.total_cost,
+        free_meals=free_meal_windows(context.profile, day),
+    )
 
     if not considered:
+        if category in DINING_CATEGORIES and not free_meal_windows(context.profile, day):
+            raise ValueError(
+                f"This day already has {_meals_eaten(context.profile, day)}. A third sit-down "
+                f"meal is not a gap in the schedule, it is a third meal — swap one of those "
+                f"instead, or say which one to replace."
+            )
         raise ValueError("Nothing in that category fits this day's schedule or budget.")
 
     _, position, chosen, fit, cost = min(considered, key=lambda row: row[0])

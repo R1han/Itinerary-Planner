@@ -1684,12 +1684,14 @@ def test_a_swap_blocked_by_nothing_relaxable_says_so(client, planned, db, monkey
     chat = _chat_for(db, plan)
     stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
     monkeypatch.setattr(itinerary_service, "_best_alternative", lambda *a, **k: None)
+    # Re-timing the day is the last thing tried, so a true "no" has to defeat that too.
+    monkeypatch.setattr(itinerary_service, "_retimed_placement", lambda *a, **k: None)
 
     result = chat.call_tool(
         "edit_stop", {"stop": stop["name"], "action": "replace", "category": "museum"}
     )
     # The old wording blamed the window and the budget every time. Neither applies here.
-    assert "can go in this slot at all" in result["error"]
+    assert "can go anywhere in this day" in result["error"]
     assert "Neither a later finish nor a bigger budget" in result["error"]
 
 
@@ -1968,3 +1970,222 @@ def test_no_chat_tool_asks_the_model_for_a_database_id():
     assert {name: ids for name, ids in supplied.items() if ids} == {
         "generate_itinerary": ["event_id"]
     }
+
+
+# --- a swap is a request about the day, not about the hour -------------------------------------
+
+
+def _abu_dhabi_day(db, planned):
+    """The reported scenario: seven people, one day, AED 7,000, confined to Abu Dhabi."""
+    from app.models import Conversation, User
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    built = chat.call_tool("generate_itinerary", {
+        "days": 1, "budget": 7000, "start_date": FUTURE,
+        "party_size": 7, "emirates": ["Abu Dhabi"],
+    })
+    assert "error" not in built, built
+    return chat
+
+
+def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
+    """The reported bug: 'replace shopping with an adventure' refused with AED 1,168 unspent.
+
+    Every adventure in range is shut by 20:35, and the replacement was pinned to the outgoing
+    stop's place in the clock. Neither budget nor a later finish was ever the constraint, so
+    waiving them — as the user did, twice — could not have helped.
+    """
+    chat = _abu_dhabi_day(db, planned)
+    # A packed day has no room to re-time INTO — the honest answer there is "that would cost the
+    # day a stop", tested separately. Thin it out so re-timing is the thing under test.
+    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
+        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
+        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+
+    plan = chat.call_tool("get_itinerary", {})
+    last = plan["days"][0]["stops"][-1]
+
+    # A museum, because museums shut in the evening: a later finish cannot help, which is what
+    # separates this from the window-overrun question.
+    asked = chat.call_tool(
+        "edit_stop", {"stop": last["name"], "action": "replace", "category": "museum"}
+    )
+    if asked.get("needs_confirmation") != "day_reorder":
+        pytest.skip(f"this day admits a museum without re-timing: {asked}")
+
+    assert asked["needs_confirmation"] == "day_reorder"
+    assert asked["place"] and asked["duration_min"] > 0
+    # Nothing may move while the question is outstanding.
+    held = chat.call_tool("get_itinerary", {})
+    assert [s["name"] for s in held["days"][0]["stops"]] == [
+        s["name"] for s in plan["days"][0]["stops"]
+    ]
+
+    agreed = chat.call_tool(
+        "edit_stop",
+        {"stop": last["name"], "action": "replace", "category": "museum",
+         "allow_reorder": True},
+    )
+    assert "error" not in agreed, agreed
+    after = chat.call_tool("get_itinerary", {})
+    names = [s["name"] for s in after["days"][0]["stops"]]
+    assert asked["place"] in names, "the place it named is the place it placed"
+    assert last["name"] not in names
+    assert len(names) == len(plan["days"][0]["stops"]), "a swap, not a removal"
+
+
+def test_re_timing_never_costs_the_day_a_stop(client, planned, db):
+    """Shifting the later stops can push one past its own closing time, and the repair pass
+    deletes what it cannot fix. Losing a stop the user never mentioned is the failure this whole
+    thread has been about."""
+    chat = _abu_dhabi_day(db, planned)
+    before = chat.call_tool("get_itinerary", {})["days"][0]["stops"]
+    last = before[-1]
+
+    chat.call_tool(
+        "edit_stop",
+        {"stop": last["name"], "action": "replace", "category": "adventure",
+         "allow_reorder": True},
+    )
+
+    after = chat.call_tool("get_itinerary", {})["days"][0]["stops"]
+    assert len(after) == len(before), [s["name"] for s in after]
+
+
+# --- dining is a meal, not a category ----------------------------------------------------------
+
+
+def test_a_day_will_not_take_a_third_sit_down_meal(client, planned, db):
+    """The reported bug: three dining stops in a row at the end of the day.
+
+    The generator treats dining as a role — `assemble_day` builds around meal windows and refuses
+    dining when filling an activity slot — and the edit paths treated it as a plain category, so
+    every edit eroded the structure generation had built.
+    """
+    from app.models import Itinerary
+    from app.services.itinerary import free_meal_windows, context_for, load_plan
+
+    chat = _abu_dhabi_day(db, planned)
+    plan = chat.call_tool("get_itinerary", {})
+    itinerary = db.get(Itinerary, plan["itinerary_id"])
+    day = load_plan(db, itinerary).days[0]
+    profile = context_for(db, itinerary, chat.user).profile
+
+    # Fill both meal windows, so any further dining would be a third meal.
+    for role in list(free_meal_windows(profile, day)):
+        del role
+        for stop in plan["days"][0]["stops"]:
+            chat.call_tool(
+                "edit_stop",
+                {"stop": stop["name"], "action": "replace", "category": "casual_dining"},
+            )
+        plan = chat.call_tool("get_itinerary", {})
+
+    final = chat.call_tool("get_itinerary", {})["days"][0]["stops"]
+    dining = [s for s in final if s["category"] in ("casual_dining", "fine_dining")]
+    assert len(dining) <= 2, [s["name"] for s in dining]
+
+
+def test_meal_roles_come_from_the_profile_the_generator_plans_with(client, planned, db):
+    from app.models import Itinerary
+    from app.services.itinerary import context_for, free_meal_windows, load_plan, meal_role
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    profile = context_for(db, itinerary, itinerary.user_id and db.get(
+        __import__("app.models", fromlist=["User"]).User, itinerary.user_id)).profile
+
+    lunch = next(w for w in profile.meal_windows if w[0] == "lunch")
+    assert meal_role(profile, lunch[1] + 10, lunch[1] + 70) == "lunch"
+    # 03:00 is nobody's mealtime.
+    assert meal_role(profile, 3 * 60, 4 * 60) is None
+
+    day = load_plan(db, itinerary).days[0]
+    assert free_meal_windows(profile, day) <= {label for label, _, _ in profile.meal_windows}
+
+
+def test_adding_a_third_meal_says_which_two_are_already_there(client, planned, db):
+    from app.models import Itinerary, User
+    from app.services import itinerary as isvc
+
+    chat = _abu_dhabi_day(db, planned)
+    itinerary = db.get(Itinerary, chat.call_tool("get_itinerary", {})["itinerary_id"])
+    user = db.get(User, itinerary.user_id)
+    monkey = isvc.free_meal_windows
+
+    try:
+        isvc.free_meal_windows = lambda *a, **k: set()   # every meal already eaten
+        with pytest.raises(ValueError, match="third sit-down meal|already has"):
+            isvc.add_stop(db, itinerary, user, day_index=0, category="casual_dining")
+    finally:
+        isvc.free_meal_windows = monkey
+
+
+def test_the_hop_cap_applies_between_stops_not_to_the_drive_from_home(client, planned, db):
+    """Generation exempts the leg from home; every edit path applied the 60 km cap to it.
+
+    `assemble_day` guards its hop check with `previous_position is not None` — "this far from the
+    LAST one is a different trip". A day generated 130 km away in Abu Dhabi could therefore never
+    have its opening stop swapped, added to, or re-timed into, because the only reference point
+    for the first slot is the family's home in Dubai.
+    """
+    from app.services.itinerary import placement_for
+    from app.services.planner import MAX_HOP_KM, TravelInfo
+    from app.services.itinerary import context_for
+    from app.models import Itinerary, Place, User
+    from app.services.retrieval import to_candidate
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    context = context_for(db, itinerary, db.get(User, itinerary.user_id))
+    candidate = to_candidate(db.query(Place).filter(Place.min_age == 0).first())
+
+    def no_travel(*_):
+        return TravelInfo(distance_km=0.0, duration_min=0, est_cost=0.0)
+
+    # A point well beyond the cap from the candidate, standing in for home.
+    faraway = (candidate.lat + 2.0, candidate.lng)
+    common = dict(
+        travel_fn=no_travel, from_point=faraway, following=None, day_month=6,
+        earliest=candidate.opens_at, latest=24 * 60,
+    )
+    assert MAX_HOP_KM < 200, "this test assumes the cap is well under the 2-degree offset used"
+
+    assert placement_for(candidate, context, from_origin=False, **common) is None
+    assert placement_for(candidate, context, from_origin=True, **common) is not None
+
+
+def test_the_prompt_asks_for_preferences_to_be_recorded_alongside_the_edit(db, orchestrator):
+    """The reported bug: "I don't like Kayaking" made the swap and recorded nothing.
+
+    record_preference existed, worked, and was never once mentioned in a system prompt that
+    instructs the model about every other tool in detail. With an actionable edit in the same
+    sentence, the model did the edit and dropped the preference.
+    """
+    prompt = orchestrator().system_prompt()
+    assert "record_preference in the same turn as the edit" in prompt
+    assert "two things at once" in prompt
+
+
+def test_recording_a_dislike_actually_reaches_the_scorer(client, planned, db):
+    """End to end: what the tool writes has to be what the planner reads."""
+    from app.models import Itinerary, Place, User
+    from app.services.itinerary import context_for
+    from app.services.planner import preference_signal
+    from app.services.retrieval import to_candidate
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    kayak = db.query(Place).filter(Place.name.like("%Kayak%")).first()
+    if kayak is None:
+        pytest.skip("no kayak in the catalog")
+
+    chat.call_tool("record_preference", {"kind": "dislike", "subject": "kayaking"})
+    db.commit()
+
+    context = context_for(db, db.get(Itinerary, plan["id"]), db.get(User, chat.user.id))
+    assert preference_signal(to_candidate(kayak), context.preferences) < 0
