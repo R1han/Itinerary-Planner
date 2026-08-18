@@ -160,7 +160,22 @@ _TOOL_DEFINITIONS = [
                     "event_id": {"type": "integer"},
                     "start_date": {"type": "string", "description": "ISO date, YYYY-MM-DD"},
                     "days": {"type": "integer", "description": "1 to 5."},
-                    "budget": {"type": "number", "description": "In AED, greater than zero."},
+                    "budget": {
+                        "type": "number",
+                        "description": (
+                            "The WHOLE trip's budget in AED, when the user gives one figure for "
+                            "the trip. Greater than zero."
+                        ),
+                    },
+                    "budget_per_day": {
+                        "type": "number",
+                        "description": (
+                            "Budget for EACH day in AED — use this, not `budget`, whenever the "
+                            "user says per day, a day, every day, daily or nightly. The server "
+                            "multiplies it by `days`; never do that arithmetic yourself and "
+                            "never pass both."
+                        ),
+                    },
                     "prayer_breaks": {"type": "boolean"},
                     "focus": {
                         "type": "string",
@@ -231,7 +246,7 @@ _TOOL_DEFINITIONS = [
                         ),
                     },
                 },
-                "required": ["days", "budget"],
+                "required": ["days"],
             },
         },
     },
@@ -829,6 +844,10 @@ class ChatOrchestrator:
             "`guests` as well only when one of the extras is a child, so their age reaches the "
             "ticket bands. Party size decides the vehicle, the fares and every ticket, so never "
             "just acknowledge a headcount in prose and plan without passing it.\n\n"
+"A budget is one figure for the trip or one figure for each day, and which one "
+            "decides the whole plan. \"3000 a day\" over five days is a 15,000 trip: pass it as "
+            "budget_per_day and let the server multiply. Pass `budget` only when the user gave a "
+            "single number for the trip as a whole.\n\n"
             "Plan what was asked for and no more. A request for a dinner is generate_itinerary "
             "with focus='dinner_only' — one evening stop — not a day out with a restaurant at the "
             "end of it. Set adults_only when the children are not coming, which an anniversary "
@@ -1077,7 +1096,22 @@ class ChatOrchestrator:
         focus = str(_arg(args, "focus", itinerary_service.FULL_DAY))
         if focus not in itinerary_service.PLAN_FOCUS:
             return {"error": f"Unknown focus {focus!r}."}
+        # "3000 AED every day" over five days is 15,000, and there used to be no way to say so:
+        # one `budget` meant the trip total, the user's phrasing meant a day, and the figure went
+        # in unchanged. The server does the multiplication, for the same reason it does not let
+        # the model subtract a household from a party size — arithmetic on the user's words is
+        # where their meaning quietly changes.
         budget = float(_arg(args, "budget", 0))
+        per_day = float(_arg(args, "budget_per_day", 0))
+        if budget > 0 and per_day > 0:
+            return {
+                "error": (
+                    f"Pass one budget, not both: {budget:.0f} for the whole trip or "
+                    f"{per_day:.0f} for each day. Which did the user mean?"
+                )
+            }
+        if per_day > 0:
+            budget = per_day * days
         if budget <= 0:
             return {"error": "I still need a budget in AED which is more than zero. Budget cannot be negative values."}
 
