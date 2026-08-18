@@ -285,10 +285,17 @@ class ItineraryOut(BaseModel):
     num_days: int
     currency: str
     status: str
+    transport_mode: Literal["taxi", "own_car"] = "taxi"
+    # What this party has to travel in — derived from the family size, not stored.
+    vehicle: str = "standard"
     days: list[DayOut]
     budget: BudgetOut
     suggestions: list[Suggestion]
     warnings: list[str] = []
+
+
+class TransportPatch(BaseModel):
+    mode: Literal["taxi", "own_car"]
 
 
 class DayPatchResponse(BaseModel):

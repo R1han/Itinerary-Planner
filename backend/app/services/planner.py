@@ -42,6 +42,17 @@ DAY_ENVELOPE_FLEX = 1.35
 # day; this decides the order within it, and is what stops a day hopping Abu Dhabi → Dubai →
 # Sharjah and spending more on taxis than on admission.
 PROXIMITY_PENALTY_PER_KM = 0.012
+# The hard ceiling the penalty above cannot provide. A penalty only ranks: when every remaining
+# candidate for a meal window is in the next emirate, the least-bad one still wins, and the day
+# ends with a forty-minute dinner ninety kilometres from every other stop and from home. Skipping
+# the meal is the better day. Applies between consecutive stops only — the first leg out from
+# home is how a trip reaches its region in the first place, and TRIP_RADIUS_KM bounds that.
+# ponytail: one flat ceiling, not a time/cost budget per day. Revisit if intercity trips (an Al
+# Ain day out from Dubai) become a real use case rather than an accident.
+MAX_HOP_KM = 60
+# How long a meal is assumed to take when guessing what can still follow it. Only used to rule
+# out attractions that could not fit afterwards, so a rough figure is enough.
+NOMINAL_MEAL_MIN = 60
 # UAE summer. Between these hours in these months, an air-conditioned venue is worth a nudge —
 # the spec calls malls and indoor attractions the "midday heat fallback".
 HOT_MONTHS = frozenset({5, 6, 7, 8, 9})
@@ -256,17 +267,16 @@ def build_profile(
         profile.day_start = 11 * 60
         profile.day_end = 23 * 60 + 30
         profile.max_slot_min = 180
-        profile.meal_windows = (("lunch", 13 * 60, 15 * 60), ("dinner", 19 * 60, 21 * 60 + 30))
+        profile.meal_windows = (("lunch", 13 * 60, 15 * 60), ("dinner", 19 * 60, 22 * 60 + 30))
     elif young_kids:
-        # Short slots, an early finish and a protected midday rest (spec §6).
         profile.w_kid = 1.0
         profile.w_teen = 0.35 if teens else 0.1
         profile.w_romance = 0.05
         profile.max_slot_min = 120
         profile.needs_midday_rest = True
         profile.day_start = 9 * 60
-        profile.day_end = 19 * 60 + 30
-        profile.meal_windows = (("lunch", 12 * 60, 14 * 60), ("dinner", 17 * 60 + 30, 19 * 60 + 30))
+        profile.day_end = 20 * 60 + 30
+        profile.meal_windows = (("lunch", 12 * 60, 14 * 60), ("dinner", 17 * 60 + 30, 20 * 60 + 30))
     elif child_ages:
         profile.w_teen = 1.0
         profile.w_kid = 0.3
@@ -274,7 +284,7 @@ def build_profile(
         profile.max_slot_min = 300
         profile.day_start = 9 * 60 + 30
         profile.day_end = 22 * 60
-        profile.meal_windows = (("lunch", 12 * 60 + 30, 15 * 60), ("dinner", 18 * 60 + 30, 21 * 60))
+        profile.meal_windows = (("lunch", 12 * 60 + 30, 15 * 60), ("dinner", 18 * 60 + 30, 22 * 60))
     else:
         profile.w_teen = 0.6
         profile.w_romance = 0.5
@@ -282,7 +292,7 @@ def build_profile(
         profile.max_slot_min = 240
         profile.day_start = 9 * 60 + 30
         profile.day_end = 22 * 60 + 30
-        profile.meal_windows = (("lunch", 12 * 60 + 30, 15 * 60), ("dinner", 19 * 60, 21 * 60 + 30))
+        profile.meal_windows = (("lunch", 12 * 60 + 30, 15 * 60), ("dinner", 19 * 60, 22 * 60 + 30))
 
     if prayer_breaks:
         # Later start and a slightly shorter day to leave room for the inserted gaps.
@@ -452,6 +462,62 @@ def _meal_reserve(profile: PartyProfile, cursor: int, filled: set[str], unit: fl
     return ahead * unit
 
 
+def next_anchor(
+    candidates: Sequence[PlaceCandidate],
+    profile: PartyProfile,
+    origin: tuple[float, float],
+    *,
+    cursor: int,
+    used: set[int],
+    day_month: int,
+    scores: dict[int, float] | None = None,
+) -> tuple[float, float]:
+    """Where the day is heading after the meal being chosen right now.
+
+    A meal is picked before the stop that follows it, so the planner has to guess: the best
+    attraction still available that could plausibly still be fitted in. When nothing can — the
+    last meal of the day — the answer is `origin`, because home really is what comes next.
+    """
+    after_meal = cursor + NOMINAL_MEAL_MIN
+    best: PlaceCandidate | None = None
+    best_score: float | None = None
+
+    for place in candidates:
+        if place.id in used or place.category in DINING_CATEGORIES:
+            continue
+        if not attendees_clear_min_age(place, profile) or not place.open_in_month(day_month):
+            continue
+        duration = min(place.avg_duration_min, profile.max_slot_min)
+        # Optimistic: the drive there is ignored. Something that cannot fit even without travel
+        # certainly cannot fit with it, which is all this needs to rule out.
+        if after_meal + duration > profile.day_end or after_meal + duration > place.closes_at:
+            continue
+        score = scores.get(place.id, 0.0) if scores is not None else score_place(place, profile)
+        if best_score is None or score > best_score:
+            best, best_score = place, score
+
+    return (best.lat, best.lng) if best is not None else origin
+
+
+def geographic_penalty(
+    candidate: PlaceCandidate, previous: tuple[float, float], anchor: tuple[float, float]
+) -> float:
+    """The kilometres this candidate really costs the day, from where we currently are.
+
+    For an attraction that is just the distance to it — going there is the point. For a meal it
+    is the *detour*: how much further the day gets by eating here rather than carrying straight
+    on to `anchor`, which is the next attraction if one is still ahead and home if none is. A
+    restaurant on that road adds nothing and scores zero; one in the opposite direction is
+    charged the trip back as well as the trip out.
+    """
+    direct = haversine_km(previous[0], previous[1], candidate.lat, candidate.lng)
+    if candidate.category not in DINING_CATEGORIES:
+        return direct
+    onward = haversine_km(candidate.lat, candidate.lng, anchor[0], anchor[1])
+    straight_on = haversine_km(previous[0], previous[1], anchor[0], anchor[1])
+    return max(0.0, direct + onward - straight_on)
+
+
 def assemble_day(
     day_index: int,
     day_date: date,
@@ -494,10 +560,19 @@ def assemble_day(
         # Re-rank from where we currently are, so the next stop is a good place that is also
         # near, and prefer somewhere air-conditioned if this is a summer midday.
         hot = day_date.month in HOT_MONTHS and HEAT_WINDOW[0] <= cursor <= HEAT_WINDOW[1]
+        # Only matters when a meal is due — an attraction is scored on plain distance.
+        anchor = (
+            next_anchor(
+                pool, profile, origin,
+                cursor=cursor, used=used, day_month=day_date.month, scores=scores,
+            )
+            if due is not None
+            else origin
+        )
         ordered = sorted(
             pool,
             key=lambda p: scores.get(p.id, 0.0)
-            - PROXIMITY_PENALTY_PER_KM * haversine_km(previous[0], previous[1], p.lat, p.lng)
+            - PROXIMITY_PENALTY_PER_KM * geographic_penalty(p, previous, anchor)
             + (INDOOR_HEAT_BONUS if hot and p.indoor else 0.0),
             reverse=True,
         )
@@ -517,6 +592,13 @@ def assemble_day(
             # A venue shut for the season cannot be scheduled at all — this is a correctness
             # filter, not a preference.
             if not place.open_in_month(day_date.month):
+                continue
+
+            # A stop this far from the last one is a different trip, not the next thing to do.
+            if (
+                previous_position is not None
+                and haversine_km(previous[0], previous[1], place.lat, place.lng) > MAX_HOP_KM
+            ):
                 continue
 
             travel = travel_fn(previous[0], previous[1], place.lat, place.lng)

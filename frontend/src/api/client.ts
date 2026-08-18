@@ -10,9 +10,9 @@ import type {
   FamilyMember,
   HealthStatus,
   Itinerary,
-  ItinerarySummary,
   Preference,
   StreamEvent,
+  TransportMode,
   User,
 } from '../types'
 
@@ -121,7 +121,6 @@ export const api = {
   deletePreference: (id: number) => request<void>(`/preferences/${id}`, { method: 'DELETE' }),
 
   // --- itineraries
-  itineraries: () => request<ItinerarySummary[]>('/itineraries'),
   itinerary: (id: number) => request<Itinerary>(`/itineraries/${id}`),
 
   alternatives: (itineraryId: number, slotId: number) =>
@@ -135,6 +134,8 @@ export const api = {
     post<Itinerary>(`/itineraries/${itineraryId}/days/${dayIndex}/cheaper`),
   prayerBreaks: (itineraryId: number) =>
     post<Itinerary>(`/itineraries/${itineraryId}/prayer-breaks`),
+  setTransport: (itineraryId: number, mode: TransportMode) =>
+    post<Itinerary>(`/itineraries/${itineraryId}/transport`, { mode }),
 
   // --- conversations
   conversations: () => request<Conversation[]>('/conversations'),

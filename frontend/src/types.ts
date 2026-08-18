@@ -143,11 +143,16 @@ export interface Itinerary {
   num_days: number
   currency: string
   status: string
+  transport_mode: TransportMode
+  /** What the party has to travel in — derived from family size, e.g. "6-seater". */
+  vehicle: string
   days: Day[]
   budget: Budget
   suggestions: Suggestion[]
   warnings: string[]
 }
+
+export type TransportMode = 'taxi' | 'own_car'
 
 export interface ItinerarySummary {
   id: number

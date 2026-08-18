@@ -238,3 +238,96 @@ def test_travel_fn_falls_back_to_coordinates_for_the_start_location(db, places):
     assert stub.calls == 1
     assert info is not None
     assert db.query(TravelCache).count() == 0
+
+
+# --- fares: vehicle size and transport mode -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("party", "label", "multiplier"),
+    [
+        (1, "standard", 1.0),
+        (4, "standard", 1.0),
+        (5, "6-seater", 1.6),
+        (6, "6-seater", 1.6),
+        (7, "two vehicles", 2.0),
+        (11, "two vehicles", 2.0),
+    ],
+)
+def test_vehicle_tier_steps_with_the_party_size(party, label, multiplier):
+    """A fifth passenger is a step change — a bigger vehicle — not a gradual surcharge."""
+    from app.services.travel import vehicle_for
+
+    assert vehicle_for(party) == (label, multiplier)
+
+
+def test_a_taxi_costs_the_metered_rate_times_the_vehicle_tier():
+    from app.services.travel import TAXI, fare
+
+    assert fare(10.0, mode=TAXI, party_size=2) == pytest.approx(25.0)
+    assert fare(10.0, mode=TAXI, party_size=6) == pytest.approx(40.0)
+
+
+def test_a_taxi_is_never_charged_for_parking():
+    """You are not parking a taxi. Only the driver pays to leave a car somewhere."""
+    from app.services.travel import TAXI, fare
+
+    assert fare(10.0, mode=TAXI, party_size=2, arriving_stops=3) == fare(
+        10.0, mode=TAXI, party_size=2
+    )
+
+
+def test_own_car_charges_fuel_plus_parking_at_the_stop_it_arrives_at():
+    from app.services.travel import OWN_CAR, fare
+
+    fuel_only = fare(10.0, mode=OWN_CAR, party_size=2, arriving_stops=0)
+    with_parking = fare(10.0, mode=OWN_CAR, party_size=2, arriving_stops=1)
+
+    assert fuel_only == pytest.approx(3.5)
+    assert with_parking == pytest.approx(3.5 + 15.0)
+
+
+def test_parking_does_not_scale_with_the_vehicle_tier():
+    """One car parked once is one parking charge, whatever size it is."""
+    from app.services.travel import OWN_CAR, fare
+
+    small = fare(0.0, mode=OWN_CAR, party_size=2, arriving_stops=1)
+    large = fare(0.0, mode=OWN_CAR, party_size=6, arriving_stops=1)
+    assert small == large == pytest.approx(15.0)
+
+
+def test_driving_your_own_car_is_far_cheaper_than_the_taxi_it_replaces():
+    """The reported complaint: AED 419 of taxi fare on a plan the family drives itself."""
+    from app.services.travel import OWN_CAR, TAXI, fare
+
+    taxi = fare(160.0, mode=TAXI, party_size=4)
+    car = fare(160.0, mode=OWN_CAR, party_size=4, arriving_stops=4)
+    assert car < taxi / 3
+
+
+def test_the_service_prices_a_cached_leg_for_the_party_that_asked(db, places):
+    """Cost is derived, never cached: the cache is shared, the party and the mode are not."""
+    from app.services.travel import OWN_CAR, TAXI, TravelService
+
+    a, b = places
+    taxi_pair = TravelService(db, StubORS(), mode=TAXI, party_size=2).between_places(a, b)
+    van_pair = TravelService(db, StubORS(), mode=TAXI, party_size=6).between_places(a, b)
+    own_car = TravelService(db, StubORS(), mode=OWN_CAR, party_size=6).between_places(a, b)
+
+    assert taxi_pair.distance_km == van_pair.distance_km == own_car.distance_km
+    assert van_pair.est_cost == pytest.approx(taxi_pair.est_cost * 1.6)
+    assert own_car.est_cost < taxi_pair.est_cost
+
+
+def test_a_shared_cache_row_cannot_freeze_one_partys_fare_for_everyone(db, places):
+    """The bug this guards: cache est_cost, and a 2-person taxi prices a 6-person van."""
+    a, b = places
+    TravelService(db, StubORS(), party_size=2).between_places(a, b)
+
+    cached = db.get(TravelCache, (a.id, b.id, DRIVING))
+    assert cached is not None, "the distance should still be cached — that part is user-agnostic"
+
+    from app.services.travel import TAXI
+
+    big = TravelService(db, StubORS(), mode=TAXI, party_size=6).between_places(a, b)
+    assert big.est_cost == pytest.approx(cached.distance_km * 2.5 * 1.6)

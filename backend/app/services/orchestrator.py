@@ -30,11 +30,13 @@ from ..models import (
     Itinerary,
     Message,
     Preference,
+    Slot,
     User,
     utcnow,
 )
 from . import itinerary as itinerary_service
 from .memory import MemoryService
+from .websearch import find_live_events
 from .tracing import traced, wrap_openai
 
 log = logging.getLogger(__name__)
@@ -100,6 +102,36 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "find_live_events",
+            "description": (
+                "Search the web for dated one-off happenings — a concert, a festival weekend — "
+                "that the seeded catalog cannot know about. READ-ONLY: it saves nothing. List "
+                "what it returns and let the user pick; call create_event only for the ones they "
+                "actually choose. Use only when the user asks what is on around a date. "
+                "Everything else (places, attractions, restaurants) comes from seeded data, "
+                "never from here."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look for, e.g. 'concerts in Dubai in March'",
+                    },
+                    "horizon_days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 365,
+                        "default": 90,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_itinerary",
             "description": (
                 "Build a complete itinerary for an event. The server rejects this if the intake "
@@ -136,6 +168,79 @@ TOOLS = [
                         "description": "Omit for the plan currently open beside the chat.",
                     }
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_day_cheaper",
+            "description": (
+                "Re-solve one day of an existing plan against a smaller budget, swapping in "
+                "cheaper places. The planner may find nothing better; the result says how much "
+                "it actually saved, which may be nothing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "integer", "minimum": 1, "description": "1-based day number."},
+                    "itinerary_id": {"type": "integer"},
+                },
+                "required": ["day"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_prayer_breaks",
+            "description": "Insert prayer breaks into every day of an existing plan and reflow it.",
+            "parameters": {
+                "type": "object",
+                "properties": {"itinerary_id": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_transport",
+            "description": (
+                "Record how the family is getting around and re-price the plan. Call this "
+                "whenever they mention having their own car, or going back to taxis — the travel "
+                "figures on screen are wrong until you do."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["taxi", "own_car"]},
+                    "itinerary_id": {"type": "integer"},
+                },
+                "required": ["mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_stop",
+            "description": (
+                "Remove one stop from a plan, or move it to a different start time. The rest of "
+                "the day reflows around the edit. slot_id comes from get_itinerary — call that "
+                "first, and never guess an id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slot_id": {"type": "integer"},
+                    "action": {"type": "string", "enum": ["remove", "adjust"]},
+                    "start_time": {
+                        "type": "string",
+                        "description": "24h HH:MM. Required when action is adjust.",
+                    },
+                    "itinerary_id": {"type": "integer"},
+                },
+                "required": ["slot_id", "action"],
             },
         },
     },
@@ -203,6 +308,10 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
     if name == "get_upcoming_events":
         return "Checking your calendar", f"next {int(args.get('horizon_days', 60))} days"
 
+    if name == "find_live_events":
+        query = str(args.get("query", "")).strip()
+        return "Searching for live events", query or None
+
     if name == "generate_itinerary":
         bits = []
         if args.get("days"):
@@ -217,6 +326,22 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
 
     if name == "get_itinerary":
         return "Reading the current plan", None
+
+    if name == "make_day_cheaper":
+        return "Finding cheaper options", f"day {int(args.get('day', 1))}"
+
+    if name == "add_prayer_breaks":
+        return "Adding prayer breaks", None
+
+    if name == "set_transport":
+        mode = str(args.get("mode", ""))
+        return "Switching transport", "own car" if mode == "own_car" else "taxi"
+
+    if name == "edit_stop":
+        action = str(args.get("action", ""))
+        if action == "adjust":
+            return "Moving a stop", f"to {args.get('start_time')}" if args.get("start_time") else None
+        return "Removing a stop", None
 
     if name == "record_preference":
         kind = str(args.get("kind", "like"))
@@ -240,16 +365,25 @@ def summarise_tool_result(name: str, result: dict) -> str:
 
     if name == "get_upcoming_events":
         return _count(result.get("events", []), "event")
+    if name == "find_live_events":
+        if not result.get("found"):
+            return "nothing found"
+        return _count(result.get("events", []), "event") + " found"
     if name == "generate_itinerary":
         return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "get_itinerary":
-        # Keyed on itinerary_id, not on an "itinerary" key: the populated shape has no such key,
-        # so `.get("itinerary") is None` was true in both cases and every successful read was
-        # labelled "no plan yet" while the model was in fact working from real figures.
         if result.get("itinerary_id") is None:
             return "no plan yet"
         budget = result.get("budget") or {}
         return f"{_count(result.get('days', []), 'day')} · {_money(budget.get('total'))}"
+    if name == "make_day_cheaper":
+        saved = result.get("saved") or 0
+        return f"saved {_money(saved)}" if saved > 0 else "nothing cheaper available"
+    if name == "set_transport":
+        travel = (result.get("travel") or {}).get("total")
+        return f"travel now {_money(travel)}" if travel is not None else "repriced"
+    if name in ("add_prayer_breaks", "edit_stop"):
+        return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "create_event":
         return "added" if result.get("created") else "already on your calendar"
     if name == "save_family_details":
@@ -277,6 +411,16 @@ class ChatOrchestrator:
             select(Preference).where(Preference.user_id == self.user.id)
         ).all()
         recalled = self.memory.recall(user_message or "family preferences", limit=5)
+        # Events are injected, not fetched. They used to be reachable only through
+        # get_upcoming_events, and nothing obliged the model to look — so asked to plan an
+        # anniversary that was already on the calendar, with its date and its notes, it asked
+        # for the date. The list is a handful of rows; carrying it costs less than the round trip.
+        upcoming = self.db.scalars(
+            select(Event)
+            .where(Event.user_id == self.user.id, Event.date >= date.today())
+            .order_by(Event.date)
+            .limit(12)
+        ).all()
 
         family_text = (
             ", ".join(
@@ -287,6 +431,12 @@ class ChatOrchestrator:
         likes = [p.subject for p in preferences if p.kind == "like"] or ["none recorded"]
         dislikes = [p.subject for p in preferences if p.kind == "dislike"] or ["none recorded"]
         memory_text = "\n".join(f"- {item['text']}" for item in recalled) or "- nothing yet"
+        calendar_text = "\n".join(
+            f"- {event.title} — {event.date.isoformat()}, {event.event_type}"
+            + (f", notes: {event.notes}" if event.notes else "")
+            + (" (already planned)" if event.planned else "")
+            for event in upcoming
+        ) or "- nothing on the calendar yet"
 
         return (
             "You are Rihla, a UAE trip planner. You help one family plan short trips (at most 5 "
@@ -298,12 +448,26 @@ class ChatOrchestrator:
             "current figures first — the user edits slots, swaps stops and asks for cheaper days "
             "between messages, so anything you saw earlier in this conversation may already be "
             "wrong, and the real numbers are on screen next to you.\n\n"
+            "Never say the plan changed unless a tool you called in THIS turn returned the "
+            "change. You can edit an existing plan only with make_day_cheaper, add_prayer_breaks, "
+            "set_transport and edit_stop. There is no tool that adds a new place to an existing plan: if the "
+            "user asks for that, say plainly that you cannot do it yet. Do NOT reach for "
+            "generate_itinerary to work around a missing edit tool: it builds a replacement plan "
+            "from scratch and throws the current one away, so call it a second time only when the "
+            "user has asked for a new plan or agreed to start over. Listing a stop the plan does not contain is "
+            "worse than admitting the limit — the real plan is on screen beside you, and the "
+            "user can see that it did not change.\n\n"
             f"Today is {date.today().isoformat()}.\n"
             f"Signed in as: {self.user.name}\n"
             f"Family: {family_text}\n"
             f"Likes: {', '.join(likes)}\n"
             f"Dislikes: {', '.join(dislikes)}\n"
-            f"Remembered from earlier sessions:\n{memory_text}\n\n"
+            f"Remembered from earlier sessions:\n{memory_text}\n"
+            f"On their calendar:\n{calendar_text}\n\n"
+            "Those calendar entries are facts you already have. If the user mentions one of them "
+            "— by name or by occasion — use its date and its notes and never ask for a date you "
+            "have been given. get_upcoming_events is only for looking further ahead than the "
+            "list above.\n\n"
             "Everything listed above is already on file — never ask the user to repeat it. Ask "
             "only for what is genuinely missing: usually just the budget and the dates, and an "
             "event's own date is a fine default start date. When you have enough, call "
@@ -346,8 +510,13 @@ class ChatOrchestrator:
             "save_family_details": self._save_family_details,
             "create_event": self._create_event,
             "get_upcoming_events": self._get_upcoming_events,
+            "find_live_events": self._find_live_events,
             "generate_itinerary": self._generate_itinerary,
             "get_itinerary": self._get_itinerary,
+            "make_day_cheaper": self._make_day_cheaper,
+            "add_prayer_breaks": self._add_prayer_breaks,
+            "set_transport": self._set_transport,
+            "edit_stop": self._edit_stop,
             "record_preference": self._record_preference,
         }.get(name)
         if handler is None:
@@ -433,8 +602,43 @@ class ChatOrchestrator:
             ]
         }
 
+    def _find_live_events(self, args: dict) -> dict:
+        """Web search → validated event rows → the model. **Writes nothing.**
+
+        This used to save every hit straight to the calendar, which meant one question about
+        what was on filled the user's calendar with scraped listings they never asked for. A
+        search result is a suggestion; it becomes a calendar entry only when the user says yes,
+        and that goes through create_event like anything else.
+        """
+        rows = find_live_events(
+            str(args.get("query") or ""),
+            horizon_days=int(args.get("horizon_days", 90)),
+        )
+        existing = {
+            (title.lower(), when)
+            for title, when in self.db.query(Event.title, Event.date).filter(
+                Event.user_id == self.user.id
+            )
+        }
+
+        return {
+            "found": len(rows),
+            "events": [
+                {
+                    "title": row["title"],
+                    "date": row["date"].isoformat(),
+                    "event_type": row["event_type"],
+                    # So the reply can say "you already have that one" rather than re-offering it.
+                    "already_saved": (row["title"].lower(), row["date"]) in existing,
+                }
+                for row in rows
+            ],
+        }
+
     def _generate_itinerary(self, args: dict) -> dict:
         event_id = args.get("event_id")
+        if event_id is None:
+            event_id = self.conversation.event_id
         event = None
         if event_id is not None:
             event = (
@@ -462,6 +666,9 @@ class ChatOrchestrator:
         if budget <= 0:
             return {"error": "I still need a budget in AED."}
 
+        # Carry the transport mode across a rebuild. Same failure as dropping the event: the
+        # family says "we have our own car", the plan is rebuilt, and the taxi fares come back.
+        current = self._resolve_itinerary(None)
         try:
             created = itinerary_service.generate(
                 self.db,
@@ -475,33 +682,17 @@ class ChatOrchestrator:
                 title=event.title if event else None,
                 currency=self.user.default_currency,
                 prayer_breaks=bool(args.get("prayer_breaks", False)),
+                transport_mode=current.transport_mode if current else itinerary_service.TAXI,
             )
         except itinerary_service.IntakeIncomplete as exc:
             return {"error": "intake_incomplete", "missing_fields": exc.missing}
 
-        self.touched_itinerary = created
         self.conversation.itinerary_id = created.id
         if event is not None:
             self.conversation.event_id = event.id
             self.conversation.title = event.title
         self.db.flush()
-
-        payload = itinerary_service.itinerary_payload(self.db, created)
-        return {
-            "itinerary_id": created.id,
-            "days": [
-                {
-                    "day": day["day_index"] + 1,
-                    "theme": day["theme"],
-                    "subtotal": day["subtotal"],
-                    "stops": [slot["place"].name for slot in day["slots"]],
-                }
-                for day in payload["days"]
-            ],
-            "total": payload["budget"]["total"],
-            "cap": payload["budget"]["cap"],
-            "remaining": payload["budget"]["remaining"],
-        }
+        return self._plan_result(created)
 
     def _resolve_itinerary(self, itinerary_id: int | None = None) -> Itinerary | None:
         """Find a plan for THIS user. Every branch filters by user_id, including the explicit id."""
@@ -545,6 +736,7 @@ class ChatOrchestrator:
                     "driving_min": day["driving_total_min"],
                     "stops": [
                         {
+                            "slot_id": slot["id"],
                             "name": slot["place"].name,
                             "category": slot["place"].category,
                             "start": slot["start_time"],
@@ -566,6 +758,107 @@ class ChatOrchestrator:
                 "travel": budget["categories"]["travel"],
             },
         }
+
+    def _plan_result(self, itinerary: Itinerary) -> dict:
+        """What every plan edit returns: the figures as they stand *after* the edit.
+
+        Also marks the itinerary as touched, which is what makes `_emit_updates` push the new
+        state to the right pane. A mutating tool that forgets this leaves the pane showing the
+        plan as it was before the edit.
+        """
+        self.touched_itinerary = itinerary
+        payload = itinerary_service.itinerary_payload(self.db, itinerary)
+        return {
+            "itinerary_id": itinerary.id,
+            "days": [
+                {
+                    "day": day["day_index"] + 1,
+                    "theme": day["theme"],
+                    "subtotal": day["subtotal"],
+                    "stops": [slot["place"].name for slot in day["slots"]],
+                }
+                for day in payload["days"]
+            ],
+            "total": payload["budget"]["total"],
+            "cap": payload["budget"]["cap"],
+            "remaining": payload["budget"]["remaining"],
+            "transport_mode": payload["transport_mode"],
+            "vehicle": payload["vehicle"],
+            "travel": {"total": payload["budget"]["categories"]["travel"]},
+        }
+
+    def _open_plan(self, args: dict) -> tuple[Itinerary | None, dict | None]:
+        itinerary = self._resolve_itinerary(args.get("itinerary_id"))
+        if itinerary is None:
+            return None, {"error": "No plan has been generated yet, so there is nothing to edit."}
+        return itinerary, None
+
+    def _make_day_cheaper(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error:
+            return error
+
+        before = itinerary_service.itinerary_payload(self.db, itinerary)["budget"]["total"]
+        try:
+            itinerary_service.cheaper_day(
+                self.db, itinerary, self.user, int(args.get("day", 1)) - 1
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        result = self._plan_result(itinerary)
+        # The planner substitutes only when it finds something genuinely cheaper, so this is
+        # often zero. Reporting it keeps the reply from announcing a saving that did not happen.
+        result["saved"] = round(before - result["total"], 2)
+        return result
+
+    def _add_prayer_breaks(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error:
+            return error
+        itinerary_service.add_prayer_breaks(self.db, itinerary, self.user)
+        return self._plan_result(itinerary)
+
+    def _set_transport(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error:
+            return error
+
+        mode = str(args.get("mode", ""))
+        if mode not in itinerary_service.TRANSPORT_MODES:
+            return {"error": f"Unknown transport mode {mode!r}."}
+
+        itinerary.transport_mode = mode
+        itinerary_service.recost_travel(self.db, itinerary, self.user)
+        return self._plan_result(itinerary)
+
+    def _edit_stop(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error:
+            return error
+
+        # Scoped to this itinerary, which _resolve_itinerary already scoped to this user — a
+        # slot_id from someone else's plan finds nothing rather than editing it.
+        slot = (
+            self.db.query(Slot)
+            .filter(Slot.id == int(args.get("slot_id", 0)), Slot.itinerary_id == itinerary.id)
+            .one_or_none()
+        )
+        if slot is None:
+            return {"error": "No such stop in this plan. Call get_itinerary for current slot_ids."}
+
+        try:
+            itinerary_service.patch_slot(
+                self.db,
+                itinerary,
+                self.user,
+                slot,
+                action=str(args.get("action", "")),
+                start_time=args.get("start_time"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return self._plan_result(itinerary)
 
     def _record_preference(self, args: dict) -> dict:
         self._remember(str(args.get("kind", "like")), str(args.get("subject", "")),

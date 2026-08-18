@@ -467,3 +467,104 @@ def test_another_user_cannot_read_or_edit_the_plan(client, mixed_family, make_us
         f"/itineraries/{plan['id']}/days/0/cheaper", headers=intruder
     ).status_code == 404
     assert client.get("/itineraries", headers=intruder).json() == []
+
+
+# --- transport mode: own car vs taxi ------------------------------------------------------------
+
+
+def test_a_plan_starts_out_priced_as_taxi_fares(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    assert plan["transport_mode"] == "taxi"
+    assert plan["budget"]["categories"]["travel"] > 0
+
+
+def test_switching_to_your_own_car_reprices_the_plan_in_place(client, mixed_family):
+    """The reported bug: the assistant said "Noted!" and the AED 419 of taxi fare stayed put."""
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    before = plan["budget"]["categories"]["travel"]
+
+    response = client.post(
+        f"/itineraries/{plan['id']}/transport", headers=headers, json={"mode": "own_car"}
+    )
+    assert response.status_code == 200, response.text
+    after = response.json()
+
+    assert after["transport_mode"] == "own_car"
+    assert after["budget"]["categories"]["travel"] < before, "travel was not repriced"
+    assert after["budget"]["total"] < plan["budget"]["total"]
+
+
+def test_repricing_moves_the_money_without_moving_the_trip(client, mixed_family):
+    """Same route, same times, same places — only the arithmetic changes."""
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    client.post(
+        f"/itineraries/{plan['id']}/transport", headers=headers, json={"mode": "own_car"}
+    )
+    after = client.get(f"/itineraries/{plan['id']}", headers=headers).json()
+
+    def shape(payload):
+        return [
+            (slot["place"]["id"], slot["start_time"], slot["end_time"])
+            for day in payload["days"]
+            for slot in day["slots"]
+        ]
+
+    assert shape(after) == shape(plan)
+    assert [seg["duration_min"] for day in after["days"] for seg in day["segments"]] == [
+        seg["duration_min"] for day in plan["days"] for seg in day["segments"]
+    ]
+
+
+def test_switching_back_to_a_taxi_restores_the_fares(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    for mode in ("own_car", "taxi"):
+        back = client.post(
+            f"/itineraries/{plan['id']}/transport", headers=headers, json={"mode": mode}
+        ).json()
+    assert back["budget"]["categories"]["travel"] == pytest.approx(
+        plan["budget"]["categories"]["travel"], abs=0.01
+    )
+
+
+def test_an_unknown_transport_mode_is_rejected(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    response = client.post(
+        f"/itineraries/{plan['id']}/transport", headers=headers, json={"mode": "camel"}
+    )
+    assert response.status_code == 422
+
+
+def test_transport_mode_cannot_be_changed_on_someone_elses_plan(client, mixed_family, make_user):
+    headers, _ = mixed_family
+    plan = generate(client, headers)
+    intruder, _ = make_user("intruder@rihla.app")
+    response = client.post(
+        f"/itineraries/{plan['id']}/transport", headers=intruder, json={"mode": "own_car"}
+    )
+    assert response.status_code == 404
+
+
+def test_a_bigger_family_pays_for_a_bigger_vehicle(client, make_user, catalog):
+    """Six people do not fit in a saloon, and the fare should say so."""
+    small, _ = make_user("four@rihla.app")
+    client.put("/family", headers=small, json={"members": [
+        {"role": "adult", "age": 34}, {"role": "adult", "age": 31},
+        {"role": "child", "age": 7}, {"role": "child", "age": 13},
+    ]})
+    big, _ = make_user("six@rihla.app")
+    client.put("/family", headers=big, json={"members": [
+        {"role": "adult", "age": 34}, {"role": "adult", "age": 31},
+        {"role": "child", "age": 7}, {"role": "child", "age": 13},
+        {"role": "child", "age": 10}, {"role": "child", "age": 4},
+    ]})
+
+    four = generate(client, small, num_days=1, total_budget=6000.0)
+    six = generate(client, big, num_days=1, total_budget=6000.0)
+
+    assert four["vehicle"] == "standard"
+    assert six["vehicle"] == "6-seater"

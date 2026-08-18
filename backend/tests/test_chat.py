@@ -81,9 +81,20 @@ def test_the_spec_tools_are_all_exposed():
         "record_preference",
     }
     assert spec_tools <= names, f"missing: {spec_tools - names}"
-    # get_itinerary is beyond spec §8: without a way to READ a plan, the assistant could only
-    # describe one from stale context and would contradict the budget bar next to it.
-    assert names == spec_tools | {"get_itinerary"}
+    # Beyond spec §8: get_itinerary, because without a way to READ a plan the assistant could
+    # only describe one from stale context and would contradict the budget bar next to it;
+    # find_live_events, spec §1.10's optional secondary path, exposed so the model can reach it
+    # rather than being a library nobody calls; and the three edit tools, without which the model
+    # is asked to change plans it has no way to change — and answers by describing edits it never
+    # made.
+    assert names == spec_tools | {
+        "get_itinerary",
+        "find_live_events",
+        "make_day_cheaper",
+        "add_prayer_breaks",
+        "edit_stop",
+        "set_transport",
+    }
 
 
 def test_no_tool_schema_exposes_a_user_id():
@@ -149,6 +160,58 @@ def test_get_upcoming_events_returns_only_the_callers_events(db, orchestrator):
 
     assert [e["title"] for e in alice.call_tool("get_upcoming_events", {})["events"]] == ["Alice only"]
     assert [e["title"] for e in bob.call_tool("get_upcoming_events", {})["events"]] == ["Bob only"]
+
+
+def test_a_web_search_never_writes_to_the_calendar(db, orchestrator, monkeypatch):
+    """A search is a search. Eight scraped listings appearing in someone's calendar unasked is
+    not a feature — the user has to say yes, and saying yes goes through create_event."""
+    rows = [
+        {"title": "Desert Jazz Night", "event_type": "other", "date": date.fromisoformat(FUTURE),
+         "notes": "https://example.test/list", "planned": False},
+        {"title": "Pitch Hunt | B2B Networking", "event_type": "other",
+         "date": date.fromisoformat(FUTURE), "notes": None, "planned": False},
+    ]
+    monkeypatch.setattr("app.services.orchestrator.find_live_events", lambda *a, **k: rows)
+
+    alice = orchestrator("alice@rihla.app")
+    result = alice.call_tool("find_live_events", {"query": "concerts in Dubai"})
+    db.commit()
+
+    assert result["found"] == 2
+    assert [e["title"] for e in result["events"]] == [r["title"] for r in rows]
+    assert db.query(Event).filter(Event.user_id == alice.user.id).count() == 0, (
+        "the search wrote to the calendar"
+    )
+
+
+def test_a_search_result_says_which_ones_are_already_on_the_calendar(db, orchestrator, monkeypatch):
+    """So the reply can say "you already have this" instead of offering it again."""
+    rows = [
+        {"title": "Desert Jazz Night", "event_type": "other", "date": date.fromisoformat(FUTURE),
+         "notes": None, "planned": False},
+        {"title": "Aisha's birthday", "event_type": "birthday",
+         "date": date.fromisoformat(FUTURE), "notes": None, "planned": False},
+    ]
+    monkeypatch.setattr("app.services.orchestrator.find_live_events", lambda *a, **k: rows)
+
+    chat = orchestrator("alice@rihla.app")
+    chat.call_tool(
+        "create_event", {"title": "Aisha's birthday", "event_type": "birthday", "date": FUTURE}
+    )
+    db.commit()
+
+    found = {e["title"]: e["already_saved"] for e in chat.call_tool(
+        "find_live_events", {"query": "what is on"}
+    )["events"]}
+    assert found == {"Desert Jazz Night": False, "Aisha's birthday": True}
+
+
+def test_find_live_events_is_silent_when_the_search_finds_nothing(db, orchestrator, monkeypatch):
+    """No key, a timeout, a rate limit — the adapter returns []; the tool must not be an error."""
+    monkeypatch.setattr("app.services.orchestrator.find_live_events", lambda *a, **k: [])
+    result = orchestrator().call_tool("find_live_events", {"query": "concerts"})
+    assert result == {"found": 0, "events": []}
+    assert db.query(Event).count() == 0
 
 
 def test_generate_itinerary_is_refused_until_intake_is_complete(db, orchestrator):
@@ -583,3 +646,273 @@ def test_the_stream_pairs_every_tool_frame_with_a_result(client, make_user, monk
     assert started[0]["data"]["detail"] == "next 30 days"
     assert finished[0]["data"]["id"] == started[0]["data"]["id"]
     assert finished[0]["data"]["outcome"] == "0 events"
+
+
+# --- editing an existing plan from chat ----------------------------------------------------------
+
+
+def _chat_for(db, plan):
+    """An orchestrator whose conversation is attached to `plan`, as the real one would be."""
+    from app.models import Conversation, User
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id, itinerary_id=plan["id"])
+    db.add(conversation)
+    db.commit()
+    return ChatOrchestrator(db, row, conversation)
+
+
+def test_removing_a_stop_from_chat_changes_the_plan_and_flags_the_pane(client, planned, db):
+    """The bug this exists to kill: the model says it changed the plan, and nothing changed.
+
+    Two halves, and both matter. The database must actually lose the stop, and
+    `touched_itinerary` must be set — that flag is the only thing that makes the stream emit
+    `itinerary_updated`, so without it the right pane keeps rendering the pre-edit plan.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+
+    slot = next(d for d in plan["days"] if d["slots"])["slots"][0]
+    result = chat.call_tool("edit_stop", {"slot_id": slot["id"], "action": "remove"})
+
+    assert "error" not in result
+    assert chat.touched_itinerary is not None, "the right pane will not refresh"
+    assert chat.touched_itinerary.id == plan["id"]
+
+    names = [s["name"] for d in chat.call_tool("get_itinerary", {})["days"] for s in d["stops"]]
+    assert slot["place"]["name"] not in names
+
+
+def test_the_model_is_given_the_slot_ids_it_needs_to_edit(client, planned, db):
+    """edit_stop takes a slot_id, so get_itinerary has to be where that id comes from."""
+    _, _, plan = planned
+    read = _chat_for(db, plan).call_tool("get_itinerary", {})
+    ids = {stop["slot_id"] for day in read["days"] for stop in day["stops"]}
+    assert ids == {slot["id"] for day in plan["days"] for slot in day["slots"]}
+
+
+def test_an_edit_cannot_reach_another_users_plan(client, planned, db, orchestrator):
+    """The slot id is real; the caller is not its owner. Scoping is by itinerary, then by user."""
+    _, _, plan = planned
+    slot = next(d for d in plan["days"] if d["slots"])["slots"][0]
+
+    intruder = orchestrator("intruder@rihla.app")
+    result = intruder.call_tool("edit_stop", {"slot_id": slot["id"], "action": "remove"})
+
+    assert "error" in result
+    assert intruder.touched_itinerary is None
+    fresh = client.get(f"/itineraries/{plan['id']}", headers=planned[0]).json()
+    assert [s["id"] for d in fresh["days"] for s in d["slots"]] == [
+        s["id"] for d in plan["days"] for s in d["slots"]
+    ]
+
+
+def test_adjust_without_a_time_is_an_error_not_a_silent_no_op(client, planned, db):
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    slot = next(d for d in plan["days"] if d["slots"])["slots"][0]
+    assert "error" in chat.call_tool("edit_stop", {"slot_id": slot["id"], "action": "adjust"})
+
+
+def test_making_a_day_cheaper_reports_what_it_actually_saved(client, planned, db):
+    """The planner often finds nothing better. `saved` is what stops the reply inventing a win."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+
+    result = chat.call_tool("make_day_cheaper", {"day": 1})
+
+    assert "error" not in result
+    assert result["saved"] == pytest.approx(plan["budget"]["total"] - result["total"], abs=0.01)
+    assert result["saved"] >= 0
+
+
+def test_make_day_cheaper_rejects_a_day_that_does_not_exist(client, planned, db):
+    result = _chat_for(db, planned[2]).call_tool("make_day_cheaper", {"day": 99})
+    assert "error" in result
+
+
+def test_editing_needs_a_plan_to_edit(db, orchestrator):
+    chat = orchestrator()
+    assert "error" in chat.call_tool("add_prayer_breaks", {})
+    assert chat.touched_itinerary is None
+
+
+def test_the_system_prompt_forbids_claiming_an_edit_that_did_not_happen(db, orchestrator):
+    """Part A of the fix: the model has no tool for some asks, and must say so."""
+    prompt = orchestrator().system_prompt()
+    assert "Never say the plan changed unless a tool you called in THIS turn returned" in prompt
+    assert "There is no tool that adds a new place to an existing plan" in prompt
+
+
+# --- a rebuild must not quietly orphan the plan --------------------------------------------------
+
+
+def test_a_rebuild_keeps_the_event_the_conversation_is_planning(client, planned, db):
+    """The model rebuilt a birthday plan without passing event_id, and the plan lost the event.
+
+    That is not cosmetic. The retrieval query is built from the event's title and notes, so
+    dropping the link changes which places are shortlisted at all — in the reported case it left
+    the day with one nearby restaurant, already used at lunch, and the planner reaching into the
+    next emirate for dinner.
+    """
+    from app.models import Conversation, Event, Itinerary, User
+
+    headers, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    event = Event(
+        user_id=row.id, title="Aisha's 7th birthday", event_type="birthday",
+        date=date.fromisoformat(FUTURE), notes="loves animals, afraid of loud rides",
+    )
+    db.add(event)
+    db.commit()
+
+    conversation = Conversation(user_id=row.id, itinerary_id=plan["id"], event_id=event.id)
+    db.add(conversation)
+    db.commit()
+
+    chat = ChatOrchestrator(db, row, conversation)
+    result = chat.call_tool(
+        "generate_itinerary", {"days": 1, "budget": 4500, "start_date": FUTURE}
+    )
+
+    assert "error" not in result, result
+    rebuilt = db.get(Itinerary, result["itinerary_id"])
+    assert rebuilt.event_id == event.id, "the rebuild orphaned the plan from its event"
+    assert rebuilt.title == event.title, "the plan was retitled 'UAE trip'"
+
+
+def test_an_explicit_event_id_still_wins_over_the_conversations(client, planned, db):
+    """The fallback is a default, not an override — the model can still retarget deliberately."""
+    from app.models import Conversation, Event, Itinerary, User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    attached = Event(user_id=row.id, title="Birthday", event_type="birthday",
+                     date=date.fromisoformat(FUTURE))
+    asked_for = Event(user_id=row.id, title="Cousins visiting", event_type="family_visit",
+                      date=date.fromisoformat(FUTURE))
+    db.add_all([attached, asked_for])
+    db.commit()
+
+    conversation = Conversation(user_id=row.id, itinerary_id=plan["id"], event_id=attached.id)
+    db.add(conversation)
+    db.commit()
+
+    result = ChatOrchestrator(db, row, conversation).call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 4500, "start_date": FUTURE, "event_id": asked_for.id},
+    )
+    assert db.get(Itinerary, result["itinerary_id"]).event_id == asked_for.id
+
+
+def test_the_system_prompt_forbids_rebuilding_as_a_workaround(db, orchestrator):
+    prompt = orchestrator().system_prompt()
+    assert "throws the current one away" in prompt
+    assert "agreed to start over" in prompt
+
+
+def test_saying_you_have_your_own_car_actually_reprices_the_plan(client, planned, db):
+    """The reported bug: the assistant replied "Noted!" and the taxi fares stayed on screen."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    before = chat.call_tool("get_itinerary", {})["budget"]["travel"]
+
+    result = chat.call_tool("set_transport", {"mode": "own_car"})
+
+    assert "error" not in result, result
+    assert result["transport_mode"] == "own_car"
+    assert result["travel"]["total"] < before
+    assert chat.touched_itinerary is not None, "the right pane will not refresh"
+    assert chat.call_tool("get_itinerary", {})["budget"]["travel"] == result["travel"]["total"]
+
+
+def test_an_unknown_transport_mode_is_an_error_not_a_silent_write(client, planned, db):
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    assert "error" in chat.call_tool("set_transport", {"mode": "camel"})
+    assert chat.call_tool("get_itinerary", {})["itinerary_id"] == plan["id"]
+
+
+def test_a_rebuild_keeps_the_transport_mode_the_family_told_us_about(client, planned, db):
+    """Same failure shape as the dropped event: say "own car", rebuild, taxi fares return."""
+    from app.models import Itinerary
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    chat.call_tool("set_transport", {"mode": "own_car"})
+
+    result = chat.call_tool(
+        "generate_itinerary", {"days": 1, "budget": 4500, "start_date": FUTURE}
+    )
+    assert "error" not in result, result
+    assert db.get(Itinerary, result["itinerary_id"]).transport_mode == "own_car"
+
+
+# --- the assistant knows what is already on the calendar -----------------------------------------
+
+
+def test_the_system_prompt_lists_the_events_already_on_the_calendar(db, orchestrator):
+    """The reported bug: asked to plan a wedding anniversary that was already in the calendar,
+    with its date and its notes, the assistant asked for the date.
+
+    Family and preferences are injected; events were the one thing the model had to go and fetch,
+    and nothing told it to. So it asked instead.
+    """
+    chat = orchestrator()
+    chat.call_tool(
+        "create_event",
+        {"title": "Wedding anniversary", "event_type": "anniversary", "date": FUTURE,
+         "notes": "dinner, just the two of us"},
+    )
+    db.commit()
+
+    prompt = chat.system_prompt("plan a romantic dinner for my wedding anniversary")
+
+    assert "Wedding anniversary" in prompt
+    assert FUTURE in prompt
+    assert "dinner, just the two of us" in prompt
+    assert "never ask for a date" in prompt.lower()
+
+
+def test_the_prompt_says_when_the_calendar_is_empty_rather_than_omitting_it(db, orchestrator):
+    """An absent section reads as "no information"; "nothing on the calendar" reads as a fact."""
+    assert "nothing on the calendar yet" in orchestrator().system_prompt()
+
+
+def test_a_planned_event_is_marked_as_such_in_the_prompt(db, orchestrator):
+    """So the assistant offers to plan the unplanned ones, not the one it already did."""
+    chat = orchestrator()
+    chat.call_tool("create_event", {"title": "Eid trip", "event_type": "eid", "date": FUTURE})
+    db.commit()
+    db.query(Event).filter(Event.title == "Eid trip").update({"planned": True})
+    db.commit()
+
+    assert "Eid trip" in chat.system_prompt()
+    assert "already planned" in chat.system_prompt()
+
+
+def test_the_prompt_tells_the_model_not_to_ask_for_a_date_it_already_has(db, orchestrator):
+    prompt = orchestrator().system_prompt()
+    assert "On their calendar:" in prompt
+    assert "never ask for a date you have been given" in prompt
+
+
+def test_a_search_followed_by_a_yes_is_what_writes_the_event(db, orchestrator, monkeypatch):
+    """The whole flow: search suggests, the user picks, create_event saves. Two steps, on purpose."""
+    monkeypatch.setattr(
+        "app.services.orchestrator.find_live_events",
+        lambda *a, **k: [
+            {"title": "Desert Jazz Night", "event_type": "other",
+             "date": date.fromisoformat(FUTURE), "notes": None, "planned": False}
+        ],
+    )
+    chat = orchestrator()
+    chat.call_tool("find_live_events", {"query": "what is on"})
+    db.commit()
+    assert db.query(Event).count() == 0
+
+    chat.call_tool(
+        "create_event", {"title": "Desert Jazz Night", "event_type": "other", "date": FUTURE}
+    )
+    db.commit()
+    assert [e.title for e in db.query(Event).all()] == ["Desert Jazz Night"]

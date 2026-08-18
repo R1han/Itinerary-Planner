@@ -440,3 +440,183 @@ def test_ensure_dining_leaves_a_cluster_that_already_has_enough_alone():
 
     cluster = [place(i, f"Cafe {i}", "casual_dining") for i in range(1, 5)]
     assert ensure_dining(cluster, [], minimum=3) is cluster
+
+
+# --- a day must not leave its own region --------------------------------------------------------
+
+
+def _stranded_day_pool():
+    """Local sights, one local restaurant, and restaurants only in the next emirate.
+
+    The shape that produced the bug: lunch consumes the one nearby restaurant, and by dinner the
+    cheapest thing the scorer can still reach is ninety kilometres away.
+    """
+    sights = [
+        place(i, f"Sight {i}", "aquarium", lat=24.45 + i * 0.01, lng=54.38,
+              emirate="Abu Dhabi", avg_duration_min=120)
+        for i in range(1, 3)
+    ]
+    near = [place(20, "Local Cafe", "casual_dining", lat=24.46, lng=54.39, emirate="Abu Dhabi")]
+    # ~70 km out, an hour of motorway: far enough to be the bug, near enough that the dinner
+    # window still accepts it. Those two facts together are the defect — before the hop cap,
+    # distance on its own was never a reason to reject a candidate.
+    far = [
+        place(30 + i, f"Distant Diner {i}", "casual_dining", lat=24.91 + i * 0.01, lng=54.89,
+              emirate="Dubai", price_adult=20.0, price_child=10.0, avg_duration_min=40)
+        for i in range(3)
+    ]
+    return sights + near + far
+
+
+def test_a_day_never_hops_to_another_emirate_for_one_stop():
+    """The reported bug: dinner 90 km from every other stop, and from home.
+
+    Skipping the meal is the correct outcome — an 87-minute drive each way for a 40-minute
+    dinner is not a better day than one that ends after the last local stop.
+    """
+    plan = generate_plan(
+        _stranded_day_pool(),
+        build_profile(family(2, (7, 13)), "birthday"),
+        distance_travel(kmh=90.0),
+        start_date=TOMORROW,
+        num_days=1,
+        total_budget=4500.0,
+        origin=(24.4539, 54.3773),
+    )
+
+    day = plan.days[0]
+    hops = [
+        haversine_km(a.place.lat, a.place.lng, b.place.lat, b.place.lng)
+        for a, b in zip(day.slots, day.slots[1:])
+    ]
+    assert hops, "the day should still have been built"
+    assert max(hops) < 60, (
+        "planner scheduled a stop far outside the day's region: "
+        + " -> ".join(f"{s.place.name} ({s.place.emirate})" for s in day.slots)
+    )
+
+
+def _detour_day_pool():
+    """Two dinner options from the same last stop: one on the way home, one further out.
+
+    The one pointing away from home is *closer* to the last attraction, so raw proximity picks
+    it. Only detour — what the stop adds to the journey you were making anyway — picks the other.
+    """
+    sights = [
+        place(1, "Sight A", "aquarium", lat=24.70, lng=54.38, emirate="Abu Dhabi",
+              avg_duration_min=120),
+        place(2, "Sight B", "museum", lat=24.75, lng=54.38, emirate="Abu Dhabi",
+              avg_duration_min=120),
+    ]
+    lunch = [place(10, "Lunch Cafe", "casual_dining", lat=24.72, lng=54.38, emirate="Abu Dhabi")]
+    dinners = [
+        # 11 km from Sight B, but in the opposite direction to home: a 22 km round-trip detour.
+        place(20, "Wrong Way Diner", "casual_dining", lat=24.85, lng=54.38,
+              emirate="Abu Dhabi", avg_duration_min=60),
+        # 17 km from Sight B, and directly on the road home: it costs the day nothing.
+        place(21, "On The Way Diner", "casual_dining", lat=24.60, lng=54.38,
+              emirate="Abu Dhabi", avg_duration_min=60),
+    ]
+    return sights + lunch + dinners
+
+
+def test_a_meal_is_chosen_for_its_detour_not_its_raw_distance():
+    """A meal is something you do on the way, so it should cost what it adds to the journey."""
+    plan = generate_plan(
+        _detour_day_pool(),
+        build_profile(family(2, (7, 13)), "birthday"),
+        distance_travel(),
+        start_date=TOMORROW,
+        num_days=1,
+        total_budget=4500.0,
+        origin=(24.4539, 54.3773),
+    )
+
+    names = [slot.place.name for slot in plan.days[0].slots]
+    assert "On The Way Diner" in names, f"picked the backtrack instead: {names}"
+    assert "Wrong Way Diner" not in names
+
+
+def test_attractions_are_still_chosen_on_plain_proximity():
+    """Only meals get the detour treatment — an attraction is the point of the day, not a stop
+    on the way to something else."""
+    from app.services.planner import DINING_CATEGORIES, geographic_penalty
+
+    origin = (24.4539, 54.3773)
+    previous = (24.75, 54.38)
+    far_side = place(1, "Sight", "museum", lat=24.85, lng=54.38)
+    diner = place(2, "Diner", "casual_dining", lat=24.85, lng=54.38)
+
+    assert far_side.category not in DINING_CATEGORIES
+    sight_km = geographic_penalty(far_side, previous, origin)
+    diner_km = geographic_penalty(diner, previous, origin)
+
+    assert sight_km == pytest.approx(haversine_km(previous[0], previous[1], 24.85, 54.38))
+    assert diner_km > sight_km, "the diner should be charged the trip back as well"
+
+
+def _lunch_between_two_attractions():
+    """Morning stop 11 km out, afternoon stop 44 km out, lunch due between them.
+
+    One restaurant sits back toward home; the other sits on the road to the afternoon stop.
+    Anchored on home the first looks free and the second looks terrible — and it is the wrong
+    way round, because the day carries on outward, not back.
+    """
+    return [
+        place(1, "Morning Sight", "aquarium", lat=24.60, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=120, kid_score=0.9),
+        place(2, "Afternoon Sight", "theme_park", lat=24.85, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=120, kid_score=0.95),
+        place(10, "Backtrack Grill", "casual_dining", lat=24.50, lng=54.3773,
+              emirate="Abu Dhabi", avg_duration_min=60),
+        place(11, "Roadside Kitchen", "casual_dining", lat=24.70, lng=54.3773,
+              emirate="Abu Dhabi", avg_duration_min=60),
+    ]
+
+
+def test_lunch_is_measured_against_where_the_day_goes_next_not_only_home():
+    """A midday meal should be on the way to the afternoon, not on the way back from it."""
+    plan = generate_plan(
+        _lunch_between_two_attractions(),
+        build_profile(family(2, (7, 13)), "birthday"),
+        distance_travel(),
+        start_date=TOMORROW,
+        num_days=1,
+        total_budget=4500.0,
+        origin=(24.4539, 54.3773),
+    )
+
+    names = [slot.place.name for slot in plan.days[0].slots]
+    assert "Afternoon Sight" in names, f"the scenario did not reach the afternoon: {names}"
+    assert "Roadside Kitchen" in names, f"took the backtrack instead: {names}"
+    assert "Backtrack Grill" not in names
+
+
+def test_the_last_meal_of_the_day_is_still_anchored_on_home():
+    """Nothing follows dinner, so home is the anchor — and must stay the anchor, or the lookahead
+    would reintroduce exactly the cross-emirate dinner the hop cap was added to stop."""
+    from app.services.planner import next_anchor
+
+    profile = build_profile(family(2, (7, 13)), "birthday")
+    origin = (24.4539, 54.3773)
+    pool = _lunch_between_two_attractions()
+
+    # 19:00, twenty minutes of daylight left: no attraction can plausibly follow.
+    late = next_anchor(pool, profile, origin, cursor=19 * 60, used=set(), day_month=TOMORROW.month)
+    assert late == origin
+
+    # Midday, with the afternoon still ahead of us.
+    midday = next_anchor(
+        pool, profile, origin, cursor=12 * 60, used={1}, day_month=TOMORROW.month
+    )
+    assert midday == (24.85, 54.3773)
+
+
+def test_an_attraction_already_used_is_not_an_anchor():
+    from app.services.planner import next_anchor
+
+    profile = build_profile(family(2, (7, 13)), "birthday")
+    origin = (24.4539, 54.3773)
+    pool = _lunch_between_two_attractions()
+    assert next_anchor(pool, profile, origin, cursor=12 * 60, used={1, 2},
+                       day_month=TOMORROW.month) == origin

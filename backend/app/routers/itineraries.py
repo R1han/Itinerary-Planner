@@ -20,6 +20,7 @@ from ..schemas import (
     ItineraryOut,
     ItinerarySummary,
     SlotPatch,
+    TransportPatch,
 )
 from ..services import itinerary as service
 
@@ -127,6 +128,20 @@ def make_day_cheaper(
         service.cheaper_day(db, itinerary, current, day_index)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return service.itinerary_payload(db, itinerary)
+
+
+@router.post("/{itinerary_id}/transport", response_model=ItineraryOut)
+def set_transport(
+    itinerary_id: int,
+    payload: TransportPatch,
+    current: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Switch between taxi fares and driving yourself, and re-price the plan on the spot."""
+    itinerary = get_itinerary_or_404(db, itinerary_id, current.id)
+    itinerary.transport_mode = payload.mode
+    service.recost_travel(db, itinerary, current)
     return service.itinerary_payload(db, itinerary)
 
 

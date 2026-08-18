@@ -42,14 +42,13 @@ from .planner import (
 )
 from .prayer import insert_prayer_breaks
 from .retrieval import query_for, retrieve_candidates, to_candidate
-from .travel import TravelService
+from .travel import TAXI, TRANSPORT_MODES, TravelService, fare, vehicle_for
 from .tracing import traced
 from .validator import repair_plan
 
 log = logging.getLogger(__name__)
 
 ALTERNATIVES_COUNT = 3
-# "Cheaper Day N" re-solves the day against this fraction of what it currently costs.
 CHEAPER_FACTOR = 0.65
 
 
@@ -133,6 +132,7 @@ def generate(
     title: str | None = None,
     currency: str = "AED",
     prayer_breaks: bool = False,
+    transport_mode: str = TAXI,
 ) -> Itinerary:
     """Plan a trip and persist it. Raises IntakeIncomplete before doing any work."""
     missing = missing_intake_fields(db, user)
@@ -155,7 +155,9 @@ def generate(
         origin=context.origin,
     )
 
-    travel_service = TravelService(db)
+    travel_service = TravelService(
+        db, mode=transport_mode, party_size=len(context.profile.attendees)
+    )
     travel_fn = travel_service.travel_fn(list(candidates))
 
     plan = generate_plan(
@@ -190,6 +192,7 @@ def generate(
         status="ready",
         start_lat=start_lat,
         start_lng=start_lng,
+        transport_mode=transport_mode,
     )
     db.add(itinerary)
     db.flush()
@@ -247,7 +250,7 @@ def pin_event_venue(
             position=len(day.slots),
             start_min=start,
             end_min=start + duration,
-            score=99.0,  # never the weakest slot, so repair trims around it
+            score=99.0, 
             cost=slot_cost_breakdown(venue, context.profile.attendees),
             locked=True,
         )
@@ -424,6 +427,36 @@ def context_for(db: Session, itinerary: Itinerary, user: User) -> PlanContext:
 # --- payload assembly --------------------------------------------------------------------------
 
 
+def _travel_service(db: Session, itinerary: Itinerary, context: PlanContext) -> TravelService:
+    """A travel service that prices legs for this plan's transport mode and this party's size."""
+    return TravelService(
+        db, mode=itinerary.transport_mode, party_size=len(context.profile.attendees)
+    )
+
+
+@traced("itinerary.recost_travel", run_type="chain")
+def recost_travel(db: Session, itinerary: Itinerary, user: User) -> None:
+    """Re-price the stored legs after the transport mode changed.
+
+    Deliberately not a re-plan: the route, the times and the places are all still right, and
+    re-solving them would move the trip when the user only said how they intend to get around.
+    Only `est_cost` changes, recomputed from the distance already on the row.
+    """
+    party = len(family_attendees(db, user.id)) or 1
+    segments = db.scalars(
+        select(TravelSegment).where(TravelSegment.itinerary_id == itinerary.id)
+    ).all()
+    for segment in segments:
+        segment.est_cost = fare(
+            segment.distance_km,
+            mode=itinerary.transport_mode,
+            party_size=party,
+            # Every leg but a day's last one arrives somewhere that has to be parked at.
+            arriving_stops=1 if segment.to_slot_id is not None else 0,
+        )
+    db.commit()
+
+
 def itinerary_payload(db: Session, itinerary: Itinerary) -> dict:
     """The full GET /itineraries/{id} body, built from persisted rows.
 
@@ -516,6 +549,8 @@ def itinerary_payload(db: Session, itinerary: Itinerary) -> dict:
         "num_days": itinerary.num_days,
         "currency": itinerary.currency,
         "status": itinerary.status,
+        "transport_mode": itinerary.transport_mode,
+        "vehicle": vehicle_for(len(family_attendees(db, itinerary.user_id)) or 1)[0],
         "days": days,
         "budget": {
             "total": total,
@@ -608,7 +643,7 @@ def alternatives_for_slot(
     plan = load_plan(db, itinerary)
     day = plan.days[slot_row.day_index]
 
-    travel_service = TravelService(db)
+    travel_service = _travel_service(db, itinerary, context)
     booked = {s.place.id for d in plan.days for s in d.slots}
     candidates = _candidates_for_gap(db, context, booked)
     # Offering three options must not cost dozens of route lookups; the real leg is routed when
@@ -705,7 +740,7 @@ def patch_slot(
     if target is None:
         raise ValueError("Slot not found in the loaded plan")
 
-    travel_service = TravelService(db)
+    travel_service = _travel_service(db, itinerary, context)
 
     if action == "remove":
         day.slots.remove(target)
@@ -771,7 +806,7 @@ def cheaper_day(db: Session, itinerary: Itinerary, user: User, day_index: int) -
     }
 
     candidates = _candidates_for_gap(db, context, booked_elsewhere)
-    travel_service = TravelService(db)
+    travel_service = _travel_service(db, itinerary, context)
     travel_fn = travel_service.travel_fn(candidates + [s.place for d in plan.days for s in d.slots])
 
     from .planner import assemble_day
@@ -810,7 +845,7 @@ def add_prayer_breaks(db: Session, itinerary: Itinerary, user: User) -> Plan:
     context = context_for(db, itinerary, user)
     plan = load_plan(db, itinerary)
 
-    travel_service = TravelService(db)
+    travel_service = _travel_service(db, itinerary, context)
     travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
 
     for day in plan.days:

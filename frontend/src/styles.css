@@ -525,6 +525,17 @@ a:hover {
   margin: 0;
 }
 
+/* URLs and ids have no spaces to break at; without this they widen the bubble past its max. */
+.bubble,
+.trace__label {
+  overflow-wrap: anywhere;
+}
+
+/* The user's own text keeps the line breaks they typed with shift+enter. */
+.bubble--user p {
+  white-space: pre-wrap;
+}
+
 .bubble--assistant {
   background: var(--muted);
   border-radius: var(--r-bubble) var(--r-bubble) var(--r-bubble) 6px;
@@ -744,6 +755,7 @@ a:hover {
 
 .trace__row {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: 7px;
   font-size: 12px;
@@ -788,9 +800,7 @@ a:hover {
 .trace__detail {
   color: var(--ink-45);
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .trace__outcome {
@@ -846,7 +856,7 @@ a:hover {
 
 .composer__box {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 12px;
   background: var(--muted);
   border: 1px solid rgba(31, 42, 42, 0.1);
@@ -858,16 +868,26 @@ a:hover {
   border-color: var(--teal);
 }
 
-.composer__box input {
+.composer__box textarea {
   flex: 1;
   min-width: 0;
   border: 0;
   background: none;
+  font-family: inherit;
   font-size: 14px;
+  /* A whole number, not a ratio: the auto-grow sets height from scrollHeight, which is an integer,
+     so a fractional line box (14 x 1.45 = 20.3px) gets rounded down and clips the descenders. */
+  line-height: 20px;
   outline: none;
+  resize: none;
+  max-height: 170px;
+  overflow-y: auto;
+  /* 20px line + 10px padding = the send button's 30px, so a one-line composer sits centred
+     against it rather than hanging below. The box still grows downward once the text wraps. */
+  padding: 5px 0;
 }
 
-.composer__box input::placeholder {
+.composer__box textarea::placeholder {
   color: var(--ink-42);
 }
 
@@ -1562,6 +1582,45 @@ a:hover {
 .legend strong {
   font-weight: 700;
   color: var(--ink);
+}
+
+/* Taxi / own car, sitting with the Travel figure it changes. */
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 2px;
+  border-radius: var(--r-pill);
+  background: var(--track);
+}
+
+.transport__option {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  color: var(--ink-62, rgba(31, 42, 42, 0.62));
+  background: none;
+}
+
+.transport__option--on {
+  background: var(--app);
+  color: var(--teal);
+  box-shadow: 0 1px 2px rgba(31, 42, 42, 0.12);
+}
+
+.transport__option:disabled {
+  opacity: 0.55;
+}
+
+.transport__vehicle {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--ink-42);
+  padding: 0 8px 0 4px;
 }
 
 .budget__days {

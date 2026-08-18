@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # --- domain ------------------------------------------------------------------
     default_currency: str = "AED"
     taxi_aed_per_km: float = 2.5
+    # Driving yourself is not free: petrol, and something to leave the car in. Both are flat
+    # knobs rather than researched per-place figures — the catalog carries no parking data.
+    fuel_aed_per_km: float = 0.35
+    parking_aed_per_stop: float = 15.0
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     @property

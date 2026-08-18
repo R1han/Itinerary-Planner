@@ -129,10 +129,10 @@ export const useStore = create<State & Actions>((set, get) => ({
     try {
       const user = await api.me()
       set({ user })
+      // refreshConversations selects the newest thread, and that thread decides what the right
+      // pane shows. Loading "the newest plan" here as well put an unrelated plan beside a thread
+      // that had nothing to do with it.
       await get().refreshConversations()
-
-      const plans = await api.itineraries()
-      if (plans.length) await get().loadItinerary(plans[0].id)
     } catch {
       token.clear()
       set({ user: null })
@@ -145,8 +145,6 @@ export const useStore = create<State & Actions>((set, get) => ({
     token.set(accessToken)
     set({ user, error: null })
     await get().refreshConversations()
-    const plans = await api.itineraries().catch(() => [])
-    if (plans.length) await get().loadItinerary(plans[0].id)
   },
 
   signOut() {
@@ -231,9 +229,14 @@ export const useStore = create<State & Actions>((set, get) => ({
           c.id === id ? { ...c, unread: false } : c,
         ),
       })
+      // The thread owns the right pane. Without the else, switching to a thread that has no
+      // plan left the previous thread's plan on screen, and switching back never reloaded.
       const conversation = get().conversations.find((c) => c.id === id)
-      if (conversation?.itinerary_id && conversation.itinerary_id !== get().itinerary?.id) {
-        await get().loadItinerary(conversation.itinerary_id)
+      const planId = conversation?.itinerary_id ?? null
+      if (planId === null) {
+        set({ itinerary: null, selectedDay: 0, selectedSlotId: null, editingSlotId: null })
+      } else if (planId !== get().itinerary?.id) {
+        await get().loadItinerary(planId)
       }
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Could not open that thread.' })

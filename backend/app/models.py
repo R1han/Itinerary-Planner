@@ -184,6 +184,8 @@ class Itinerary(Base):
     status: Mapped[str] = mapped_column(String(24), default="draft")
     start_lat: Mapped[float] = mapped_column(Float, default=25.2048)
     start_lng: Mapped[float] = mapped_column(Float, default=55.2708)
+    # "taxi" or "own_car" — per itinerary, because a family with a car may still fly to a trip.
+    transport_mode: Mapped[str] = mapped_column(String(16), default="taxi", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 

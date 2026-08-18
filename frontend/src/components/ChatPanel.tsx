@@ -186,6 +186,7 @@ export function ChatPanel() {
   const [draft, setDraft] = useState('')
   const [intakeFields, setIntakeFields] = useState<string[]>([])
   const bodyRef = useRef<HTMLDivElement>(null)
+  const draftRef = useRef<HTMLTextAreaElement>(null)
 
   const active = conversations.find((c) => c.id === conversationId)
   const others = conversations.filter((c) => c.id !== conversationId)
@@ -197,6 +198,15 @@ export function ChatPanel() {
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages.length, streamedText])
+
+  // The composer grows with its content: reset to one line, then take the height the text needs.
+  // CSS max-height caps it, after which the textarea scrolls.
+  useEffect(() => {
+    const field = draftRef.current
+    if (!field) return
+    field.style.height = 'auto'
+    field.style.height = `${field.scrollHeight}px`
+  }, [draft])
 
   const send = async () => {
     const text = draft.trim()
@@ -379,10 +389,13 @@ export function ChatPanel() {
 
       <div className="composer">
         <div className="composer__box">
-          <input
+          <textarea
+            ref={draftRef}
+            rows={1}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
+              // Enter sends; shift+enter is a newline, which the browser inserts for us.
               if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault()
                 void send()

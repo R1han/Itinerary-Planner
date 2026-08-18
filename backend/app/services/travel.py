@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Protocol
 
 from sqlalchemy.orm import Session
@@ -27,12 +28,49 @@ log = logging.getLogger(__name__)
 DRIVING = "driving-car"
 ORS_URL = "https://api.openrouteservice.org/v2/directions/{mode}/geojson"
 
+# How the party gets around. Stored per itinerary, because the answer can differ per trip.
+TAXI = "taxi"
+OWN_CAR = "own_car"
+TRANSPORT_MODES = (TAXI, OWN_CAR)
+
+# Seats, not heads. A fifth passenger does not cost 25% more — it costs a different vehicle.
+VEHICLE_TIERS = ((4, "standard", 1.0), (6, "6-seater", 1.6))
+LARGE_PARTY_VEHICLE = ("two vehicles", 2.0)
+
 # Fallback model (spec §7): straight-line × road factor, at city or highway speed, plus parking.
 ROAD_FACTOR = 1.3
 CITY_KMH = 45.0
 INTERCITY_KMH = 90.0
 INTERCITY_THRESHOLD_KM = 40.0
 PARKING_BUFFER_MIN = 10
+
+
+def vehicle_for(party_size: int) -> tuple[str, float]:
+    """What this many people have to travel in, and what it multiplies the fare by."""
+    for seats, label, multiplier in VEHICLE_TIERS:
+        if party_size <= seats:
+            return label, multiplier
+    return LARGE_PARTY_VEHICLE
+
+
+def fare(
+    distance_km: float, *, mode: str = TAXI, party_size: int = 2, arriving_stops: int = 0
+) -> float:
+    """What one leg costs this party.
+
+    Kept out of the providers on purpose. Distance is a property of the road and is cached and
+    shared between users; price is a property of who is travelling and how, and must not be.
+    """
+    _, multiplier = vehicle_for(party_size)
+    if mode == OWN_CAR:
+        return round(
+            distance_km * settings.fuel_aed_per_km * multiplier
+            # Parking is per car parked, so the vehicle tier does not touch it.
+            + arriving_stops * settings.parking_aed_per_stop,
+            2,
+        )
+    # A taxi is never parked by the people in it.
+    return round(distance_km * settings.taxi_aed_per_km * multiplier, 2)
 
 
 class TravelTimeProvider(Protocol):
@@ -80,7 +118,6 @@ class ORSProvider:
         response = httpx.post(
             ORS_URL.format(mode=mode),
             headers={"Authorization": self.api_key, "Content-Type": "application/json"},
-            # ORS takes [lng, lat] — the opposite order to everything else in this codebase.
             json={"coordinates": [[from_lng, from_lat], [to_lng, to_lat]]},
             timeout=self.timeout,
         )
@@ -110,14 +147,35 @@ def default_provider() -> TravelTimeProvider:
 class TravelService:
     """Cache-aware travel lookups, and the `travel_fn` the pure planner consumes."""
 
-    def __init__(self, db: Session, provider: TravelTimeProvider | None = None) -> None:
+    def __init__(
+        self,
+        db: Session,
+        provider: TravelTimeProvider | None = None,
+        *,
+        mode: str = TAXI,
+        party_size: int = 2,
+    ) -> None:
         self.db = db
         self.provider = provider or default_provider()
         self.fallback = HaversineProvider()
+        self.mode = mode
+        self.party_size = party_size
         # Within one planning run the same leg is asked for many times; don't re-hit ORS or SQL.
         self._memo: dict[tuple, TravelInfo] = {}
 
     # --- lookups ---------------------------------------------------------------------------
+
+    def _priced(self, info: TravelInfo, *, arriving_stops: int = 1) -> TravelInfo:
+        """Re-price a leg for THIS party. Providers and the cache only supply the distance."""
+        return replace(
+            info,
+            est_cost=fare(
+                info.distance_km,
+                mode=self.mode,
+                party_size=self.party_size,
+                arriving_stops=arriving_stops,
+            ),
+        )
 
     @traced("travel.between_places", run_type="tool")
     def between_places(self, from_place, to_place, mode: str = DRIVING) -> TravelInfo:
@@ -134,8 +192,8 @@ class TravelService:
                 estimated=cached.provider == HaversineProvider.name,
                 geometry=cached.geometry_json,
             )
-            self._memo[key] = info
-            return info
+            self._memo[key] = self._priced(info)
+            return self._memo[key]
 
         info, provider_name = self._fetch(
             from_place.lat, from_place.lng, to_place.lat, to_place.lng, mode
@@ -158,15 +216,16 @@ class TravelService:
             )
             self.db.flush()
 
-        self._memo[key] = info
-        return info
+        self._memo[key] = self._priced(info)
+        return self._memo[key]
 
     def between_coords(
         self, from_lat: float, from_lng: float, to_lat: float, to_lng: float, mode: str = DRIVING
     ) -> TravelInfo:
         key = (round(from_lat, 5), round(from_lng, 5), round(to_lat, 5), round(to_lng, 5), mode)
         if key not in self._memo:
-            self._memo[key], _ = self._fetch(from_lat, from_lng, to_lat, to_lng, mode)
+            info, _ = self._fetch(from_lat, from_lng, to_lat, to_lng, mode)
+            self._memo[key] = self._priced(info)
         return self._memo[key]
 
     def _fetch(
@@ -196,7 +255,7 @@ class TravelService:
         def _estimate(from_lat: float, from_lng: float, to_lat: float, to_lng: float) -> TravelInfo:
             key = (round(from_lat, 4), round(from_lng, 4), round(to_lat, 4), round(to_lng, 4))
             if key not in memo:
-                memo[key] = self.fallback.route(from_lat, from_lng, to_lat, to_lng)
+                memo[key] = self._priced(self.fallback.route(from_lat, from_lng, to_lat, to_lng))
             return memo[key]
 
         return _estimate
