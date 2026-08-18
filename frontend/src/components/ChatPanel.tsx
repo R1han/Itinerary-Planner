@@ -245,6 +245,10 @@ export function ChatPanel() {
             finishToolActivity(event.data.id, event.data.outcome, event.data.failed)
             break
           case 'itinerary_updated':
+            // A plan exists, so nothing is outstanding. The assistant can fill a gap itself
+            // mid-turn — asked for three adults, it saves the family and retries — and without
+            // this the checklist keeps asking a question that has already been answered.
+            setIntakeFields([])
             void loadItinerary(event.data.itinerary_id)
             break
           case 'budget_updated':
