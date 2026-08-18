@@ -256,16 +256,17 @@ def test_a_tight_budget_substitutes_rather_than_failing(client, mixed_family):
 # --- action chips ------------------------------------------------------------------------------
 
 
-def test_suggestions_name_the_priciest_day(client, mixed_family):
+def test_no_action_chips_are_offered(client, mixed_family):
+    """The "Cheaper Day N" and "Add prayer breaks" chips were deliberately withdrawn.
+
+    Both actions are still reachable — `/days/{i}/cheaper` and the chat's make_day_cheaper and
+    add_prayer_breaks — so this is about what the plan volunteers, not what it can do. The key
+    stays in the payload because the client types it as a list and reads it on every day patch.
+    """
     headers, _ = mixed_family
     plan = generate(client, headers)
-    suggestions = {s["action"]: s for s in plan["suggestions"]}
 
-    assert "prayer_breaks" in suggestions
-    cheaper = suggestions["cheaper_day"]
-    priciest = max(range(len(plan["budget"]["per_day"])), key=lambda i: plan["budget"]["per_day"][i])
-    assert cheaper["day_index"] == priciest
-    assert cheaper["label"] == f"Cheaper Day {priciest + 1}"
+    assert plan["suggestions"] == []
 
 
 def test_cheaper_day_reduces_that_day_without_breaking_the_plan(client, mixed_family):

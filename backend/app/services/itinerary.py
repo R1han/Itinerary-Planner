@@ -672,22 +672,6 @@ def suggestions_from_rows(per_day_totals: list[float]) -> list[dict]:
         return chips
 
     priciest = max(spending_days, key=lambda pair: pair[1])[0]
-    chips.append(
-        {
-            "id": f"cheaper-day-{priciest}",
-            "label": f"Cheaper Day {priciest + 1}",
-            "action": "cheaper_day",
-            "day_index": priciest,
-        }
-    )
-    chips.append(
-        {
-            "id": "prayer-breaks",
-            "label": "Add prayer breaks",
-            "action": "prayer_breaks",
-            "day_index": None,
-        }
-    )
     return chips
 
 
