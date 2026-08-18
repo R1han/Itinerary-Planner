@@ -327,8 +327,19 @@ def preference_signal(place: PlaceCandidate, preferences: Sequence[PreferenceSig
         if pref.category and pref.category == place.category:
             matched = True
         else:
+            words = haystack.split()
             for token in pref.subject.lower().split():
-                if len(token) > 3 and token in haystack:
+                # Prefix matching, not substring: people say "kayaking" about a "Kayak Tour" and
+                # "museums" about a "Museum", and exact containment silently missed every one of
+                # them — the preference was recorded, and then quietly did nothing. Four
+                # characters is the floor on the SHORTER of the two, so "kayak"/"kayaking" and
+                # "museum"/"museums" pair up while short words cannot swallow long ones.
+                if len(token) <= 3:
+                    continue
+                if any(
+                    (word.startswith(token) or token.startswith(word)) and min(len(word), len(token)) >= 4
+                    for word in words
+                ):
                     matched = True
                     break
         if not matched:

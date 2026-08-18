@@ -52,7 +52,10 @@ def create_all() -> None:
 # without this an existing rihla.db keeps working right up until something SELECTs the new column.
 # ponytail: a two-entry list beats adding Alembic for one column. If this list reaches a handful
 # of entries, or anything needs a data backfill, that trade has flipped — bring in migrations.
-_ADDED_COLUMNS = (("itineraries", "transport_mode", "VARCHAR(16) NOT NULL DEFAULT 'taxi'"),)
+_ADDED_COLUMNS = (
+    ("itineraries", "transport_mode", "VARCHAR(16) NOT NULL DEFAULT 'taxi'"),
+    ("itineraries", "emirates_json", "JSON"),
+)
 
 
 def _add_missing_columns() -> None:

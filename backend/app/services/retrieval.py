@@ -26,6 +26,19 @@ from .tracing import traced
 log = logging.getLogger(__name__)
 
 SHORTLIST_SIZE = 80
+
+# The seven emirates as the catalog spells them. A trip may be confined to some of these;
+# note that cities are NOT in here — Al Ain is a city in Abu Dhabi, and a request for it is
+# a request for that emirate.
+EMIRATES = (
+    "Abu Dhabi",
+    "Dubai",
+    "Sharjah",
+    "Ajman",
+    "Umm Al Quwain",
+    "Ras Al Khaimah",
+    "Fujairah",
+)
 SEMANTIC_POOL = 200
 # Places held back for affordability rather than relevance. Similarity ranking is blind to price,
 # so on a large catalog the free beaches and cheap cafes stop making the shortlist at all — and

@@ -714,3 +714,85 @@ def test_replace_needs_either_a_place_or_a_category(client, mixed_family):
         json={"action": "replace"},
     )
     assert response.status_code == 422
+
+
+# --- guests ------------------------------------------------------------------------------------
+
+
+GUESTS = [
+    {"role": "adult", "age": 30},
+    {"role": "adult", "age": 28},
+    {"role": "child", "age": 9},
+]
+
+
+def test_guests_join_the_party_for_pricing_and_the_vehicle(client, mixed_family):
+    """People coming on the trip but not in the household still get counted and charged.
+
+    `mixed_family` is four; three guests make seven, which no single taxi seats.
+    """
+    headers, _ = mixed_family
+    plan = generate(client, headers, total_budget=7000.0, guests=GUESTS)
+
+    assert plan["vehicle"] == "two vehicles"
+
+    priced = 0
+    for day in plan["days"]:
+        for slot in day["slots"]:
+            cost = slot["cost_breakdown"]
+            heads = len(cost["adults"]) + len(cost["children"]) + cost["free_children"]
+            assert heads == 7, f"{slot['place']['name']} charged {heads} people, not 7"
+            priced += 1
+    assert priced, "the plan had no slots to check"
+
+
+def test_a_transport_round_trip_does_not_forget_the_guests(client, mixed_family):
+    """recost_travel must re-price for the same party generation used, guests included."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, total_budget=7000.0, guests=GUESTS)
+    taxi_travel = plan["budget"]["categories"]["travel"]
+
+    for mode in ("own_car", "taxi"):
+        response = client.post(
+            f"/itineraries/{plan['id']}/transport", headers=headers, json={"mode": mode}
+        )
+        assert response.status_code == 200, response.text
+        back = response.json()
+
+    assert back["vehicle"] == "two vehicles"
+    assert back["budget"]["categories"]["travel"] == pytest.approx(taxi_travel)
+
+
+# --- region ------------------------------------------------------------------------------------
+
+
+def test_a_trip_confined_to_one_emirate_stays_there(client, mixed_family):
+    """The reported bug: "in and around Abu Dhabi or Al Ain" returned City Walk and La Mer.
+
+    Al Ain is a city inside the Abu Dhabi emirate, so that request is one emirate, not two.
+    """
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0, emirates=["Abu Dhabi"])
+
+    stops = [(s["place"].get("name"), s["place"].get("emirate")) for d in plan["days"] for s in d["slots"]]
+    assert stops, "the plan had no stops"
+    assert all(emirate == "Abu Dhabi" for _, emirate in stops), stops
+
+
+def test_a_later_edit_still_respects_the_region(client, mixed_family):
+    """Persisted, not just applied once — otherwise the next edit quietly reintroduces Dubai.
+
+    Swapping a stop goes through the same gap retrieval that add_stop and cheaper-day use, so
+    this covers every edit path without depending on one category happening to fit the day.
+    """
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0, emirates=["Abu Dhabi"])
+    slot = plan["days"][0]["slots"][0]
+
+    options = client.get(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}/alternatives", headers=headers
+    ).json()
+    assert options, "no alternatives were offered"
+    assert all(o["place"]["emirate"] == "Abu Dhabi" for o in options), [
+        (o["place"]["name"], o["place"]["emirate"]) for o in options
+    ]

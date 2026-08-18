@@ -146,6 +146,7 @@ export interface Itinerary {
   transport_mode: TransportMode
   /** What the party has to travel in — derived from family size, e.g. "6-seater". */
   vehicle: string
+  party_size: number
   days: Day[]
   budget: Budget
   suggestions: Suggestion[]

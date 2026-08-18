@@ -768,3 +768,57 @@ def test_an_adults_only_anniversary_scores_for_romance_not_for_children():
     assert whole_family.w_kid == 1.0 and whole_family.w_romance < 0.5
     assert just_the_two.w_romance == 1.0 and just_the_two.w_kid == 0.0
     assert just_the_two.evening_bias is True
+
+
+# --- a preference has to match the word the user actually used ---------------------------------
+
+
+def _kayak():
+    from app.services.planner import PlaceCandidate
+
+    return PlaceCandidate(
+        id=1, name="Mangrove Kayak Tour", category="adventure", emirate="Abu Dhabi",
+        lat=24.45, lng=54.6, tags=("water", "outdoor"),
+    )
+
+
+@pytest.mark.parametrize("said", ["kayaking", "kayak", "Kayaks", "Mangrove Kayak Tour"])
+def test_the_word_a_person_uses_reaches_the_place_they_mean(said):
+    """The reported bug: "I don't like Kayaking" recorded, and then nothing happened.
+
+    Matching was exact substring containment, so "kayaking" was not in "mangrove kayak tour" and
+    the dislike scored zero. Silent — the preference was on file and simply did no work.
+    """
+    from app.services.planner import PreferenceSignal, preference_signal
+
+    dislike = [PreferenceSignal(kind="dislike", subject=said)]
+    assert preference_signal(_kayak(), dislike) < 0, said
+
+
+@pytest.mark.parametrize("said", ["museums", "museum"])
+def test_a_plural_matches_its_singular(said):
+    from app.services.planner import PlaceCandidate, PreferenceSignal, preference_signal
+
+    louvre = PlaceCandidate(
+        id=2, name="Louvre Abu Dhabi", category="museum", emirate="Abu Dhabi", lat=24.5, lng=54.4
+    )
+    assert preference_signal(louvre, [PreferenceSignal(kind="like", subject=said)]) > 0
+
+
+def test_a_short_word_cannot_swallow_a_long_one():
+    """Prefix matching has to stay a near-miss rule, not a free-for-all."""
+    from app.services.planner import PreferenceSignal, preference_signal
+
+    for unrelated in ("karting", "camel rides", "shopping"):
+        assert preference_signal(
+            _kayak(), [PreferenceSignal(kind="dislike", subject=unrelated)]
+        ) == 0, unrelated
+
+
+def test_a_category_dislike_still_rules_out_the_whole_kind():
+    from app.services.planner import PreferenceSignal, preference_signal
+
+    signal = preference_signal(
+        _kayak(), [PreferenceSignal(kind="dislike", subject="anything", category="adventure")]
+    )
+    assert signal < 0
