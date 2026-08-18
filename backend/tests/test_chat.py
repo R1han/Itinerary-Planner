@@ -94,6 +94,7 @@ def test_the_spec_tools_are_all_exposed():
         "add_prayer_breaks",
         "edit_stop",
         "set_transport",
+        "add_stop",
     }
 
 
@@ -738,10 +739,12 @@ def test_editing_needs_a_plan_to_edit(db, orchestrator):
 
 
 def test_the_system_prompt_forbids_claiming_an_edit_that_did_not_happen(db, orchestrator):
-    """Part A of the fix: the model has no tool for some asks, and must say so."""
+    """The honesty rule. The "no tool exists for that" clause it used to carry is gone —
+    add_stop and edit_stop/replace now cover the asks it was written for — but the rule that a
+    change must have actually happened before it is described stands on its own."""
     prompt = orchestrator().system_prompt()
     assert "Never say the plan changed unless a tool you called in THIS turn returned" in prompt
-    assert "There is no tool that adds a new place to an existing plan" in prompt
+    assert "Listing a stop the plan does not contain is" in prompt
 
 
 # --- a rebuild must not quietly orphan the plan --------------------------------------------------
@@ -976,7 +979,9 @@ ALL_NULL_CALLS = [
     ("add_prayer_breaks", {"itinerary_id": None}),
     ("set_transport", {"mode": "own_car", "itinerary_id": None}),
     ("make_day_cheaper", {"day": 1, "itinerary_id": None}),
-    ("edit_stop", {"slot_id": 1, "action": "remove", "start_time": None, "itinerary_id": None}),
+    ("edit_stop", {"slot_id": 1, "action": "remove", "start_time": None, "category": None,
+                   "itinerary_id": None}),
+    ("add_stop", {"day": 1, "category": None, "itinerary_id": None}),
 ]
 
 
@@ -1115,3 +1120,95 @@ def test_the_prompt_tells_the_model_to_match_the_scope_of_the_request(db, orches
     assert "focus='dinner_only'" in prompt
     assert "not a day out with a restaurant at the end of it" in prompt
     assert "adults_only" in prompt
+
+
+# --- swapping a stop from chat --------------------------------------------------------------------
+
+
+def test_replacing_a_stop_by_category_swaps_rather_than_removes(client, planned, db):
+    """The reported bug: asked to swap a park for shopping, the assistant could only remove.
+
+    edit_stop had no 'replace', so it removed the park, said "Day 2: Adventure & Shopping", and
+    left the day one stop short with nothing shopping about it.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    before = chat.call_tool("get_itinerary", {})
+    stop = before["days"][0]["stops"][0]
+
+    result = chat.call_tool(
+        "edit_stop", {"slot_id": stop["slot_id"], "action": "replace", "category": "mall"}
+    )
+
+    if "error" in result:  # a packed day may genuinely have no room for that category
+        assert "place_id or category" not in result["error"]
+        return
+    after = chat.call_tool("get_itinerary", {})
+    names = [s["name"] for d in after["days"] for s in d["stops"]]
+    assert stop["name"] not in names
+    assert len(after["days"][0]["stops"]) == len(before["days"][0]["stops"]), "a swap, not a removal"
+
+
+def test_a_removed_stop_can_be_added_back_from_chat(client, planned, db):
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
+    chat.call_tool("edit_stop", {"slot_id": stop["slot_id"], "action": "remove"})
+    gone = len(chat.call_tool("get_itinerary", {})["days"][0]["stops"])
+
+    result = chat.call_tool("add_stop", {"day": 1})
+
+    assert "error" not in result, result
+    assert result["added"], result
+    assert len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) == gone + 1
+
+
+def test_adding_a_stop_reports_what_else_was_available(db, planned):
+    """So the reply can offer a different one instead of pretending there was no choice."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
+    chat.call_tool("edit_stop", {"slot_id": stop["slot_id"], "action": "remove"})
+
+    result = chat.call_tool("add_stop", {"day": 1})
+    assert "alternatives" in result
+    assert result["added"] not in result["alternatives"]
+
+
+def test_a_full_day_refuses_a_stop_from_chat_too(client, planned, db):
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    result = chat.call_tool("add_stop", {"day": 1, "category": "mall"})
+    if "error" in result:
+        assert "fits" in result["error"] or "Nothing available" in result["error"]
+
+
+def test_replace_without_a_target_is_an_error_not_a_removal(client, planned, db):
+    """A malformed swap must never fall through to deleting the stop."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    before = chat.call_tool("get_itinerary", {})
+    stop = before["days"][0]["stops"][0]
+
+    result = chat.call_tool("edit_stop", {"slot_id": stop["slot_id"], "action": "replace"})
+
+    assert "error" in result
+    after = chat.call_tool("get_itinerary", {})
+    assert stop["name"] in [s["name"] for d in after["days"] for s in d["stops"]]
+
+
+def test_the_trace_says_swapping_not_removing(db):
+    from app.services.orchestrator import describe_tool_call
+
+    label, detail = describe_tool_call(
+        "edit_stop", {"slot_id": 3, "action": "replace", "category": "mall"}
+    )
+    assert label == "Swapping a stop"
+    assert detail == "for mall"
+
+
+def test_the_prompt_tells_the_model_to_swap_rather_than_remove(db, orchestrator):
+    prompt = orchestrator().system_prompt()
+    assert "action='replace'" in prompt
+    assert "never remove it and hope" in prompt
+    assert "add_stop" in prompt

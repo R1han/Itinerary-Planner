@@ -14,6 +14,7 @@ from ..db import get_db
 from ..models import Itinerary, User
 from ..repo import get_itinerary_or_404, get_slot_or_404, owned_query
 from ..schemas import (
+    AddStopRequest,
     AlternativeOut,
     DayPatchResponse,
     GenerateRequest,
@@ -109,11 +110,29 @@ def patch_slot(
             action=payload.action,
             place_id=payload.place_id,
             start_time=payload.start_time,
+            category=payload.category,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return service.day_payload(db, itinerary, day_index)
+
+
+@router.post("/{itinerary_id}/days/{day_index}/stops", response_model=ItineraryOut)
+def add_stop(
+    itinerary_id: int,
+    day_index: int,
+    payload: AddStopRequest,
+    current: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Add one stop to a day, placed wherever it costs the day least."""
+    itinerary = get_itinerary_or_404(db, itinerary_id, current.id)
+    try:
+        service.add_stop(db, itinerary, current, day_index=day_index, category=payload.category)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return service.itinerary_payload(db, itinerary)
 
 
 @router.post("/{itinerary_id}/days/{day_index}/cheaper", response_model=ItineraryOut)

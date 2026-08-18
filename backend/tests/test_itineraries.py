@@ -568,3 +568,149 @@ def test_a_bigger_family_pays_for_a_bigger_vehicle(client, make_user, catalog):
 
     assert four["vehicle"] == "standard"
     assert six["vehicle"] == "6-seater"
+
+
+# --- putting something new into a day -------------------------------------------------------------
+
+
+def _day_with_room(plan: dict) -> int:
+    return min(range(len(plan["days"])), key=lambda i: len(plan["days"][i]["slots"]))
+
+
+def _remove_one(client, headers, plan) -> tuple[int, dict]:
+    """Free up a slot, which is the situation add_stop exists for."""
+    day_index, slot = _first_editable(plan)
+    client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}", headers=headers, json={"action": "remove"}
+    )
+    return day_index, slot
+
+
+def test_a_removed_stop_can_be_put_back(client, mixed_family):
+    """Removing used to be one-way from chat: nothing could add anything to a day."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    day_index, removed = _remove_one(client, headers, plan)
+
+    after_removal = client.get(f"/itineraries/{plan['id']}", headers=headers).json()
+    count_before = len(after_removal["days"][day_index]["slots"])
+
+    response = client.post(
+        f"/itineraries/{plan['id']}/days/{day_index}/stops", headers=headers, json={}
+    )
+    assert response.status_code == 200, response.text
+    assert len(response.json()["days"][day_index]["slots"]) == count_before + 1
+
+
+def test_a_stop_can_be_added_by_category(client, mixed_family):
+    """"Replace the park with shopping" in the shape the chat actually needs it."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    day_index, removed = _remove_one(client, headers, plan)
+    wanted = removed["place"]["category"]
+
+    response = client.post(
+        f"/itineraries/{plan['id']}/days/{day_index}/stops",
+        headers=headers,
+        json={"category": wanted},
+    )
+    assert response.status_code == 200, response.text
+    categories = [s["place"]["category"] for s in response.json()["days"][day_index]["slots"]]
+    assert wanted in categories, categories
+
+
+def test_an_added_stop_keeps_the_day_valid(client, mixed_family):
+    """It has to be scheduled, not merely appended — times in order, no overlaps."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    day_index, _ = _remove_one(client, headers, plan)
+
+    after = client.post(
+        f"/itineraries/{plan['id']}/days/{day_index}/stops", headers=headers, json={}
+    ).json()
+
+    slots = sorted(after["days"][day_index]["slots"], key=lambda s: s["start_time"])
+    for a, b in zip(slots, slots[1:]):
+        assert a["end_time"] <= b["start_time"], (a["place"]["name"], b["place"]["name"])
+
+
+def test_a_full_day_refuses_a_new_stop_rather_than_forcing_one_in(client, mixed_family):
+    """A freshly generated day is packed. Saying so beats overlapping two stops."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    response = client.post(
+        f"/itineraries/{plan['id']}/days/0/stops", headers=headers, json={"category": "mall"}
+    )
+    assert response.status_code == 422
+    assert "fits" in response.json()["detail"]
+
+
+def test_adding_a_stop_that_cannot_fit_is_an_error_not_a_silent_no_op(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    response = client.post(
+        f"/itineraries/{plan['id']}/days/0/stops", headers=headers, json={"category": "nonsense"}
+    )
+    assert response.status_code == 422
+
+
+def test_a_stop_cannot_be_added_to_someone_elses_plan(client, mixed_family, make_user):
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    intruder, _ = make_user("intruder2@rihla.app")
+    response = client.post(
+        f"/itineraries/{plan['id']}/days/0/stops", headers=intruder, json={"category": "mall"}
+    )
+    assert response.status_code == 404
+
+
+def test_replacing_a_slot_by_category_swaps_it_for_that_kind_of_place(client, mixed_family):
+    """"Replace the park with shopping" — one call, no place ids to juggle."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    day_index, slot = _first_editable(plan)
+
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "replace", "category": "mall"},
+    )
+    assert response.status_code == 200, response.text
+
+    names = {s["place"]["id"]: s["place"] for s in response.json()["day"]["slots"]}
+    assert slot["place"]["id"] not in names
+    assert any(p["category"] == "mall" for p in names.values()), [
+        p["name"] for p in names.values()
+    ]
+
+
+def test_replace_still_accepts_an_explicit_place_id(client, mixed_family):
+    """The strip UI picks from a list and sends an id; that path must not change."""
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    day_index, slot = _first_editable(plan)
+    options = client.get(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}/alternatives", headers=headers
+    ).json()
+    assert options, "no alternatives to test with"
+
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}",
+        headers=headers,
+        json={"action": "replace", "place_id": options[0]["place"]["id"]},
+    )
+    assert response.status_code == 200, response.text
+    assert options[0]["place"]["id"] in [
+        s["place"]["id"] for s in response.json()["day"]["slots"]
+    ]
+
+
+def test_replace_needs_either_a_place_or_a_category(client, mixed_family):
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0)
+    _, slot = _first_editable(plan)
+    response = client.patch(
+        f"/itineraries/{plan['id']}/slots/{slot['id']}", headers=headers,
+        json={"action": "replace"},
+    )
+    assert response.status_code == 422

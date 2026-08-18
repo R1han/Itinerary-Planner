@@ -307,15 +307,29 @@ class DayPatchResponse(BaseModel):
     warnings: list[str] = []
 
 
+PlaceCategory = Literal[
+    "adventure", "aquarium", "beach", "casual_dining", "cruise", "fine_dining",
+    "mall", "museum", "park", "show", "theme_park", "waterpark",
+]
+
+
+class AddStopRequest(BaseModel):
+    """Put a new stop into a day. The server picks the best fit of that kind."""
+
+    category: PlaceCategory | None = None
+
+
 class SlotPatch(BaseModel):
     action: Literal["replace", "adjust", "remove"]
     place_id: int | None = None
     start_time: HHMM | None = None
+    # "Swap this for shopping" — the server resolves the place, so no id has to change hands.
+    category: PlaceCategory | None = None
 
     @model_validator(mode="after")
     def _action_args(self) -> Self:
-        if self.action == "replace" and self.place_id is None:
-            raise ValueError("replace requires place_id")
+        if self.action == "replace" and self.place_id is None and self.category is None:
+            raise ValueError("replace requires place_id or category")
         if self.action == "adjust" and self.start_time is None:
             raise ValueError("adjust requires start_time")
         return self

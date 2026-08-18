@@ -34,10 +34,13 @@ from .planner import (
     TravelInfo,
     DINNER_ONLY,
     FULL_DAY,
+    MAX_HOP_KM,
     PLAN_FOCUS,
     build_profile,
     dinner_only,
     generate_plan,
+    geographic_penalty,
+    haversine_km,
     rebuild_segments,
     reflow_day,
     score_place,
@@ -658,6 +661,57 @@ def gap_window(day: DayPlan, position: int) -> tuple[int, int]:
     return (earliest, latest)
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Where a candidate would sit between two neighbours, and what getting there costs."""
+
+    start_min: int
+    end_min: int
+    inbound: TravelInfo
+
+
+def placement_for(
+    candidate: PlaceCandidate,
+    context: PlanContext,
+    travel_fn,
+    *,
+    earliest: int,
+    latest: int,
+    from_point: tuple[float, float],
+    following: PlannedSlot | None,
+    day_month: int,
+) -> Placement | None:
+    """Fit one candidate into one gap, or None if it cannot go there.
+
+    Shared by "what else could this slot be" and "put something new in this day" — the two only
+    differ in what they do with the answer, and having one implementation of *fits* means a rule
+    added here (the hop cap, an age gate) can never apply to one and not the other.
+    """
+    if not all(person.age >= candidate.min_age for person in context.profile.attendees):
+        return None
+    if not candidate.open_in_month(day_month):
+        return None
+    if haversine_km(from_point[0], from_point[1], candidate.lat, candidate.lng) > MAX_HOP_KM:
+        return None
+
+    inbound = travel_fn(from_point[0], from_point[1], candidate.lat, candidate.lng)
+    start = max(earliest + inbound.duration_min, candidate.opens_at)
+    end = start + min(candidate.avg_duration_min, context.profile.max_slot_min)
+
+    if end > candidate.closes_at or end > context.profile.day_end:
+        return None
+    if following is not None:
+        outbound = travel_fn(
+            candidate.lat, candidate.lng, following.place.lat, following.place.lng
+        )
+        if end + outbound.duration_min > following.start_min:
+            return None
+    elif end > latest:
+        return None
+
+    return Placement(start_min=start, end_min=end, inbound=inbound)
+
+
 @traced("itinerary.alternatives", run_type="chain")
 def alternatives_for_slot(
     db: Session, itinerary: Itinerary, user: User, slot_row: Slot, limit: int = ALTERNATIVES_COUNT
@@ -692,26 +746,16 @@ def alternatives_for_slot(
 
     options: list[dict] = []
     for candidate in scored:
-        if not all(person.age >= candidate.min_age for person in context.profile.attendees):
+        fit = placement_for(
+            candidate, context, travel_fn,
+            earliest=earliest, latest=latest, from_point=origin, following=following,
+            day_month=day.day_date.month,
+        )
+        if fit is None:
             continue
+        start, end = fit.start_min, fit.end_min
 
-        inbound = travel_fn(origin[0], origin[1], candidate.lat, candidate.lng)
-        start = max(earliest + inbound.duration_min, candidate.opens_at)
-        duration = min(candidate.avg_duration_min, context.profile.max_slot_min)
-        end = start + duration
-
-        if end > candidate.closes_at:
-            continue
-        if following is not None:
-            outbound = travel_fn(
-                candidate.lat, candidate.lng, following.place.lat, following.place.lng
-            )
-            if end + outbound.duration_min > following.start_min:
-                continue
-        elif end > latest:
-            continue
-
-        cost = slot_cost_breakdown(candidate, context.profile.attendees, inbound.est_cost)
+        cost = slot_cost_breakdown(candidate, context.profile.attendees, fit.inbound.est_cost)
         if cost.total > spare:
             continue
 
@@ -732,6 +776,22 @@ def alternatives_for_slot(
     return options
 
 
+def _best_alternative_id(
+    db: Session, itinerary: Itinerary, user: User, slot_row: Slot, category: str
+) -> int | None:
+    """The highest-scoring swap of a given kind that fits this slot's window and budget.
+
+    Lets a request stay in the user's own words — "replace the park with shopping" — instead of
+    making the assistant fetch a list and pick an id out of it.
+    """
+    options = [
+        option
+        for option in alternatives_for_slot(db, itinerary, user, slot_row, limit=ALTERNATIVES_COUNT * 4)
+        if option["place"].category == category
+    ]
+    return options[0]["place"].id if options else None
+
+
 @traced("itinerary.patch_slot", run_type="chain")
 def patch_slot(
     db: Session,
@@ -742,6 +802,7 @@ def patch_slot(
     action: str,
     place_id: int | None = None,
     start_time: str | None = None,
+    category: str | None = None,
 ) -> tuple[Plan, PlanContext, int]:
     """Replace / adjust / remove one slot, re-solving only that gap.
 
@@ -778,7 +839,15 @@ def patch_slot(
 
     elif action == "replace":
         if place_id is None:
-            raise ValueError("replace requires place_id")
+            if not category:
+                raise ValueError("replace requires place_id or category")
+            place_id = _best_alternative_id(db, itinerary, user, slot_row, category)
+            # Distinct from the message above on purpose: "you did not say what to put here" and
+            # "nothing of that kind fits here" need different answers from the caller.
+            if place_id is None:
+                raise ValueError(
+                    f"No {category.replace('_', ' ')} fits that slot's window and budget."
+                )
         place_row = db.get(Place, place_id)
         if place_row is None:
             raise ValueError("Unknown place")
@@ -813,6 +882,102 @@ def patch_slot(
     persist_plan(db, itinerary, plan)
     db.commit()
     return plan, context, day_index
+
+
+@traced("itinerary.add_stop", run_type="chain")
+def add_stop(
+    db: Session, itinerary: Itinerary, user: User, *, day_index: int, category: str | None = None
+) -> tuple[Plan, PlanContext, dict]:
+    """Put one new stop into a day, in whichever gap costs the day least.
+
+    Removing a stop used to be one-way: nothing could put anything back. Every gap between two
+    existing stops is tried, plus the ends of the day; the placement that adds the fewest
+    kilometres wins. Returns the plan, the context, and what was chosen alongside the runners-up
+    so the caller can say what else was available.
+    """
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+    if not 0 <= day_index < len(plan.days):
+        raise ValueError("Unknown day")
+    day = plan.days[day_index]
+
+    booked = {s.place.id for d in plan.days for s in d.slots}
+    candidates = _candidates_for_gap(db, context, booked)
+    if category:
+        candidates = [c for c in candidates if c.category == category]
+    if not candidates:
+        raise ValueError(f"Nothing available in {category!r}." if category else "Nothing available.")
+
+    travel_service = _travel_service(db, itinerary, context)
+    travel_fn = travel_service.estimate_fn()
+    spare = plan.total_budget - plan.total_cost
+    ordered = sorted(day.slots, key=lambda s: s.start_min)
+
+    # Every insertion point: before the first stop, between each pair, and after the last.
+    considered: list[tuple[float, int, PlaceCandidate, Placement, CostBreakdown]] = []
+    for index in range(len(ordered) + 1):
+        previous = ordered[index - 1] if index > 0 else None
+        following = ordered[index] if index < len(ordered) else None
+        from_point = (
+            (previous.place.lat, previous.place.lng) if previous else context.origin
+        )
+        earliest = previous.end_min if previous else context.profile.day_start
+        latest = following.start_min if following else context.profile.day_end
+
+        for candidate in candidates:
+            fit = placement_for(
+                candidate, context, travel_fn,
+                earliest=earliest, latest=latest, from_point=from_point, following=following,
+                day_month=day.day_date.month,
+            )
+            if fit is None:
+                continue
+            cost = slot_cost_breakdown(candidate, context.profile.attendees, fit.inbound.est_cost)
+            if cost.total > spare:
+                continue
+            # Prefer the stop that adds the least travel, then the better-scoring place.
+            detour = geographic_penalty(candidate, from_point, context.origin)
+            rank = detour - 20.0 * score_place(candidate, context.profile, context.preferences)
+            considered.append((rank, index, candidate, fit, cost))
+
+    if not considered:
+        raise ValueError("Nothing in that category fits this day's schedule or budget.")
+
+    _, position, chosen, fit, cost = min(considered, key=lambda row: row[0])
+    runners_up = [c.name for _, _, c, _, _ in sorted(considered, key=lambda r: r[0])
+                  if c.id != chosen.id][:2]
+
+    for other_day in plan.days:
+        for slot in other_day.slots:
+            slot.locked = True
+
+    day.slots.insert(position, PlannedSlot(
+        place=chosen,
+        day_index=day_index,
+        position=position,
+        start_min=fit.start_min,
+        end_min=fit.end_min,
+        score=score_place(chosen, context.profile, context.preferences),
+        cost=cost,
+    ))
+    for order, slot in enumerate(sorted(day.slots, key=lambda s: s.start_min)):
+        slot.position = order
+
+    real_travel = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+    reflow_day(day, context.profile, real_travel, context.origin)
+    plan = repair_plan(plan, context.profile, real_travel, context.origin)
+
+    for other_day in plan.days:
+        for slot in other_day.slots:
+            slot.locked = False
+
+    survived = any(s.place.id == chosen.id for s in plan.days[day_index].slots)
+    if not survived:
+        raise ValueError(f"{chosen.name} could not be fitted into that day.")
+
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan, context, {"chosen": chosen.name, "alternatives": runners_up}
 
 
 @traced("itinerary.cheaper_day", run_type="chain")

@@ -226,6 +226,30 @@ _TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "add_stop",
+            "description": (
+                "Add one new stop to a day of an existing plan, placed wherever it costs the day "
+                "least. Use it to fill a gap, or after removing something. The server refuses "
+                "rather than overlapping two stops if the day has no room."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "integer", "description": "1-based day number."},
+                    "category": {
+                        "type": "string",
+                        "enum": ["adventure", "aquarium", "beach", "casual_dining", "cruise", "fine_dining", "mall", "museum", "park", "show", "theme_park", "waterpark"],
+                        "description": "What kind of place. Omit to take the best of any kind.",
+                    },
+                    "itinerary_id": {"type": "integer"},
+                },
+                "required": ["day"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_transport",
             "description": (
                 "Record how the family is getting around and re-price the plan. Call this "
@@ -255,7 +279,15 @@ _TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "slot_id": {"type": "integer"},
-                    "action": {"type": "string", "enum": ["remove", "adjust"]},
+                    "action": {"type": "string", "enum": ["remove", "adjust", "replace"]},
+                    "category": {
+                        "type": "string",
+                        "enum": ["adventure", "aquarium", "beach", "casual_dining", "cruise", "fine_dining", "mall", "museum", "park", "show", "theme_park", "waterpark"],
+                        "description": (
+                            "For action='replace': the kind of place to swap in. The server "
+                            "picks the best one that fits the slot's window and budget."
+                        ),
+                    },
                     "start_time": {
                         "type": "string",
                         "description": "24h HH:MM. Required when action is adjust.",
@@ -427,8 +459,15 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
         mode = str(_arg(args, "mode", ""))
         return "Switching transport", "own car" if mode == "own_car" else "taxi"
 
+    if name == "add_stop":
+        kind = str(args.get("category") or "").replace("_", " ")
+        return "Adding a stop", f"{kind} · day {int(_arg(args, 'day', 1))}" if kind else None
+
     if name == "edit_stop":
         action = str(_arg(args, "action", ""))
+        if action == "replace":
+            kind = str(args.get("category") or "").replace("_", " ")
+            return "Swapping a stop", f"for {kind}" if kind else None
         if action == "adjust":
             return "Moving a stop", f"to {args.get('start_time')}" if args.get("start_time") else None
         return "Removing a stop", None
@@ -472,6 +511,9 @@ def summarise_tool_result(name: str, result: dict) -> str:
     if name == "set_transport":
         travel = (result.get("travel") or {}).get("total")
         return f"travel now {_money(travel)}" if travel is not None else "repriced"
+    if name == "add_stop":
+        chosen = result.get("added")
+        return f"added {chosen}" if chosen else "added"
     if name in ("add_prayer_breaks", "edit_stop"):
         return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "create_event":
@@ -539,12 +581,13 @@ class ChatOrchestrator:
             "between messages, so anything you saw earlier in this conversation may already be "
             "wrong, and the real numbers are on screen next to you.\n\n"
             "Never say the plan changed unless a tool you called in THIS turn returned the "
-            "change. You can edit an existing plan only with make_day_cheaper, add_prayer_breaks, "
-            "set_transport and edit_stop. There is no tool that adds a new place to an existing plan: if the "
-            "user asks for that, say plainly that you cannot do it yet. Do NOT reach for "
-            "generate_itinerary to work around a missing edit tool: it builds a replacement plan "
-            "from scratch and throws the current one away, so call it a second time only when the "
-            "user has asked for a new plan or agreed to start over. Listing a stop the plan does not contain is "
+            "change. You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
+            "set_transport, add_stop and edit_stop. To swap one stop for a different kind of "
+            "place use edit_stop with action='replace' and a category — never remove it and hope; "
+            "removing leaves the day one stop short. Do NOT reach for generate_itinerary to work "
+            "around an edit: it builds a replacement plan from scratch and throws the current one "
+            "away, so call it a second time only when the user has asked for a new plan or agreed "
+            "to start over. Listing a stop the plan does not contain is "
             "worse than admitting the limit — the real plan is on screen beside you, and the "
             "user can see that it did not change.\n\n"
             f"Today is {date.today().isoformat()}.\n"
@@ -611,6 +654,7 @@ class ChatOrchestrator:
             "make_day_cheaper": self._make_day_cheaper,
             "add_prayer_breaks": self._add_prayer_breaks,
             "set_transport": self._set_transport,
+            "add_stop": self._add_stop,
             "edit_stop": self._edit_stop,
             "record_preference": self._record_preference,
         }.get(name)
@@ -932,6 +976,26 @@ class ChatOrchestrator:
         itinerary_service.recost_travel(self.db, itinerary, self.user)
         return self._plan_result(itinerary)
 
+    def _add_stop(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error:
+            return error
+
+        try:
+            _, _, outcome = itinerary_service.add_stop(
+                self.db, itinerary, self.user,
+                day_index=int(_arg(args, "day", 1)) - 1,
+                category=args.get("category"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        result = self._plan_result(itinerary)
+        result["added"] = outcome["chosen"]
+        # So the reply can offer a different one instead of pretending there was no choice.
+        result["alternatives"] = outcome["alternatives"]
+        return result
+
     def _edit_stop(self, args: dict) -> dict:
         itinerary, error = self._open_plan(args)
         if error:
@@ -955,6 +1019,7 @@ class ChatOrchestrator:
                 slot,
                 action=str(_arg(args, "action", "")),
                 start_time=args.get("start_time"),
+                category=args.get("category"),
             )
         except ValueError as exc:
             return {"error": str(exc)}
