@@ -668,6 +668,17 @@ def test_the_stream_pairs_every_tool_frame_with_a_result(client, make_user, monk
 # --- editing an existing plan from chat ----------------------------------------------------------
 
 
+def _warned_last_turn(chat):
+    """Put the thread where a real one is when the user says "yes, start over".
+
+    The warning was given in a previous turn and the user has since replied, which is the only
+    state in which replace_existing counts for anything.
+    """
+    chat.conversation.rebuild_warned = True
+    chat.warned_at_turn_start = True
+    return chat
+
+
 def _chat_for(db, plan):
     """An orchestrator whose conversation is attached to `plan`, as the real one would be."""
     from app.models import Conversation, User
@@ -806,7 +817,7 @@ def test_a_rebuild_keeps_the_event_the_conversation_is_planning(client, planned,
     db.add(conversation)
     db.commit()
 
-    chat = ChatOrchestrator(db, row, conversation)
+    chat = _warned_last_turn(ChatOrchestrator(db, row, conversation))
     result = chat.call_tool(
         "generate_itinerary", {"replace_existing": True, "days": 1, "budget": 4500, "start_date": FUTURE}
     )
@@ -834,7 +845,7 @@ def test_an_explicit_event_id_still_wins_over_the_conversations(client, planned,
     db.add(conversation)
     db.commit()
 
-    result = ChatOrchestrator(db, row, conversation).call_tool(
+    result = _warned_last_turn(ChatOrchestrator(db, row, conversation)).call_tool(
         "generate_itinerary",
         {"replace_existing": True, "days": 1, "budget": 4500, "start_date": FUTURE, "event_id": asked_for.id},
     )
@@ -874,7 +885,7 @@ def test_a_rebuild_keeps_the_transport_mode_the_family_told_us_about(client, pla
     from app.models import Itinerary
 
     _, _, plan = planned
-    chat = _chat_for(db, plan)
+    chat = _warned_last_turn(_chat_for(db, plan))
     chat.call_tool("set_transport", {"mode": "own_car"})
 
     result = chat.call_tool(
@@ -1440,7 +1451,7 @@ def test_the_chat_can_plan_for_more_people_than_the_household(client, planned, d
     `planned` saves a household of two, so five guests make seven — more than one taxi seats.
     """
     _, _, plan = planned
-    chat = _chat_for(db, plan)
+    chat = _warned_last_turn(_chat_for(db, plan))
     result = chat.call_tool(
         "generate_itinerary",
         {"replace_existing": True, 
@@ -1457,7 +1468,7 @@ def test_the_chat_can_plan_for_more_people_than_the_household(client, planned, d
 def test_a_rebuild_does_not_quietly_drop_the_guests(client, planned, db):
     """Same failure the transport mode had: replan, and the extra five stop being charged for."""
     _, _, plan = planned
-    chat = _chat_for(db, plan)
+    chat = _warned_last_turn(_chat_for(db, plan))
     first = chat.call_tool(
         "generate_itinerary",
         {"replace_existing": True, "days": 1, "budget": 7000, "start_date": FUTURE,
@@ -1514,7 +1525,7 @@ def test_a_stated_total_beats_the_models_arithmetic(client, planned, db):
     many the model happened to list.
     """
     _, _, plan = planned
-    chat = _chat_for(db, plan)
+    chat = _warned_last_turn(_chat_for(db, plan))
     result = chat.call_tool(
         "generate_itinerary",
         {"replace_existing": True, "days": 1, "budget": 7000, "start_date": FUTURE, "party_size": 7,
@@ -1586,7 +1597,7 @@ def test_a_swap_that_only_fits_past_the_window_asks_before_taking_it(client, pla
     )
     assert asked.get("needs_confirmation") == "window_overrun"
     assert "error" not in asked  # a question, so the row must not render as a failure
-    assert asked["place"] and asked["ends_at"]
+    assert asked["proposed_place"] and asked["proposed_ends_at"]
 
     # Nothing may have changed while the question was outstanding.
     held = chat.call_tool("get_itinerary", {})
@@ -1715,7 +1726,7 @@ def test_generating_again_will_not_silently_discard_the_current_plan(client, pla
         "generate_itinerary", {"days": 1, "budget": 5000, "start_date": "2026-09-01"}
     )
 
-    assert "replace_existing" in result["error"]
+    assert "Their ANSWER is what unlocks this" in result["error"]
     assert db.query(Itinerary).count() == count_before, "no orphan row"
     after = chat.call_tool("get_itinerary", {})
     assert after["itinerary_id"] == before["itinerary_id"]
@@ -1724,7 +1735,7 @@ def test_generating_again_will_not_silently_discard_the_current_plan(client, pla
 
 def test_an_explicit_start_over_still_works(client, planned, db):
     _, _, plan = planned
-    chat = _chat_for(db, plan)
+    chat = _warned_last_turn(_chat_for(db, plan))
     before = chat.call_tool("get_itinerary", {})
 
     result = chat.call_tool(
@@ -1798,30 +1809,35 @@ def test_an_unknown_id_in_the_arguments_is_simply_ignored(client, planned, db):
 # --- the model cannot grant itself a rebuild it was just refused -------------------------------
 
 
-def test_replace_existing_is_refused_again_when_it_follows_a_refusal_in_the_same_turn(
-    client, planned, db
-):
-    """The reported bug: the guard was a speed bump.
+def test_replace_existing_cannot_grant_itself(client, planned, db):
+    """The reported bug: the guard was a formality.
 
-    Told no, the model set replace_existing itself and rebuilt anyway — inside the same turn, so
-    the user it was told to ask had not said a word in between.
+    "This plan is okay, let us finalize it" became a rebuild that discarded every edit. The flag
+    was free to set, and the model set it on its first attempt, so the refusal it was meant to
+    follow never happened. Permission arrives a turn after the warning, because that is how long
+    the user takes to answer.
     """
     _, _, plan = planned
     chat = _chat_for(db, plan)
     args = {"days": 1, "budget": 5000, "start_date": FUTURE}
 
-    first = chat.call_tool("generate_itinerary", args)
-    assert "replace_existing" in first["error"]
-
-    second = chat.call_tool("generate_itinerary", {**args, "replace_existing": True})
-    assert "Still no" in second["error"]
+    straight_in = chat.call_tool("generate_itinerary", {**args, "replace_existing": True})
+    assert "does not grant itself" in straight_in["error"]
     assert chat.call_tool("get_itinerary", {})["itinerary_id"] == plan["id"], "plan untouched"
 
-    # The user answers, which starts a new turn — and now it goes through.
-    chat.rebuild_refused = False
-    third = chat.call_tool("generate_itinerary", {**args, "replace_existing": True})
-    assert "error" not in third
-    assert third["itinerary_id"] != plan["id"]
+    # Refused, then insisting, still inside the turn the user has not spoken in.
+    assert "does not grant itself" in chat.call_tool(
+        "generate_itinerary", {**args, "replace_existing": True}
+    )["error"]
+    assert chat.call_tool("get_itinerary", {})["itinerary_id"] == plan["id"]
+
+    # The warning stuck, so once the user has actually answered it goes through.
+    assert chat.conversation.rebuild_warned is True
+    chat.warned_at_turn_start = True
+    went_through = chat.call_tool("generate_itinerary", {**args, "replace_existing": True})
+    assert "error" not in went_through
+    assert went_through["itinerary_id"] != plan["id"]
+    assert chat.conversation.rebuild_warned is False, "spent — the next rebuild asks again"
 
 
 # --- a turn never ends without a reply ---------------------------------------------------------
@@ -2018,7 +2034,7 @@ def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
         pytest.skip(f"this day admits a museum without re-timing: {asked}")
 
     assert asked["needs_confirmation"] == "day_reorder"
-    assert asked["place"] and asked["duration_min"] > 0
+    assert asked["proposed_place"] and asked["proposed_duration_min"] > 0
     # Nothing may move while the question is outstanding.
     held = chat.call_tool("get_itinerary", {})
     assert [s["name"] for s in held["days"][0]["stops"]] == [
@@ -2033,7 +2049,7 @@ def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
     assert "error" not in agreed, agreed
     after = chat.call_tool("get_itinerary", {})
     names = [s["name"] for s in after["days"][0]["stops"]]
-    assert asked["place"] in names, "the place it named is the place it placed"
+    assert asked["proposed_place"] in names, "the place it named is the place it placed"
     assert last["name"] not in names
     assert len(names) == len(plan["days"][0]["stops"]), "a swap, not a removal"
 
@@ -2189,3 +2205,82 @@ def test_recording_a_dislike_actually_reaches_the_scorer(client, planned, db):
 
     context = context_for(db, db.get(Itinerary, plan["id"]), db.get(User, chat.user.id))
     assert preference_signal(to_candidate(kayak), context.preferences) < 0
+
+
+# --- a question is not an answer ---------------------------------------------------------------
+
+
+def test_a_confirmation_carries_the_plan_as_it_really_stands(client, planned, db):
+    """The reported bug: the chat described a swap that never happened.
+
+    The result was `{"needs_confirmation": ..., "place": "Hudayriyat Adventure Park", ...}` — a
+    place name and a plausible story — and the model reported it as done. The right pane was
+    correct all along and the user was told otherwise, which is the worst way to be wrong.
+    """
+    chat = _abu_dhabi_day(db, planned)
+    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
+        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
+        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+
+    before = [s["name"] for s in chat.call_tool("get_itinerary", {})["days"][0]["stops"]]
+    asked = chat.call_tool(
+        "edit_stop", {"stop": before[-1], "action": "replace", "category": "museum"}
+    )
+    if not asked.get("needs_confirmation"):
+        pytest.skip("this day needed no confirmation")
+
+    assert asked["applied"] is False, "the model has to be told nothing happened"
+    assert asked["plan_is_unchanged"] == before, "the truth travels with the question"
+    # Nothing may be named in a way that reads like an outcome.
+    assert "place" not in asked and "ends_at" not in asked and "duration_min" not in asked
+    assert asked["proposed_place"] not in asked["plan_is_unchanged"]
+
+
+def test_a_confirmation_does_not_nudge_the_right_pane(client, planned, db):
+    """`touched_itinerary` is what makes the stream emit `itinerary_updated`. A question changed
+    nothing, so a refresh would only redraw the same plan and imply otherwise."""
+    chat = _abu_dhabi_day(db, planned)
+    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
+        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
+        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+
+    last = chat.call_tool("get_itinerary", {})["days"][0]["stops"][-1]["name"]
+    chat.touched_itinerary = None
+    asked = chat.call_tool("edit_stop", {"stop": last, "action": "replace", "category": "museum"})
+    if not asked.get("needs_confirmation"):
+        pytest.skip("this day needed no confirmation")
+    assert chat.touched_itinerary is None
+
+
+def test_finalising_a_plan_is_not_a_thing_the_model_has_to_do(db, orchestrator):
+    """"Let us finalize it" found no finalise tool and reached for the most destructive one.
+
+    There is nothing to call: the plan is already saved. The prompt now says so, and the refusal
+    repeats it, because the refusal is what the model reads when it guesses wrong.
+    """
+    prompt = orchestrator().system_prompt()
+    assert "there is no " in prompt and "finalising, confirming or committing" in prompt
+    assert "A tool that comes back asking has changed NOTHING" in prompt
+
+
+def test_the_first_refusal_does_not_name_the_flag_that_defeats_it(client, planned, db):
+    """Naming `replace_existing` in the refusal is what taught the model to set it."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    refusal = chat.call_tool(
+        "generate_itinerary", {"days": 1, "budget": 5000, "start_date": FUTURE}
+    )["error"]
+    assert "replace_existing" not in refusal
+    assert "no finalising, confirming or committing" in refusal
+
+
+def test_the_warning_survives_the_turn_it_was_given_in(client, planned, db):
+    """Consent arrives a turn after the warning, so the warning has to outlive the turn."""
+    from app.models import Conversation
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    chat.call_tool("generate_itinerary", {"days": 1, "budget": 5000, "start_date": FUTURE})
+    db.commit()
+
+    assert db.get(Conversation, chat.conversation.id).rebuild_warned is True

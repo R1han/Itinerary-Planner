@@ -714,6 +714,9 @@ class ChatOrchestrator:
         self.touched_itinerary: Itinerary | None = None
         # Set when a rebuild is turned down, cleared at the top of every turn. See _generate_itinerary.
         self.rebuild_refused = False
+        # Whether the warning predates this turn. Snapshotted because the guard itself sets the
+        # flag, and a value it just wrote is not evidence the user has answered.
+        self.warned_at_turn_start = bool(getattr(conversation, "rebuild_warned", False))
 
     def _rebind(self) -> None:
         """Re-load the user and conversation from the session by id.
@@ -828,7 +831,16 @@ class ChatOrchestrator:
             "have been given, and pass its event_id exactly as listed. Do not guess an id: the "
             "plan is titled after the event you name, so the wrong one mislabels the whole trip. "
             "get_upcoming_events is only for looking further ahead than the list above.\n\n"
-"Likes and dislikes are worth recording the moment they are said, and a message can be "
+"A plan is saved the moment it is built and again on every edit — there is no "
+            "finalising, confirming or committing step, and nothing to call when the user says "
+            "they are happy with it. Say so and stop. Reaching for generate_itinerary there "
+            "rebuilds the trip from scratch and throws away everything they just approved.\n\n"
+            "A tool that comes back asking has changed NOTHING. `applied: false` means the plan "
+            "is exactly as it was, and `plan_is_unchanged` is what it still contains — describe "
+            "that, put the question to the user, and wait. Reporting the proposal as though it "
+            "had happened leaves them reading one plan in the chat and a different one on "
+            "screen.\n\n"
+            "Likes and dislikes are worth recording the moment they are said, and a message can be "
             "two things at once: \"I don't like kayaking\" is an edit to make AND a preference "
             "to keep, so call record_preference in the same turn as the edit. Doing only the "
             "edit fixes today's plan and forgets the reason by the next session, which is how "
@@ -1068,29 +1080,34 @@ class ChatOrchestrator:
         # sacrifice some budget" reads as. Only the conversation's *own* plan is protected: a new
         # thread still plans freely even though the user has older plans elsewhere.
         if current is not None and current.id == self.conversation.itinerary_id:
+            # `replace_existing` alone is not permission. Setting it is free, and the model set
+            # it on its first attempt — "let us finalize it" became a rebuild that threw away
+            # every edit. Permission arrives a TURN after the warning, because that is how long
+            # it takes the user to answer, so the flag counts only once the warning has been
+            # given and the user has spoken since.
+            warned_before_this_turn = self.warned_at_turn_start
+            self.conversation.rebuild_warned = True
+            self.rebuild_refused = True
+
             if not bool(_arg(args, "replace_existing", False)):
-                self.rebuild_refused = True
                 return {
                     "error": (
                         "This conversation already has a plan, and generating another one "
                         "replaces it completely — every edit the user has approved is lost. "
                         "Adding, removing or swapping a single stop is add_stop or edit_stop, "
-                        "never this. If the user genuinely wants to start over, tell them the "
-                        "current plan will be discarded, get an unambiguous yes, and only then "
-                        "call this again with replace_existing=true."
+                        "never this. Nothing else needs this tool: a plan is saved as it is "
+                        "built and edited, so there is no finalising, confirming or committing "
+                        "to do. If the user genuinely wants to start over, tell them the current "
+                        "plan will be discarded, and ask. Their ANSWER is what unlocks this."
                     )
                 }
-            if self.rebuild_refused:
-                # Refused a moment ago and now insisting. The user has not spoken since — no one
-                # has, this is the same turn — so this cannot be the yes the refusal asked for.
-                # Without this, the refusal was a speed bump: the model simply set the flag and
-                # rebuilt anyway, which is the exact outcome the guard exists to prevent.
+            if not warned_before_this_turn:
                 return {
                     "error": (
-                        "Still no. replace_existing needs the user's answer, and they have not "
-                        "said anything since you were told this — you cannot give yourself "
-                        "permission inside one turn. Stop calling tools, tell them what would be "
-                        "lost, and ask. If they say yes, their next message is when this works."
+                        "replace_existing does not grant itself. The user has not been told this "
+                        "plan would be discarded and has not agreed to it — as of the start of "
+                        "this turn, nobody had raised it. Stop calling tools, tell them what "
+                        "would be lost, and ask. Their next message is when this works."
                     )
                 }
 
@@ -1131,6 +1148,7 @@ class ChatOrchestrator:
             return {"error": "intake_incomplete", "missing_fields": exc.missing}
 
         self.conversation.itinerary_id = created.id
+        self.conversation.rebuild_warned = False  # spent — the next rebuild must ask again
         if event is not None:
             self.conversation.event_id = event.id
             self.conversation.title = event.title
@@ -1333,24 +1351,44 @@ class ChatOrchestrator:
             )
         except itinerary_service.DayReorderRequired as exc:
             # Before WindowOverrunRequired only because both are ValueErrors and order decides.
-            return {
-                "needs_confirmation": "day_reorder",
-                "place": exc.place_name,
-                "duration_min": exc.duration_min,
-                "ask": str(exc),
-            }
+            return self._unapplied(
+                itinerary, "day_reorder", exc,
+                proposed_place=exc.place_name, proposed_duration_min=exc.duration_min,
+            )
         except itinerary_service.WindowOverrunRequired as exc:
             # Not an `error`: nothing failed, the server needs an answer. Returned before the
             # plain ValueError branch because it is one.
-            return {
-                "needs_confirmation": "window_overrun",
-                "place": exc.place_name,
-                "ends_at": exc.ends_at,
-                "ask": str(exc),
-            }
+            return self._unapplied(
+                itinerary, "window_overrun", exc,
+                proposed_place=exc.place_name, proposed_ends_at=exc.ends_at,
+            )
         except ValueError as exc:
             return {"error": str(exc)}
         return self._plan_result(itinerary)
+
+    def _unapplied(self, itinerary: Itinerary, kind: str, exc: Exception, **proposed) -> dict:
+        """A question, shaped so it cannot be read as an answer.
+
+        The reported bug: this used to return `{"needs_confirmation": ..., "place": "Hudayriyat
+        Adventure Park", ...}`, and the model reported the swap as done — it saw a place name and
+        a plausible story and narrated them. Nothing had changed, the right pane correctly still
+        showed the old stop, and the user was told otherwise.
+
+        So: `applied` says no in as many words, every proposal is prefixed `proposed_` rather than
+        named like an outcome, and the plan as it ACTUALLY stands travels with the question. A
+        reply that invents a change now has to contradict the stop list sitting beside it.
+        """
+        self.touched_itinerary = None  # nothing changed, so the right pane must not be nudged
+        payload = itinerary_service.itinerary_payload(self.db, itinerary)
+        return {
+            "applied": False,
+            "needs_confirmation": kind,
+            "question_for_the_user": str(exc),
+            **proposed,
+            "plan_is_unchanged": [
+                slot["place"].name for day in payload["days"] for slot in day["slots"]
+            ],
+        }
 
     def _record_preference(self, args: dict) -> dict:
         self._remember(str(_arg(args, "kind", "like")), str(_arg(args, "subject", "")),
@@ -1385,6 +1423,7 @@ class ChatOrchestrator:
     def stream(self, user_message: str) -> Iterator[str]:
         self._rebind()
         self.rebuild_refused = False
+        self.warned_at_turn_start = bool(self.conversation.rebuild_warned)
         self.record("user", user_message)
         self.db.commit()
         # A failure here propagates to the router, which turns it into an `error` frame. The
