@@ -49,8 +49,11 @@ function TransportToggle() {
           {mode === 'taxi' ? 'Taxi' : 'Own car'}
         </button>
       ))}
-      <span className="transport__vehicle" title="Vehicle size needed for your party">
-        {itinerary.vehicle}
+      <span
+        className="transport__vehicle"
+        title={`${itinerary.party_size} travelling — ${itinerary.vehicle}`}
+      >
+        {itinerary.party_size} · {itinerary.vehicle}
       </span>
     </div>
   )

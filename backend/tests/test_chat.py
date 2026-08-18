@@ -13,6 +13,7 @@ from datetime import date, timedelta
 import pytest
 
 from app.models import Conversation, Event, FamilyMember, Preference, User
+from app.services.budget import Attendee
 from app.services.orchestrator import TOOLS, ChatOrchestrator
 
 FUTURE = (date.today() + timedelta(days=20)).isoformat()
@@ -104,6 +105,19 @@ def test_no_tool_schema_exposes_a_user_id():
         properties = tool["function"]["parameters"].get("properties", {})
         assert "user_id" not in properties, tool["function"]["name"]
         assert "user_id" not in json.dumps(tool)
+
+
+def test_no_tool_schema_exposes_an_itinerary_id():
+    """An argument the model must supply is an argument the model can get wrong.
+
+    It did: strict mode makes every property required, so this had to be sent on every call, and
+    a model with no id to give sends 0. `get_itinerary` then answered "no plan yet" on a thread
+    that had one, and the model set about building a replacement. Which plan is meant was never
+    ambiguous — the conversation knows — so the parameter bought nothing and cost that.
+    """
+    for tool in TOOLS:
+        properties = tool["function"]["parameters"].get("properties", {})
+        assert "itinerary_id" not in properties, tool["function"]["name"]
 
 
 # --- tools write only the current user's rows --------------------------------------------------
@@ -457,8 +471,10 @@ def test_get_itinerary_reflects_an_edit_rather_than_the_original(client, planned
 
 
 def test_get_itinerary_cannot_read_another_users_plan(client, planned, db, orchestrator):
+    """There is no argument left to try, and naming one anyway changes nothing."""
     _, _, plan = planned
     intruder = orchestrator("intruder@rihla.app")
+    assert intruder.call_tool("get_itinerary", {})["itinerary"] is None
     assert intruder.call_tool("get_itinerary", {"itinerary_id": plan["id"]})["itinerary"] is None
 
 
@@ -674,9 +690,9 @@ def test_removing_a_stop_from_chat_changes_the_plan_and_flags_the_pane(client, p
     chat = _chat_for(db, plan)
 
     slot = next(d for d in plan["days"] if d["slots"])["slots"][0]
-    result = chat.call_tool("edit_stop", {"slot_id": slot["id"], "action": "remove"})
+    result = chat.call_tool("edit_stop", {"stop": slot["place"]["name"], "action": "remove"})
 
-    assert "error" not in result
+    assert "error" not in result, result
     assert chat.touched_itinerary is not None, "the right pane will not refresh"
     assert chat.touched_itinerary.id == plan["id"]
 
@@ -684,21 +700,36 @@ def test_removing_a_stop_from_chat_changes_the_plan_and_flags_the_pane(client, p
     assert slot["place"]["name"] not in names
 
 
-def test_the_model_is_given_the_slot_ids_it_needs_to_edit(client, planned, db):
-    """edit_stop takes a slot_id, so get_itinerary has to be where that id comes from."""
+def test_a_stop_can_be_edited_without_reading_the_plan_first(client, planned, db):
+    """The point of naming stops: no lookup round, so nothing to remember or get stale.
+
+    edit_stop used to take a slot_id, which exists only in the database — a model that had not
+    just called get_itinerary could only invent one, and did.
+    """
     _, _, plan = planned
-    read = _chat_for(db, plan).call_tool("get_itinerary", {})
-    ids = {stop["slot_id"] for day in read["days"] for stop in day["stops"]}
-    assert ids == {slot["id"] for day in plan["days"] for slot in day["slots"]}
+    chat = _chat_for(db, plan)
+    named = next(d for d in plan["days"] if d["slots"])["slots"][0]["place"]["name"]
+
+    result = chat.call_tool("edit_stop", {"stop": named, "action": "remove"})
+
+    assert "error" not in result, result
+    names = [s["name"] for d in chat.call_tool("get_itinerary", {})["days"] for s in d["stops"]]
+    assert named not in names
 
 
 def test_an_edit_cannot_reach_another_users_plan(client, planned, db, orchestrator):
-    """The slot id is real; the caller is not its owner. Scoping is by itinerary, then by user."""
+    """The stop is real and its name is guessable; the caller is not its owner.
+
+    Naming stops instead of numbering them changes nothing here — resolution runs against the
+    plan the CONVERSATION owns, and this conversation owns none.
+    """
     _, _, plan = planned
     slot = next(d for d in plan["days"] if d["slots"])["slots"][0]
 
     intruder = orchestrator("intruder@rihla.app")
-    result = intruder.call_tool("edit_stop", {"slot_id": slot["id"], "action": "remove"})
+    result = intruder.call_tool(
+        "edit_stop", {"stop": slot["place"]["name"], "action": "remove"}
+    )
 
     assert "error" in result
     assert intruder.touched_itinerary is None
@@ -712,7 +743,9 @@ def test_adjust_without_a_time_is_an_error_not_a_silent_no_op(client, planned, d
     _, _, plan = planned
     chat = _chat_for(db, plan)
     slot = next(d for d in plan["days"] if d["slots"])["slots"][0]
-    assert "error" in chat.call_tool("edit_stop", {"slot_id": slot["id"], "action": "adjust"})
+    assert "error" in chat.call_tool(
+        "edit_stop", {"stop": slot["place"]["name"], "action": "adjust"}
+    )
 
 
 def test_making_a_day_cheaper_reports_what_it_actually_saved(client, planned, db):
@@ -775,7 +808,7 @@ def test_a_rebuild_keeps_the_event_the_conversation_is_planning(client, planned,
 
     chat = ChatOrchestrator(db, row, conversation)
     result = chat.call_tool(
-        "generate_itinerary", {"days": 1, "budget": 4500, "start_date": FUTURE}
+        "generate_itinerary", {"replace_existing": True, "days": 1, "budget": 4500, "start_date": FUTURE}
     )
 
     assert "error" not in result, result
@@ -803,7 +836,7 @@ def test_an_explicit_event_id_still_wins_over_the_conversations(client, planned,
 
     result = ChatOrchestrator(db, row, conversation).call_tool(
         "generate_itinerary",
-        {"days": 1, "budget": 4500, "start_date": FUTURE, "event_id": asked_for.id},
+        {"replace_existing": True, "days": 1, "budget": 4500, "start_date": FUTURE, "event_id": asked_for.id},
     )
     assert db.get(Itinerary, result["itinerary_id"]).event_id == asked_for.id
 
@@ -811,7 +844,7 @@ def test_an_explicit_event_id_still_wins_over_the_conversations(client, planned,
 def test_the_system_prompt_forbids_rebuilding_as_a_workaround(db, orchestrator):
     prompt = orchestrator().system_prompt()
     assert "throws the current one away" in prompt
-    assert "agreed to start over" in prompt
+    assert "never a reason to start over" in prompt
 
 
 def test_saying_you_have_your_own_car_actually_reprices_the_plan(client, planned, db):
@@ -845,7 +878,7 @@ def test_a_rebuild_keeps_the_transport_mode_the_family_told_us_about(client, pla
     chat.call_tool("set_transport", {"mode": "own_car"})
 
     result = chat.call_tool(
-        "generate_itinerary", {"days": 1, "budget": 4500, "start_date": FUTURE}
+        "generate_itinerary", {"replace_existing": True, "days": 1, "budget": 4500, "start_date": FUTURE}
     )
     assert "error" not in result, result
     assert db.get(Itinerary, result["itinerary_id"]).transport_mode == "own_car"
@@ -934,25 +967,36 @@ def test_every_tool_schema_satisfies_strict_mode():
 
     A schema that breaks these rules is rejected by the API, and a rejected schema fails the
     whole chat request — so this is checked here rather than discovered in production.
+
+    Checked at EVERY depth, not just the top: the rule applies to an object nested inside an
+    array's `items` too, and a top-level-only check let exactly that reach the API.
     """
+
+    def closed(node, where: str):
+        if node.get("type") == "object" or "properties" in node:
+            assert node.get("additionalProperties") is False, f"{where} is not closed"
+            assert set(node.get("required", [])) == set(node.get("properties", {})), (
+                where,
+                set(node.get("properties", {})) ^ set(node.get("required", [])),
+            )
+        for name, child in node.get("properties", {}).items():
+            closed(child, f"{where}.{name}")
+        if isinstance(node.get("items"), dict):
+            closed(node["items"], f"{where}[]")
+
     for tool in TOOLS:
-        parameters = tool["function"]["parameters"]
-        assert parameters["additionalProperties"] is False, tool["function"]["name"]
-        assert set(parameters["required"]) == set(parameters["properties"]), (
-            tool["function"]["name"],
-            set(parameters["properties"]) ^ set(parameters["required"]),
-        )
+        closed(tool["function"]["parameters"], tool["function"]["name"])
 
 
 def test_a_formerly_optional_argument_is_declared_nullable():
     """It has to still be omittable in spirit, and null is how strict mode spells that."""
     by_name = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
 
-    assert "null" in by_name["get_itinerary"]["properties"]["itinerary_id"]["type"]
+    assert "null" in by_name["get_upcoming_events"]["properties"]["horizon_days"]["type"]
     assert "null" in by_name["edit_stop"]["properties"]["start_time"]["type"]
     assert "null" in by_name["save_family_details"]["properties"]["likes"]["type"]
     # A required one stays a plain scalar.
-    assert by_name["edit_stop"]["properties"]["slot_id"]["type"] == "integer"
+    assert by_name["edit_stop"]["properties"]["stop"]["type"] == "string"
 
 
 def test_no_schema_carries_a_keyword_strict_mode_may_reject():
@@ -974,14 +1018,13 @@ ALL_NULL_CALLS = [
     ("save_family_details", {"adults": 2, "children_ages": None, "likes": None, "dislikes": None}),
     ("create_event", {"title": "X", "event_type": "birthday", "date": FUTURE, "notes": None}),
     ("get_upcoming_events", {"horizon_days": None}),
-    ("get_itinerary", {"itinerary_id": None}),
+    ("get_itinerary", {}),
     ("record_preference", {"kind": "like", "subject": "beaches", "category": None}),
-    ("add_prayer_breaks", {"itinerary_id": None}),
-    ("set_transport", {"mode": "own_car", "itinerary_id": None}),
-    ("make_day_cheaper", {"day": 1, "itinerary_id": None}),
-    ("edit_stop", {"slot_id": 1, "action": "remove", "start_time": None, "category": None,
-                   "itinerary_id": None}),
-    ("add_stop", {"day": 1, "category": None, "itinerary_id": None}),
+    ("add_prayer_breaks", {}),
+    ("set_transport", {"mode": "own_car"}),
+    ("make_day_cheaper", {"day": 1}),
+    ("edit_stop", {"stop": "anything", "action": "remove", "start_time": None, "category": None}),
+    ("add_stop", {"day": 1, "category": None}),
 ]
 
 
@@ -1068,7 +1111,7 @@ def test_adults_only_charges_for_the_adults_and_not_the_children(client, planned
         {"days": 1, "budget": 5000, "start_date": FUTURE,
          "focus": "dinner_only", "adults_only": True},
     )
-    payload = chat.call_tool("get_itinerary", {"itinerary_id": couple["itinerary_id"]})
+    payload = chat.call_tool("get_itinerary", {})
     breakdown = payload["days"][0]["stops"][0]
     assert breakdown["cost"] > 0
 
@@ -1136,10 +1179,13 @@ def test_replacing_a_stop_by_category_swaps_rather_than_removes(client, planned,
     before = chat.call_tool("get_itinerary", {})
     stop = before["days"][0]["stops"][0]
 
-    result = chat.call_tool(
-        "edit_stop", {"slot_id": stop["slot_id"], "action": "replace", "category": "mall"}
-    )
+    swap = {"stop": stop["name"], "action": "replace", "category": "mall"}
+    result = chat.call_tool("edit_stop", swap)
 
+    if result.get("needs_confirmation"):
+        # The mall fits only if the day runs later, so the server asks first. Answer yes — the
+        # swap itself is what this test is about.
+        result = chat.call_tool("edit_stop", {**swap, "allow_overrun": True})
     if "error" in result:  # a packed day may genuinely have no room for that category
         assert "place_id or category" not in result["error"]
         return
@@ -1153,7 +1199,7 @@ def test_a_removed_stop_can_be_added_back_from_chat(client, planned, db):
     _, _, plan = planned
     chat = _chat_for(db, plan)
     stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
-    chat.call_tool("edit_stop", {"slot_id": stop["slot_id"], "action": "remove"})
+    chat.call_tool("edit_stop", {"stop": stop["name"], "action": "remove"})
     gone = len(chat.call_tool("get_itinerary", {})["days"][0]["stops"])
 
     result = chat.call_tool("add_stop", {"day": 1})
@@ -1168,7 +1214,7 @@ def test_adding_a_stop_reports_what_else_was_available(db, planned):
     _, _, plan = planned
     chat = _chat_for(db, plan)
     stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
-    chat.call_tool("edit_stop", {"slot_id": stop["slot_id"], "action": "remove"})
+    chat.call_tool("edit_stop", {"stop": stop["name"], "action": "remove"})
 
     result = chat.call_tool("add_stop", {"day": 1})
     assert "alternatives" in result
@@ -1190,7 +1236,7 @@ def test_replace_without_a_target_is_an_error_not_a_removal(client, planned, db)
     before = chat.call_tool("get_itinerary", {})
     stop = before["days"][0]["stops"][0]
 
-    result = chat.call_tool("edit_stop", {"slot_id": stop["slot_id"], "action": "replace"})
+    result = chat.call_tool("edit_stop", {"stop": stop["name"], "action": "replace"})
 
     assert "error" in result
     after = chat.call_tool("get_itinerary", {})
@@ -1201,10 +1247,11 @@ def test_the_trace_says_swapping_not_removing(db):
     from app.services.orchestrator import describe_tool_call
 
     label, detail = describe_tool_call(
-        "edit_stop", {"slot_id": 3, "action": "replace", "category": "mall"}
+        "edit_stop", {"stop": "the park", "action": "replace", "category": "mall"}
     )
     assert label == "Swapping a stop"
-    assert detail == "for mall"
+    # The row names the stop now, because the model does — worth showing, it is what changed.
+    assert detail == "the park · for mall"
 
 
 def test_the_prompt_tells_the_model_to_swap_rather_than_remove(db, orchestrator):
@@ -1382,3 +1429,542 @@ def test_an_event_on_no_particular_date_is_left_alone(db, orchestrator, planned)
         {"days": 1, "budget": 4000, "start_date": later, "event_id": cousins.id},
     )
     assert "error" not in result, result
+
+
+# --- guests ---------------------------------------------------------------------------------
+
+
+def test_the_chat_can_plan_for_more_people_than_the_household(client, planned, db):
+    """The reported bug: "we will have 7 people" was acknowledged, then planned for the family.
+
+    `planned` saves a household of two, so five guests make seven — more than one taxi seats.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, 
+            "days": 1,
+            "budget": 7000,
+            "start_date": FUTURE,
+            "guests": [{"role": "adult", "age": 30} for _ in range(5)],
+        },
+    )
+    assert result.get("party_size") == 7, result
+    assert result["vehicle"] == "two vehicles"
+
+
+def test_a_rebuild_does_not_quietly_drop_the_guests(client, planned, db):
+    """Same failure the transport mode had: replan, and the extra five stop being charged for."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    first = chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, "days": 1, "budget": 7000, "start_date": FUTURE,
+         "guests": [{"role": "adult", "age": 30} for _ in range(5)]},
+    )
+    assert first["party_size"] == 7
+
+    again = chat.call_tool(
+        "generate_itinerary", {"replace_existing": True, "days": 1, "budget": 7000, "start_date": FUTURE}
+    )
+    assert again["party_size"] == 7, "the rebuild fell back to the household"
+
+
+def test_a_malformed_guest_is_dropped_rather_than_guessed(db):
+    """The list is written by a model, so it arrives in whatever shape the model felt like."""
+    from app.services.orchestrator import _guests
+
+    people = _guests(
+        {
+            "guests": [
+                {"role": "adult", "age": 30},
+                {"role": "adult", "age": "not a number"},  # unreadable adult → default age
+                {"role": "child", "age": None},  # unreadable child → dropped, never guessed
+                {"role": "friend", "age": 22},  # unknown role → adult
+                {"role": "child", "age": 900},  # impossible → dropped
+                "just a string",
+            ]
+        }
+    )
+    assert [(p.role, p.age) for p in people] == [
+        ("adult", 30),
+        ("adult", 30),
+        ("adult", 22),
+    ]
+
+
+def test_guests_are_capped(db):
+    from app.services.orchestrator import MAX_GUESTS, _guests
+
+    assert len(_guests({"guests": [{"role": "adult", "age": 30}] * 200})) == MAX_GUESTS
+
+
+def test_guests_default_to_empty_when_absent_or_null(db):
+    from app.services.orchestrator import _guests
+
+    assert _guests({}) == []
+    assert _guests({"guests": None}) == []
+
+
+def test_a_stated_total_beats_the_models_arithmetic(client, planned, db):
+    """The reported bug: "7 people" arrived as 6 guests on a household of 3 — a party of 9.
+
+    `planned` saves a household of two, so a stated total of 7 must mean five guests however
+    many the model happened to list.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, "days": 1, "budget": 7000, "start_date": FUTURE, "party_size": 7,
+         "guests": [{"role": "adult", "age": 30} for _ in range(6)]},
+    )
+    assert result["party_size"] == 7, result
+
+
+def test_a_stated_total_keeps_the_ages_the_model_did_give(db):
+    """A guest child's age must survive the reconciliation — it drives their ticket band."""
+    from app.services.orchestrator import _fit_party
+
+    kid = Attendee(role="child", age=6)
+    fitted = _fit_party(2, 5, [kid])
+    assert len(fitted) == 3
+    assert fitted[0] is kid
+    assert [p.role for p in fitted[1:]] == ["adult", "adult"]
+
+
+def test_a_total_no_larger_than_the_household_adds_nobody(db):
+    from app.services.orchestrator import _fit_party
+
+    assert _fit_party(4, 4, []) == []
+    assert _fit_party(4, 2, []) == []
+
+
+# --- a swap that only fits if the day runs late -----------------------------------------------
+
+
+def test_a_tool_error_never_reaches_the_row_verbatim():
+    """Tool errors are addressed to the model; the row is addressed to the user."""
+    from app.services.orchestrator import summarise_tool_result
+
+    assert summarise_tool_result(
+        "edit_stop", {"error": "This plan has no stop like 'the casino'. It has: ..."}
+    ) == "no change made"
+    assert summarise_tool_result("edit_stop", {"error": "Unknown action 'foo'"}) == "no change made"
+    # The one that is a question, not a failure, still reads as one.
+    assert summarise_tool_result(
+        "edit_stop", {"needs_confirmation": "window_overrun", "place": "X", "ends_at": "19:30"}
+    ) == "needs your OK"
+
+
+def test_a_swap_that_only_fits_past_the_window_asks_before_taking_it(client, planned, db,
+                                                                     monkeypatch):
+    """The reported case: the user names a category, and 'nothing fits' was the whole answer."""
+    from app.services import itinerary as itinerary_service
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    before = chat.call_tool("get_itinerary", {})
+    stop = before["days"][0]["stops"][0]
+
+    # Force the shape the bug report describes: nothing fits the slot's own window, but something
+    # does once the day is allowed to run later. Which category the seeded catalog happens to
+    # offer is not what this test is about, so the relaxed search ignores it.
+    def only_when_relaxed(db_, itinerary_, user_, slot_row_, category_, ignore_window=False):
+        if not ignore_window:
+            return None
+        options = itinerary_service.alternatives_for_slot(
+            db_, itinerary_, user_, slot_row_, limit=8, ignore_window=True
+        )
+        return options[0] if options else None
+
+    monkeypatch.setattr(itinerary_service, "_best_alternative", only_when_relaxed)
+
+    asked = chat.call_tool(
+        "edit_stop", {"stop": stop["name"], "action": "replace", "category": "museum"}
+    )
+    assert asked.get("needs_confirmation") == "window_overrun"
+    assert "error" not in asked  # a question, so the row must not render as a failure
+    assert asked["place"] and asked["ends_at"]
+
+    # Nothing may have changed while the question was outstanding.
+    held = chat.call_tool("get_itinerary", {})
+    assert stop["name"] in [s["name"] for d in held["days"] for s in d["stops"]]
+
+    # And the user says yes.
+    agreed = chat.call_tool(
+        "edit_stop",
+        {
+            "stop": stop["name"],
+            "action": "replace",
+            "category": "museum",
+            "allow_overrun": True,
+        },
+    )
+    assert "needs_confirmation" not in agreed
+    if "error" not in agreed:
+        after = chat.call_tool("get_itinerary", {})
+        assert asked["place"] in [s["name"] for d in after["days"] for s in d["stops"]]
+
+
+def test_relaxing_the_window_still_respects_opening_hours(db, planned):
+    """`ignore_window` may make the day late, never the plan wrong."""
+    from app.models import Place
+    from app.services.itinerary import context_for, placement_for
+    from app.services.retrieval import to_candidate
+
+    from app.models import Itinerary, User
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    context = context_for(db, itinerary, db.get(User, itinerary.user_id))
+    candidate = to_candidate(db.query(Place).filter(Place.min_age == 0).first())
+
+    def no_travel(*_):
+        from app.services.planner import TravelInfo
+
+        return TravelInfo(distance_km=0.0, duration_min=0, est_cost=0.0)
+
+    common = dict(
+        travel_fn=no_travel, from_point=(candidate.lat, candidate.lng),
+        following=None, day_month=6,
+    )
+    # Starting one minute before the venue shuts is refused either way.
+    assert placement_for(
+        candidate, context, earliest=candidate.closes_at - 1, latest=24 * 60,
+        ignore_window=True, **common,
+    ) is None
+    # Ending past the nominal day end is refused only while the window is enforced.
+    late = candidate.closes_at - min(candidate.avg_duration_min, context.profile.max_slot_min)
+    assert placement_for(
+        candidate, context, earliest=late, latest=late, ignore_window=False, **common
+    ) is None
+    assert placement_for(
+        candidate, context, earliest=late, latest=late, ignore_window=True, **common
+    ) is not None
+
+
+# --- naming the constraint that actually bit ---------------------------------------------------
+
+
+def test_a_swap_blocked_by_money_says_money_not_time(client, planned, db, monkeypatch):
+    """The reported bug: 'not feasible within budget and time' when AED 1,850 was sitting unspent.
+
+    One `None` stood for five different refusals, and the message guessed at both.
+    """
+    from app.services import itinerary as itinerary_service
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
+
+    def only_without_the_budget_cap(db_, itinerary_, user_, slot_row_, category_,
+                                    ignore_window=False, ignore_budget=False):
+        if not ignore_budget:
+            return None
+        options = itinerary_service.alternatives_for_slot(
+            db_, itinerary_, user_, slot_row_, limit=8, ignore_budget=True
+        )
+        return options[0] if options else None
+
+    monkeypatch.setattr(itinerary_service, "_best_alternative", only_without_the_budget_cap)
+
+    result = chat.call_tool(
+        "edit_stop", {"stop": stop["name"], "action": "replace", "category": "museum"}
+    )
+    assert "Time is not the problem" in result["error"]
+    assert "cheapest museum" in result["error"]
+
+
+def test_a_swap_blocked_by_nothing_relaxable_says_so(client, planned, db, monkeypatch):
+    from app.services import itinerary as itinerary_service
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
+    monkeypatch.setattr(itinerary_service, "_best_alternative", lambda *a, **k: None)
+
+    result = chat.call_tool(
+        "edit_stop", {"stop": stop["name"], "action": "replace", "category": "museum"}
+    )
+    # The old wording blamed the window and the budget every time. Neither applies here.
+    assert "can go in this slot at all" in result["error"]
+    assert "Neither a later finish nor a bigger budget" in result["error"]
+
+
+# --- a rebuild may not quietly replace an approved plan ----------------------------------------
+
+
+def test_generating_again_will_not_silently_discard_the_current_plan(client, planned, db):
+    """The reported bug: 'Add an Adventure' rebuilt the trip, orphaning the approved itinerary.
+
+    A stop the user had swapped out came back and one they never touched disappeared, because a
+    whole new itinerary row was created and the conversation re-pointed at it.
+    """
+    from app.models import Itinerary
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    before = chat.call_tool("get_itinerary", {})
+    count_before = db.query(Itinerary).count()
+
+    result = chat.call_tool(
+        "generate_itinerary", {"days": 1, "budget": 5000, "start_date": "2026-09-01"}
+    )
+
+    assert "replace_existing" in result["error"]
+    assert db.query(Itinerary).count() == count_before, "no orphan row"
+    after = chat.call_tool("get_itinerary", {})
+    assert after["itinerary_id"] == before["itinerary_id"]
+    assert after["days"][0]["stops"] == before["days"][0]["stops"]
+
+
+def test_an_explicit_start_over_still_works(client, planned, db):
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    before = chat.call_tool("get_itinerary", {})
+
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 5000, "start_date": "2026-09-01", "replace_existing": True},
+    )
+
+    assert "error" not in result
+    assert result["itinerary_id"] != before["itinerary_id"]
+
+
+def test_a_fresh_thread_is_not_blocked_by_an_older_plan(client, planned, db):
+    """The guard protects THIS conversation's plan, not the user's right to plan again."""
+    from app.models import Conversation, User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    fresh = Conversation(user_id=row.id)
+    db.add(fresh)
+    db.commit()
+
+    result = ChatOrchestrator(db, row, fresh).call_tool(
+        "generate_itinerary", {"days": 1, "budget": 5000, "start_date": "2026-09-01"}
+    )
+    assert "error" not in result
+    assert result["itinerary_id"] != plan["id"]
+
+
+def test_the_prompt_no_longer_offers_start_over_as_a_way_around_a_failed_edit(db, orchestrator):
+    prompt = orchestrator().system_prompt()
+    assert "agreeing to an EDIT" in prompt
+    assert "replace_existing" in prompt
+
+
+# --- a filler itinerary_id must not hide the plan ----------------------------------------------
+
+
+@pytest.mark.parametrize("junk", [0, 999])
+def test_a_junk_itinerary_id_does_not_report_the_plan_as_missing(client, planned, db, junk):
+    """The reported bug: 'no plan yet' on a thread that plainly had one.
+
+    Strict schemas make itinerary_id a property the model must send on EVERY call, and 0 is what
+    a model reaches for when it has no value. That answer sent it off building a replacement.
+    """
+    from app.services.orchestrator import summarise_tool_result
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    truth = chat.call_tool("get_itinerary", {})
+
+    result = chat.call_tool("get_itinerary", {"itinerary_id": junk})
+
+    assert result["itinerary_id"] == truth["itinerary_id"]
+    assert summarise_tool_result("get_itinerary", result) != "no plan yet"
+    # Editing tools resolve through the same path, and said "nothing to edit" for the same reason.
+    stop = truth["days"][0]["stops"][0]
+    edit = chat.call_tool(
+        "edit_stop", {"itinerary_id": junk, "stop": stop["name"], "action": "remove"}
+    )
+    assert "nothing to edit" not in edit.get("error", "")
+
+
+def test_an_unknown_id_in_the_arguments_is_simply_ignored(client, planned, db):
+    """Nothing supplies one any more, but a stray key must not resurrect the old failure."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    for junk in (0, 999):
+        assert chat.call_tool("get_itinerary", {"itinerary_id": junk})["itinerary_id"] == plan["id"]
+
+
+# --- the model cannot grant itself a rebuild it was just refused -------------------------------
+
+
+def test_replace_existing_is_refused_again_when_it_follows_a_refusal_in_the_same_turn(
+    client, planned, db
+):
+    """The reported bug: the guard was a speed bump.
+
+    Told no, the model set replace_existing itself and rebuilt anyway — inside the same turn, so
+    the user it was told to ask had not said a word in between.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    args = {"days": 1, "budget": 5000, "start_date": FUTURE}
+
+    first = chat.call_tool("generate_itinerary", args)
+    assert "replace_existing" in first["error"]
+
+    second = chat.call_tool("generate_itinerary", {**args, "replace_existing": True})
+    assert "Still no" in second["error"]
+    assert chat.call_tool("get_itinerary", {})["itinerary_id"] == plan["id"], "plan untouched"
+
+    # The user answers, which starts a new turn — and now it goes through.
+    chat.rebuild_refused = False
+    third = chat.call_tool("generate_itinerary", {**args, "replace_existing": True})
+    assert "error" not in third
+    assert third["itinerary_id"] != plan["id"]
+
+
+# --- a turn never ends without a reply ---------------------------------------------------------
+
+
+class _FakeStream:
+    """An OpenAI chat client that emits scripted rounds: a tool call, then prose."""
+
+    def __init__(self, rounds):
+        self.rounds = list(rounds)
+        self.calls: list[dict] = []
+        chat = type("Chat", (), {})()
+        chat.completions = self
+        self.chat = chat
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self.rounds.pop(0) if self.rounds else [])
+
+
+def _chunk(content=None, tool=None):
+    delta = type("Delta", (), {"content": content, "tool_calls": None})()
+    if tool:
+        fn = type("Fn", (), {"name": tool[0], "arguments": tool[1]})()
+        delta.tool_calls = [type("TC", (), {"index": 0, "id": "c1", "function": fn})()]
+    choice = type("Choice", (), {"delta": delta})()
+    return type("Chunk", (), {"choices": [choice]})()
+
+
+def test_a_turn_that_spends_every_round_on_tools_still_answers(client, planned, db, monkeypatch):
+    """The reported bug: three assistant messages saved as an empty string.
+
+    The tool rows scrolled past and nothing explained them — the loop hit MAX_TOOL_ROUNDS while
+    the model was still calling tools, so `answer` was never assigned.
+    """
+    from app.services import orchestrator as orch
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+
+    tool_round = [_chunk(tool=("get_itinerary", '{"itinerary_id": null}'))]
+    fake = _FakeStream([list(tool_round) for _ in range(orch.MAX_TOOL_ROUNDS)]
+                       + [[_chunk(content="Here is where things stand.")]])
+    monkeypatch.setattr(orch, "wrap_openai", lambda c: c)
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai", type("M", (), {"OpenAI": lambda **_: fake})
+    )
+
+    frames = "".join(chat.stream("what does the plan look like?"))
+
+    assert "Here is where things stand." in frames
+    saved = [m for m in _messages(db, chat) if m.role == "assistant"][-1]
+    assert saved.content, "an empty bubble is what the user actually saw"
+    # The rescue round must not hand the tools back, or it can loop forever.
+    assert "tools" not in fake.calls[-1]
+
+
+def _messages(db, chat):
+    from app.models import Message
+
+    return db.query(Message).filter(Message.conversation_id == chat.conversation.id).all()
+
+
+# --- naming a stop instead of numbering it -----------------------------------------------------
+
+
+def test_the_words_the_user_actually_used_find_the_stop(client, planned, db):
+    """'Replace shopping' has to reach a stop whose category is `mall`.
+
+    The transcripts say "shopping", "dining", "the park at the end". None of those is a slot id,
+    and every one of them is unambiguous against a plan the server is already holding.
+    """
+    from app.models import Itinerary
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    stops = {s["place"]["category"]: s["place"]["name"] for d in plan["days"] for s in d["slots"]}
+
+    for phrase, category in (("shopping", "mall"), ("the shopping stop", "mall")):
+        if category not in stops:
+            continue
+        assert find_stop(db, itinerary, phrase).place.name == stops[category]
+
+    # A name always wins, however it is cased or padded.
+    any_name = next(iter(stops.values()))
+    assert find_stop(db, itinerary, f"  {any_name.upper()} ").place.name == any_name
+
+
+def test_a_stop_that_is_not_there_is_told_what_is(client, planned, db):
+    """The old answer was "call get_itinerary for current slot_ids" — a round trip for data the
+    server already had in its hand."""
+    from app.models import Itinerary
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+
+    with pytest.raises(ValueError) as caught:
+        find_stop(db, itinerary, "the casino")
+
+    message = str(caught.value)
+    assert "no stop like 'the casino'" in message
+    for slot in plan["days"][0]["slots"]:
+        assert slot["place"]["name"] in message, "the reply can name what IS there"
+
+
+def test_an_ambiguous_description_asks_rather_than_guesses(client, planned, db):
+    from app.models import Itinerary
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    categories = [s["place"]["category"] for d in plan["days"] for s in d["slots"]]
+    doubled = next((c for c in categories if categories.count(c) > 1), None)
+    if doubled is None:
+        pytest.skip("this generated plan has no repeated category")
+
+    with pytest.raises(ValueError, match="more than one stop"):
+        find_stop(db, itinerary, doubled.replace("_", " "))
+
+
+def test_an_empty_description_is_an_omission_not_a_match(client, planned, db):
+    """Every stop contains the empty string, so this read as ambiguity instead of a mistake."""
+    from app.models import Itinerary
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    with pytest.raises(ValueError, match="Say which stop"):
+        find_stop(db, db.get(Itinerary, plan["id"]), "   ")
+
+
+def test_no_chat_tool_asks_the_model_for_a_database_id():
+    """What the conversation knows, the conversation supplies. What it cannot know is `event_id`.
+
+    An id is a value the model can only have by looking it up, so every one of them is a round
+    trip it can skip and a number it can invent. `event_id` survives because which event the user
+    means is their intent, not plumbing — and the system prompt lists the ids outright.
+    """
+    supplied = {
+        tool["function"]["name"]: sorted(
+            k for k in tool["function"]["parameters"].get("properties", {}) if k.endswith("_id")
+        )
+        for tool in TOOLS
+    }
+    assert {name: ids for name, ids in supplied.items() if ids} == {
+        "generate_itinerary": ["event_id"]
+    }

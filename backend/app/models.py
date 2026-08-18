@@ -186,6 +186,9 @@ class Itinerary(Base):
     start_lng: Mapped[float] = mapped_column(Float, default=55.2708)
     # "taxi" or "own_car" — per itinerary, because a family with a car may still fly to a trip.
     transport_mode: Mapped[str] = mapped_column(String(16), default="taxi", nullable=False)
+    # Emirates this trip is confined to, or NULL for "anywhere". Stored rather than applied once,
+    # so a stop added later cannot quietly reintroduce the region the user ruled out.
+    emirates_json: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -196,6 +199,32 @@ class Itinerary(Base):
     travel_segments: Mapped[list["TravelSegment"]] = relationship(
         back_populates="itinerary", cascade="all, delete-orphan"
     )
+    guests: Mapped[list["Guest"]] = relationship(
+        back_populates="itinerary", cascade="all, delete-orphan"
+    )
+
+
+class Guest(Base):
+    """Someone on this trip who is not in the household.
+
+    Deliberately per-itinerary and not a FamilyMember: seven people at a graduation are not
+    seven people every weekend, and writing them to the family would re-price every later plan.
+    Ages are kept rather than a bare headcount because the party drives both ticket bands and
+    the min_age check, and a guest child fails both differently from a guest adult.
+    """
+
+    __tablename__ = "guests"
+    __table_args__ = (CheckConstraint("role IN ('adult','child')", name="ck_guest_role"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    itinerary_id: Mapped[int] = mapped_column(
+        ForeignKey("itineraries.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    age: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str | None] = mapped_column(String(120))
+
+    itinerary: Mapped[Itinerary] = relationship(back_populates="guests")
 
 
 class Slot(Base):

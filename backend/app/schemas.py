@@ -159,6 +159,19 @@ class PlaceOut(ORMModel):
 # --- itineraries -----------------------------------------------------------------------------
 
 
+Emirate = Literal[
+    "Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"
+]
+
+
+class GuestIn(BaseModel):
+    """A trip-only companion. Ages are required — they set the ticket band and the min_age check."""
+
+    role: Literal["adult", "child"]
+    age: int = Field(ge=0, le=120)
+    name: str | None = Field(default=None, max_length=120)
+
+
 class GenerateRequest(BaseModel):
     """The intake checklist. Every field here is required before generation (spec §1.2)."""
 
@@ -171,6 +184,11 @@ class GenerateRequest(BaseModel):
     currency: str = Field(default="AED", max_length=8)
     title: str | None = Field(default=None, max_length=200)
     prayer_breaks: bool = False
+    # People on this trip who are not in the saved household. Capped so one bad tool call cannot
+    # ask the planner to seat a coach party.
+    guests: list[GuestIn] = Field(default_factory=list, max_length=30)
+    # Emirates to confine the trip to. Empty means anywhere — the catalog spans all seven.
+    emirates: list[Emirate] = Field(default_factory=list, max_length=7)
 
     @field_validator("start_date")
     @classmethod
@@ -286,8 +304,10 @@ class ItineraryOut(BaseModel):
     currency: str
     status: str
     transport_mode: Literal["taxi", "own_car"] = "taxi"
-    # What this party has to travel in — derived from the family size, not stored.
+    # What this party has to travel in — derived from household + guests, not stored.
     vehicle: str = "standard"
+    # Everyone this plan is priced for, so the UI can show "7 people" rather than imply the family.
+    party_size: int = 0
     days: list[DayOut]
     budget: BudgetOut
     suggestions: list[Suggestion]

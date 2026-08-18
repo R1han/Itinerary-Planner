@@ -10,13 +10,24 @@ Nothing here decides scheduling — that lives in planner.py and validator.py.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import Event, FamilyMember, Itinerary, Place, Preference, Slot, TravelSegment, User
+from ..models import (
+    Event,
+    FamilyMember,
+    Guest,
+    Itinerary,
+    Place,
+    Preference,
+    Slot,
+    TravelSegment,
+    User,
+)
 from .budget import (
     Attendee,
     CostBreakdown,
@@ -75,6 +86,9 @@ class PlanContext:
     profile: PartyProfile
     preferences: list[PreferenceSignal]
     origin: tuple[float, float]
+    # None means "anywhere". Lives here rather than being passed around because every retrieval
+    # in a plan's lifetime — generation, gap-filling, alternatives — must apply the same one.
+    emirates: tuple[str, ...] | None = None
 
 
 # --- gathering ---------------------------------------------------------------------------------
@@ -85,6 +99,24 @@ def family_attendees(db: Session, user_id: int) -> list[Attendee]:
         select(FamilyMember).where(FamilyMember.user_id == user_id).order_by(FamilyMember.id)
     )
     return [Attendee(role=m.role, age=m.age, name=m.name) for m in members]
+
+
+def guest_attendees(db: Session, itinerary_id: int) -> list[Attendee]:
+    """The non-household people on one trip. Empty for the ordinary family outing."""
+    rows = db.scalars(
+        select(Guest).where(Guest.itinerary_id == itinerary_id).order_by(Guest.id)
+    )
+    return [Attendee(role=g.role, age=g.age, name=g.name) for g in rows]
+
+
+def trip_party(db: Session, itinerary: Itinerary) -> list[Attendee]:
+    """Everyone this itinerary is priced for: the household plus its guests.
+
+    The single source of truth for party size. Every consumer — the vehicle tier, taxi fares,
+    per-head admission — must go through here, or a plan ends up costed for the wrong number of
+    people while still looking plausible.
+    """
+    return family_attendees(db, itinerary.user_id) + guest_attendees(db, itinerary.id)
 
 
 def preference_signals(db: Session, user_id: int) -> list[PreferenceSignal]:
@@ -112,8 +144,11 @@ def missing_intake_fields(db: Session, user: User) -> list[str]:
 def build_context(
     db: Session, user: User, event: Event | None, *, start_lat: float, start_lng: float,
     adults_only: bool = False, focus: str = FULL_DAY,
+    guests: Sequence[Attendee] = (),
+    emirates: Sequence[str] | None = None,
 ) -> PlanContext:
-    attendees = family_attendees(db, user.id)
+    # Guests join before the adults_only filter, so "just the grown-ups" drops a guest child too.
+    attendees = family_attendees(db, user.id) + list(guests)
     if adults_only:
         # An anniversary "just the two of us" is still recorded against a household with kids in
         # it. Leaving them in the party means `romantic` never fires, and the whole evening gets
@@ -130,6 +165,7 @@ def build_context(
         profile=profile,
         preferences=preference_signals(db, user.id),
         origin=(start_lat, start_lng),
+        emirates=tuple(emirates) if emirates else None,
     )
 
 
@@ -153,6 +189,8 @@ def generate(
     transport_mode: str = TAXI,
     adults_only: bool = False,
     focus: str = FULL_DAY,
+    guests: Sequence[Attendee] = (),
+    emirates: Sequence[str] | None = None,
 ) -> Itinerary:
     """Plan a trip and persist it. Raises IntakeIncomplete before doing any work."""
     missing = missing_intake_fields(db, user)
@@ -173,13 +211,14 @@ def generate(
 
     context = build_context(
         db, user, event, start_lat=start_lat, start_lng=start_lng,
-        adults_only=adults_only, focus=focus,
+        adults_only=adults_only, focus=focus, guests=guests, emirates=emirates,
     )
     candidates = retrieve_candidates(
         db,
         context.profile,
         query_for(context.profile, event.title if event else "", event.notes if event else ""),
         origin=context.origin,
+        emirates=context.emirates,
     )
 
     travel_service = TravelService(
@@ -220,9 +259,19 @@ def generate(
         start_lat=start_lat,
         start_lng=start_lng,
         transport_mode=transport_mode,
+        emirates_json=list(context.emirates) if context.emirates else None,
     )
     db.add(itinerary)
     db.flush()
+
+    # Stored so that everything reached later — a transport switch, a cheaper day, the payload's
+    # vehicle tier — re-prices for the same party this plan was solved for.
+    for guest in guests:
+        db.add(
+            Guest(
+                itinerary_id=itinerary.id, role=guest.role, age=guest.age, name=guest.name
+            )
+        )
 
     for day in plan.days:
         for slot in day.slots:
@@ -447,7 +496,9 @@ def context_for(db: Session, itinerary: Itinerary, user: User) -> PlanContext:
     if event is not None and event.user_id != user.id:  # defence in depth
         event = None
     return build_context(
-        db, user, event, start_lat=itinerary.start_lat, start_lng=itinerary.start_lng
+        db, user, event, start_lat=itinerary.start_lat, start_lng=itinerary.start_lng,
+        guests=guest_attendees(db, itinerary.id),
+        emirates=itinerary.emirates_json,
     )
 
 
@@ -462,14 +513,14 @@ def _travel_service(db: Session, itinerary: Itinerary, context: PlanContext) -> 
 
 
 @traced("itinerary.recost_travel", run_type="chain")
-def recost_travel(db: Session, itinerary: Itinerary, user: User) -> None:
+def recost_travel(db: Session, itinerary: Itinerary) -> None:
     """Re-price the stored legs after the transport mode changed.
 
     Deliberately not a re-plan: the route, the times and the places are all still right, and
     re-solving them would move the trip when the user only said how they intend to get around.
     Only `est_cost` changes, recomputed from the distance already on the row.
     """
-    party = len(family_attendees(db, user.id)) or 1
+    party = len(trip_party(db, itinerary)) or 1
     segments = db.scalars(
         select(TravelSegment).where(TravelSegment.itinerary_id == itinerary.id)
     ).all()
@@ -567,6 +618,7 @@ def itinerary_payload(db: Session, itinerary: Itinerary) -> dict:
     total = round(sum(per_day_totals), 2)
     event = db.get(Event, itinerary.event_id) if itinerary.event_id else None
 
+    party = trip_party(db, itinerary)
     return {
         "id": itinerary.id,
         "title": itinerary.title,
@@ -577,7 +629,9 @@ def itinerary_payload(db: Session, itinerary: Itinerary) -> dict:
         "currency": itinerary.currency,
         "status": itinerary.status,
         "transport_mode": itinerary.transport_mode,
-        "vehicle": vehicle_for(len(family_attendees(db, itinerary.user_id)) or 1)[0],
+        "vehicle": vehicle_for(len(party) or 1)[0],
+        "emirates": itinerary.emirates_json,
+        "party_size": len(party),
         "days": days,
         "budget": {
             "total": total,
@@ -645,9 +699,68 @@ def _candidates_for_gap(
     exclude_place_ids: set[int],
 ) -> list[PlaceCandidate]:
     candidates = retrieve_candidates(
-        db, context.profile, query_for(context.profile), origin=context.origin
+        db, context.profile, query_for(context.profile), origin=context.origin,
+        emirates=context.emirates,
     )
     return [c for c in candidates if c.id not in exclude_place_ids]
+
+
+# The words people use for a category where they differ from the category itself. Not a synonym
+# engine — just the handful the transcripts actually produced. "shopping" for a `mall` is the one
+# that went wrong three times running.
+_CATEGORY_WORDS = {"shopping": "mall", "restaurant": "dining", "food": "dining", "leisure": "park"}
+
+
+def find_stop(db: Session, itinerary: Itinerary, description: str) -> Slot:
+    """Which stop the user meant, from the words they used for it.
+
+    The chat has no slot ids to offer — they exist only in the database, so a model that has not
+    just read the plan can only invent one, and did. It has the user's own phrasing instead
+    ("the shopping stop", "Shakespeare and Co", "the park at the end"), which is the thing the
+    server can actually resolve, because the conversation already says which plan is meant.
+
+    Raises with the plan's real contents listed, so a miss is answerable without another lookup.
+    """
+    slots = (
+        db.query(Slot)
+        .filter(Slot.itinerary_id == itinerary.id)
+        .order_by(Slot.day_index, Slot.position)
+        .all()
+    )
+    if not slots:
+        raise ValueError("This plan has no stops in it yet.")
+
+    text = " ".join(description.lower().split())
+    if not text:
+        # Empty matched every stop through the substring test below, which reads as ambiguity
+        # when it is really an omission.
+        raise ValueError("Say which stop to change — its name, or what kind of place it is.")
+    for word, category in _CATEGORY_WORDS.items():
+        text = text.replace(word, category)
+
+    def listing() -> str:
+        return "; ".join(
+            f"{slot.place.name} ({slot.place.category.replace('_', ' ')}, day {slot.day_index + 1})"
+            for slot in slots
+        )
+
+    # A name beats a category: "Shakespeare and Co" is a specific ask, "dining" is a description
+    # of two of them, and someone who names a place has told you which one they mean.
+    for match in (
+        [s for s in slots if text and (text in s.place.name.lower() or s.place.name.lower() in text)],
+        [s for s in slots
+         if (label := s.place.category.replace("_", " ")) in text or text in label],
+    ):
+        if len(match) == 1:
+            return match[0]
+        if match:
+            raise ValueError(
+                f"{description!r} matches more than one stop — "
+                + "; ".join(f"{s.place.name} on day {s.day_index + 1}" for s in match)
+                + ". Say which one."
+            )
+
+    raise ValueError(f"This plan has no stop like {description!r}. It has: {listing()}.")
 
 
 def gap_window(day: DayPlan, position: int) -> tuple[int, int]:
@@ -680,12 +793,19 @@ def placement_for(
     from_point: tuple[float, float],
     following: PlannedSlot | None,
     day_month: int,
+    ignore_window: bool = False,
 ) -> Placement | None:
     """Fit one candidate into one gap, or None if it cannot go there.
 
     Shared by "what else could this slot be" and "put something new in this day" — the two only
     differ in what they do with the answer, and having one implementation of *fits* means a rule
     added here (the hop cap, an age gate) can never apply to one and not the other.
+
+    `ignore_window` drops only the day's own boundaries — the gap between the neighbours and
+    `day_end`. It is safe because `validate_plan` never checks `day_end`: a long stop pushes the
+    rest of the day later via `reflow_day` instead of being rejected. Everything that would make
+    the plan *wrong* rather than *late* — opening hours, the age gate, the hop cap, and the
+    budget the caller applies — still holds.
     """
     if not all(person.age >= candidate.min_age for person in context.profile.attendees):
         return None
@@ -698,25 +818,38 @@ def placement_for(
     start = max(earliest + inbound.duration_min, candidate.opens_at)
     end = start + min(candidate.avg_duration_min, context.profile.max_slot_min)
 
-    if end > candidate.closes_at or end > context.profile.day_end:
+    if end > candidate.closes_at:
         return None
-    if following is not None:
-        outbound = travel_fn(
-            candidate.lat, candidate.lng, following.place.lat, following.place.lng
-        )
-        if end + outbound.duration_min > following.start_min:
+    if not ignore_window:
+        if end > context.profile.day_end:
             return None
-    elif end > latest:
-        return None
+        if following is not None:
+            outbound = travel_fn(
+                candidate.lat, candidate.lng, following.place.lat, following.place.lng
+            )
+            if end + outbound.duration_min > following.start_min:
+                return None
+        elif end > latest:
+            return None
 
     return Placement(start_min=start, end_min=end, inbound=inbound)
 
 
 @traced("itinerary.alternatives", run_type="chain")
 def alternatives_for_slot(
-    db: Session, itinerary: Itinerary, user: User, slot_row: Slot, limit: int = ALTERNATIVES_COUNT
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    slot_row: Slot,
+    limit: int = ALTERNATIVES_COUNT,
+    ignore_window: bool = False,
+    ignore_budget: bool = False,
 ) -> list[dict]:
-    """Three options that fit the exact window and the remaining budget (spec §6)."""
+    """Three options that fit the exact window and the remaining budget (spec §6).
+
+    The two `ignore_*` flags exist for diagnosis, not for planning: relaxing one at a time is how
+    a caller finds out *which* constraint emptied the list, instead of guessing at the answer.
+    """
     context = context_for(db, itinerary, user)
     plan = load_plan(db, itinerary)
     day = plan.days[slot_row.day_index]
@@ -749,14 +882,14 @@ def alternatives_for_slot(
         fit = placement_for(
             candidate, context, travel_fn,
             earliest=earliest, latest=latest, from_point=origin, following=following,
-            day_month=day.day_date.month,
+            day_month=day.day_date.month, ignore_window=ignore_window,
         )
         if fit is None:
             continue
         start, end = fit.start_min, fit.end_min
 
         cost = slot_cost_breakdown(candidate, context.profile.attendees, fit.inbound.est_cost)
-        if cost.total > spare:
+        if cost.total > spare and not ignore_budget:
             continue
 
         options.append(
@@ -776,9 +909,34 @@ def alternatives_for_slot(
     return options
 
 
-def _best_alternative_id(
-    db: Session, itinerary: Itinerary, user: User, slot_row: Slot, category: str
-) -> int | None:
+class WindowOverrunRequired(ValueError):
+    """Nothing of this kind fits the slot, but something does if the day is allowed to run late.
+
+    A ValueError so every `except ValueError` already wrapped around `patch_slot` still catches
+    it; the subclass exists so a caller that can ask the user gets the choice — "the only kayak
+    tour ends at 18:30, an hour past this slot, shall I take it?" — instead of a flat refusal.
+    """
+
+    def __init__(self, category: str, place_name: str, ends_at: str) -> None:
+        super().__init__(
+            f"{place_name} is the only {category} available here, but it runs to {ends_at}, "
+            f"past this slot's window. Ask the user whether the day may run later, then retry "
+            f"with allow_overrun=true."
+        )
+        self.category = category
+        self.place_name = place_name
+        self.ends_at = ends_at
+
+
+def _best_alternative(
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    slot_row: Slot,
+    category: str,
+    ignore_window: bool = False,
+    ignore_budget: bool = False,
+) -> dict | None:
     """The highest-scoring swap of a given kind that fits this slot's window and budget.
 
     Lets a request stay in the user's own words — "replace the park with shopping" — instead of
@@ -786,10 +944,14 @@ def _best_alternative_id(
     """
     options = [
         option
-        for option in alternatives_for_slot(db, itinerary, user, slot_row, limit=ALTERNATIVES_COUNT * 4)
+        for option in alternatives_for_slot(
+            db, itinerary, user, slot_row,
+            limit=ALTERNATIVES_COUNT * 4,
+            ignore_window=ignore_window, ignore_budget=ignore_budget,
+        )
         if option["place"].category == category
     ]
-    return options[0]["place"].id if options else None
+    return options[0] if options else None
 
 
 @traced("itinerary.patch_slot", run_type="chain")
@@ -803,6 +965,7 @@ def patch_slot(
     place_id: int | None = None,
     start_time: str | None = None,
     category: str | None = None,
+    allow_overrun: bool = False,
 ) -> tuple[Plan, PlanContext, int]:
     """Replace / adjust / remove one slot, re-solving only that gap.
 
@@ -841,13 +1004,44 @@ def patch_slot(
         if place_id is None:
             if not category:
                 raise ValueError("replace requires place_id or category")
-            place_id = _best_alternative_id(db, itinerary, user, slot_row, category)
-            # Distinct from the message above on purpose: "you did not say what to put here" and
-            # "nothing of that kind fits here" need different answers from the caller.
-            if place_id is None:
-                raise ValueError(
-                    f"No {category.replace('_', ' ')} fits that slot's window and budget."
+            label = category.replace("_", " ")
+            chosen = _best_alternative(db, itinerary, user, slot_row, category)
+            if chosen is None:
+                # "Nothing fits" is five different answers wearing one coat — the window, the
+                # budget, the age gate, the distance cap, or a catalog with none of that kind.
+                # Naming the wrong one sends the user off adjusting something that was never the
+                # problem, so relax one constraint at a time and let whichever unblocks the
+                # search name itself. Distinct from the message above on purpose: "you did not
+                # say what to put here" needs a different answer again.
+                by_window = _best_alternative(
+                    db, itinerary, user, slot_row, category, ignore_window=True
                 )
+                if by_window is None:
+                    by_budget = _best_alternative(
+                        db, itinerary, user, slot_row, category, ignore_budget=True
+                    )
+                    if by_budget is not None:
+                        # Same arithmetic as `alternatives_for_slot`: what is left over once this
+                        # slot's own cost is handed back.
+                        spare = plan.total_budget - plan.total_cost + target.cost.total
+                        raise ValueError(
+                            f"The cheapest {label} that fits this slot is "
+                            f"{by_budget['place'].name} at "
+                            f"{by_budget['cost_breakdown']['total']:.0f} "
+                            f"{itinerary.currency}, and only {spare:.0f} {itinerary.currency} of "
+                            f"the budget is unspent. Time is not the problem here."
+                        )
+                    raise ValueError(
+                        f"No {label} can go in this slot at all — nothing of that kind in range "
+                        f"is open then, suitable for the party, and within budget. Neither a "
+                        f"later finish nor a bigger budget would change it."
+                    )
+                if not allow_overrun:
+                    raise WindowOverrunRequired(
+                        label, by_window["place"].name, by_window["end_time"]
+                    )
+                chosen = by_window
+            place_id = chosen["place"].id
         place_row = db.get(Place, place_id)
         if place_row is None:
             raise ValueError("Unknown place")
@@ -874,6 +1068,16 @@ def patch_slot(
     # neighbours rather than overlapping them.
     reflow_day(day, context.profile, travel_fn, context.origin)
     plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+
+    # `repair_plan` resolves a violation by dropping a slot, and the edited one is the only
+    # unlocked candidate — so a replacement that breaks the day gets deleted instead of applied.
+    # Nothing is persisted yet, so raising here leaves the plan exactly as the user last saw it.
+    if action == "replace" and not any(
+        slot.place.id == place_id for d in plan.days for slot in d.slots
+    ):
+        raise ValueError(
+            f"{db.get(Place, place_id).name} could not be fitted here without breaking the day."
+        )
 
     for other_day in plan.days:
         for slot in other_day.slots:

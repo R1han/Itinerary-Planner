@@ -24,6 +24,7 @@ from ..schemas import (
     TransportPatch,
 )
 from ..services import itinerary as service
+from ..services.budget import Attendee
 
 router = APIRouter(prefix="/itineraries", tags=["itineraries"])
 
@@ -54,6 +55,10 @@ def generate_itinerary(
             title=payload.title,
             currency=payload.currency,
             prayer_breaks=payload.prayer_breaks,
+            guests=[
+                Attendee(role=g.role, age=g.age, name=g.name) for g in payload.guests
+            ],
+            emirates=payload.emirates or None,
         )
     except service.IntakeIncomplete as exc:
         # 422 with the exact list, so the chat can render its numbered intake checklist.
@@ -160,7 +165,7 @@ def set_transport(
     """Switch between taxi fares and driving yourself, and re-price the plan on the spot."""
     itinerary = get_itinerary_or_404(db, itinerary_id, current.id)
     itinerary.transport_mode = payload.mode
-    service.recost_travel(db, itinerary, current)
+    service.recost_travel(db, itinerary)
     return service.itinerary_payload(db, itinerary)
 
 
