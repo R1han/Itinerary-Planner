@@ -55,6 +55,7 @@ def create_all() -> None:
 _ADDED_COLUMNS = (
     ("itineraries", "transport_mode", "VARCHAR(16) NOT NULL DEFAULT 'taxi'"),
     ("itineraries", "emirates_json", "JSON"),
+    ("conversations", "rebuild_warned", "BOOLEAN NOT NULL DEFAULT 0"),
 )
 
 

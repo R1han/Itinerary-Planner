@@ -296,6 +296,10 @@ class Conversation(Base):
     )
     event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(String(200), default="New plan")
+    # Whether this thread has already been told that rebuilding discards the current plan. Kept
+    # on the row rather than in the request because consent arrives a TURN later than the
+    # warning: the model asks, the user answers, and only that answer is permission.
+    rebuild_warned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     # Deliberately no onupdate: this tracks the last MESSAGE, not the last row touch. With
     # onupdate, marking a thread seen would bump it too and it would read as unread again.
