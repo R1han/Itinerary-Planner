@@ -78,17 +78,3 @@ def wrap_openai(client: Any) -> Any:
     except Exception:  # noqa: BLE001 — tracing must never break a user-facing call
         log.exception("could not wrap the OpenAI client for tracing")
         return client
-
-
-def trace_metadata(**fields: Any) -> None:
-    """Attach metadata to the currently active span, if there is one."""
-    if not tracing_enabled():
-        return
-    try:
-        from langsmith.run_helpers import get_current_run_tree
-
-        run = get_current_run_tree()
-        if run is not None:
-            run.extra.setdefault("metadata", {}).update(fields)
-    except Exception:  # noqa: BLE001
-        log.debug("could not attach trace metadata", exc_info=True)

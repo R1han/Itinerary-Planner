@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from ..auth import create_access_token, get_current_user, hash_password, verify_password
 from ..db import get_db
 from ..models import User
-from ..schemas import LoginRequest, RegisterRequest, TokenResponse, UserOut, UserUpdate
+from ..schemas import LoginRequest, RegisterRequest, TokenResponse, UserOut
 
 router = APIRouter(tags=["auth"])
 
@@ -37,18 +37,4 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
 
 @router.get("/me", response_model=UserOut)
 def me(current: User = Depends(get_current_user)) -> User:
-    return current
-
-
-@router.patch("/me", response_model=UserOut)
-def update_me(
-    payload: UserUpdate,
-    current: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> User:
-    for key, value in payload.model_dump(exclude_unset=True).items():
-        if value is not None:
-            setattr(current, key, value)
-    db.commit()
-    db.refresh(current)
     return current

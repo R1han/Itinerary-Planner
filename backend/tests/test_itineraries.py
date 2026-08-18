@@ -164,6 +164,17 @@ def test_the_response_carries_everything_the_workspace_renders(client, mixed_fam
     assert day["driving_total_min"] > 0
     assert set(plan["budget"]["categories"]) == {"activities", "food", "travel"}
 
+    # The budget block must add up three ways, or the BudgetPanel's bar, legend and per-day
+    # mini-bars disagree with each other on screen.
+    budget = plan["budget"]
+    categories = budget["categories"]
+    assert budget["total"] == pytest.approx(
+        categories["activities"] + categories["food"] + categories["travel"], abs=0.05
+    )
+    assert sum(budget["per_day"]) == pytest.approx(budget["total"], abs=0.05)
+    assert budget["remaining"] == pytest.approx(budget["cap"] - budget["total"], abs=0.01)
+    assert len(budget["per_day"]) == plan["num_days"]
+
     slot = day["slots"][0]
     assert {"id", "start_time", "end_time", "cost_breakdown", "place"} <= set(slot)
     assert "image_url" in slot["place"]

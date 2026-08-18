@@ -127,18 +127,6 @@ a:hover {
   border-radius: 6px;
 }
 
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
 /* ============================================================ shell */
 
 .shell {
@@ -1440,11 +1428,6 @@ a:hover {
 
 .btn--ghost {
   border: 1px solid var(--ink-16);
-}
-
-.btn--danger {
-  background: var(--coral-tint-2);
-  color: var(--coral-dark);
 }
 
 .pref-toast {

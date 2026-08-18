@@ -6,7 +6,7 @@ and never patches a day locally (spec §6.5, §6 single-slot edit).
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
@@ -73,22 +73,6 @@ def get_itinerary(
 ) -> dict:
     itinerary = get_itinerary_or_404(db, itinerary_id, current.id)
     return service.itinerary_payload(db, itinerary)
-
-
-@router.delete(
-    "/{itinerary_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    response_class=Response,
-    response_model=None,
-)
-def delete_itinerary(
-    itinerary_id: int,
-    current: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> None:
-    itinerary = get_itinerary_or_404(db, itinerary_id, current.id)
-    db.delete(itinerary)
-    db.commit()
 
 
 @router.get("/{itinerary_id}/slots/{slot_id}/alternatives", response_model=list[AlternativeOut])

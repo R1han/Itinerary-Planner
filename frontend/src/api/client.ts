@@ -99,16 +99,11 @@ export const api = {
   login: (email: string, password: string) =>
     post<{ access_token: string; user: User }>('/auth/login', { email, password }),
   me: () => request<User>('/me'),
-  updateMe: (body: Partial<User>) => patch<User>('/me', body),
 
   // --- events
   events: () => request<CalendarEvent[]>('/events'),
-  upcomingEvents: (horizonDays = 120) =>
-    request<CalendarEvent[]>(`/events/upcoming?horizon_days=${horizonDays}`),
   createEvent: (body: { title: string; event_type: EventType; date: string; notes?: string }) =>
     post<CalendarEvent>('/events', body),
-  updateEvent: (id: number, body: Partial<CalendarEvent>) =>
-    patch<CalendarEvent>(`/events/${id}`, body),
   deleteEvent: (id: number) => request<void>(`/events/${id}`, { method: 'DELETE' }),
 
   // --- family + preferences
@@ -128,17 +123,6 @@ export const api = {
   // --- itineraries
   itineraries: () => request<ItinerarySummary[]>('/itineraries'),
   itinerary: (id: number) => request<Itinerary>(`/itineraries/${id}`),
-  generate: (body: {
-    event_id?: number | null
-    start_date: string
-    num_days: number
-    total_budget: number
-    start_lat: number
-    start_lng: number
-    title?: string
-    prayer_breaks?: boolean
-  }) => post<Itinerary>('/itineraries/generate', body),
-  deleteItinerary: (id: number) => request<void>(`/itineraries/${id}`, { method: 'DELETE' }),
 
   alternatives: (itineraryId: number, slotId: number) =>
     request<Alternative[]>(`/itineraries/${itineraryId}/slots/${slotId}/alternatives`),
@@ -156,13 +140,8 @@ export const api = {
   conversations: () => request<Conversation[]>('/conversations'),
   createConversation: (title = 'New plan', eventId?: number | null) =>
     post<Conversation>('/conversations', { title, event_id: eventId ?? null }),
-  updateConversation: (
-    id: number,
-    body: { title?: string; itinerary_id?: number | null; event_id?: number | null },
-  ) => patch<Conversation>(`/conversations/${id}`, body),
   messages: (id: number) => request<ChatMessage[]>(`/conversations/${id}/messages`),
   markSeen: (id: number) => post<Conversation>(`/conversations/${id}/seen`),
-  deleteConversation: (id: number) => request<void>(`/conversations/${id}`, { method: 'DELETE' }),
 }
 
 /**

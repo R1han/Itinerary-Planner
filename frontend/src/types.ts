@@ -218,11 +218,6 @@ export interface ToolActivity {
   failed: boolean
 }
 
-export interface IntakeError {
-  error: 'intake_incomplete'
-  missing_fields: string[]
-}
-
 export interface HealthStatus {
   status: string
   openai: boolean

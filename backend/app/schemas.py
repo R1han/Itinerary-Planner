@@ -59,22 +59,6 @@ class UserOut(ORMModel):
     default_budget: float
 
 
-class UserUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=120)
-    home_base_lat: float | None = None
-    home_base_lng: float | None = None
-    default_currency: str | None = Field(default=None, max_length=8)
-    default_budget: float | None = Field(default=None, ge=0)
-
-    @model_validator(mode="after")
-    def _coords(self) -> Self:
-        if self.home_base_lat is not None and self.home_base_lng is not None:
-            validate_uae_coords(self.home_base_lat, self.home_base_lng)
-        elif (self.home_base_lat is None) != (self.home_base_lng is None):
-            raise ValueError("home_base_lat and home_base_lng must be set together")
-        return self
-
-
 # --- family / preferences --------------------------------------------------------------------
 
 
@@ -135,14 +119,6 @@ class EventIn(BaseModel):
         if v < dt.date.today():
             raise ValueError("Event date cannot be in the past")
         return v
-
-
-class EventUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=200)
-    event_type: EventType | None = None
-    date: dt.date | None = None
-    notes: str | None = Field(default=None, max_length=2000)
-    planned: bool | None = None
 
 
 class EventOut(ORMModel):
@@ -368,12 +344,6 @@ class ConversationOut(ORMModel):
 
 class ConversationCreate(BaseModel):
     title: str = Field(default="New plan", max_length=200)
-    event_id: int | None = None
-
-
-class ConversationUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=200)
-    itinerary_id: int | None = None
     event_id: int | None = None
 
 

@@ -17,13 +17,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import Event, FamilyMember, Itinerary, Place, Preference, Slot, TravelSegment, User
-from ..repo import get_itinerary_or_404
 from .budget import (
     Attendee,
     CostBreakdown,
     category_bucket,
     slot_cost_breakdown,
-    summarise,
 )
 from .planner import (
     DayPlan,
@@ -35,7 +33,6 @@ from .planner import (
     PreferenceSignal,
     TravelInfo,
     build_profile,
-    day_theme,
     generate_plan,
     rebuild_segments,
     reflow_day,
@@ -47,7 +44,7 @@ from .prayer import insert_prayer_breaks
 from .retrieval import query_for, retrieve_candidates, to_candidate
 from .travel import TravelService
 from .tracing import traced
-from .validator import repair_plan, validate_plan
+from .validator import repair_plan
 
 log = logging.getLogger(__name__)
 
@@ -577,10 +574,6 @@ def suggestions_from_rows(per_day_totals: list[float]) -> list[dict]:
     return chips
 
 
-def budget_payload(plan: Plan) -> dict:
-    return summarise(plan.days, plan.total_budget, plan.currency)
-
-
 # --- editing -----------------------------------------------------------------------------------
 
 
@@ -827,13 +820,3 @@ def add_prayer_breaks(db: Session, itinerary: Itinerary, user: User) -> Plan:
     persist_plan(db, itinerary, plan)
     db.commit()
     return plan
-
-
-def reload_and_validate(db: Session, itinerary_id: int, user: User) -> tuple[Plan, PlanContext]:
-    itinerary = get_itinerary_or_404(db, itinerary_id, user.id)
-    context = context_for(db, itinerary, user)
-    plan = load_plan(db, itinerary)
-    violations = validate_plan(plan, context.profile)
-    if violations:
-        log.warning("persisted itinerary %s has %s violations", itinerary_id, len(violations))
-    return plan, context

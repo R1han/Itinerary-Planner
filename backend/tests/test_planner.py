@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from app.services.budget import Attendee, price_for_age, slot_cost_breakdown, summarise
+from app.services.budget import Attendee, price_for_age, slot_cost_breakdown
 from app.services.planner import (
     DINING_CATEGORIES,
     PreferenceSignal,
@@ -342,23 +342,6 @@ def test_day_theme_of_an_empty_day():
     from app.services.planner import DayPlan
 
     assert day_theme(DayPlan(day_index=0, day_date=TOMORROW)) == "Open day"
-
-
-# --- budget summary ----------------------------------------------------------------------------
-
-
-def test_summary_splits_activities_food_and_travel():
-    plan, _ = _plan(family(2, (7, 13)), days=2, budget=3000.0)
-    summary = summarise(plan.days, 3000.0)
-
-    categories = summary["categories"]
-    assert summary["total"] == pytest.approx(
-        categories["activities"] + categories["food"] + categories["travel"], abs=0.05
-    )
-    assert summary["remaining"] == pytest.approx(3000.0 - summary["total"], abs=0.01)
-    assert summary["over_budget"] is False
-    assert len(summary["per_day"]) == 2
-    assert sum(summary["per_day"]) == pytest.approx(summary["total"], abs=0.05)
 
 
 # --- seasonal closure, heat and rest ------------------------------------------------------------

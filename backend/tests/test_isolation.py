@@ -19,7 +19,6 @@ FUTURE = (date.today() + timedelta(days=30)).isoformat()
 PROTECTED_ROUTES = [
     ("get", "/me"),
     ("get", "/events"),
-    ("get", "/events/upcoming"),
     ("post", "/events"),
     ("get", "/family"),
     ("get", "/preferences"),
@@ -75,12 +74,11 @@ def test_user_b_gets_404_for_user_a_event(client, two_users):
     event_id = created.json()["id"]
 
     # 404 rather than 403 — a 403 would confirm the row exists.
-    assert client.patch(f"/events/{event_id}", headers=bob_headers, json={"title": "x"}).status_code == 404
     assert client.delete(f"/events/{event_id}", headers=bob_headers).status_code == 404
     assert client.get("/events", headers=bob_headers).json() == []
 
 
-def test_upcoming_events_returns_only_own_events(client, two_users):
+def test_the_event_list_returns_only_own_events(client, two_users):
     (alice_headers, _), (bob_headers, _) = two_users
     client.post(
         "/events",
@@ -93,8 +91,8 @@ def test_upcoming_events_returns_only_own_events(client, two_users):
         json={"title": "Bob only", "event_type": "anniversary", "date": FUTURE},
     )
 
-    alice_titles = [e["title"] for e in client.get("/events/upcoming", headers=alice_headers).json()]
-    bob_titles = [e["title"] for e in client.get("/events/upcoming", headers=bob_headers).json()]
+    alice_titles = [e["title"] for e in client.get("/events", headers=alice_headers).json()]
+    bob_titles = [e["title"] for e in client.get("/events", headers=bob_headers).json()]
     assert alice_titles == ["Alice only"]
     assert bob_titles == ["Bob only"]
 

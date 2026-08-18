@@ -159,10 +159,6 @@ class PartyProfile:
         return min([a.age for a in self.attendees], default=18)
 
     @property
-    def party_size(self) -> int:
-        return len(self.attendees)
-
-    @property
     def adults_only(self) -> bool:
         return not self.children_ages
 
@@ -715,20 +711,6 @@ def theme_from_categories(pairs: Sequence[tuple[str, int]]) -> str:
     top = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:2]
     labels = [pretty.get(category, category.replace("_", " ").title()) for category, _ in top]
     return " & ".join(labels)
-
-
-def renumber(day: DayPlan) -> DayPlan:
-    """Re-index positions after an insert or removal, keeping segments consistent."""
-    day.slots.sort(key=lambda s: s.start_min)
-    old_to_new = {slot.position: index for index, slot in enumerate(day.slots)}
-    for index, slot in enumerate(day.slots):
-        slot.position = index
-    for segment in day.segments:
-        segment.to_position = old_to_new.get(segment.to_position, segment.to_position)
-        if segment.from_position is not None:
-            segment.from_position = old_to_new.get(segment.from_position, segment.from_position)
-    day.segments.sort(key=lambda s: s.to_position)
-    return day
 
 
 def reflow_day(

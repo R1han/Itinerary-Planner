@@ -314,8 +314,3 @@ export const useStore = create<State & Actions>((set, get) => ({
     set({ error })
   },
 }))
-
-/** The day currently shown in the strip and filtered on the map. */
-export function useActiveDay(): Day | null {
-  return useStore((state) => state.itinerary?.days[state.selectedDay] ?? null)
-}

@@ -23,7 +23,6 @@ from .models import (
     Message,
     Preference,
     Slot,
-    TravelSegment,
 )
 
 # Only these may be reached through the generic helpers; anything else is a programming error.
@@ -77,27 +76,5 @@ def list_messages(db: Session, conversation_id: int, user_id: int) -> list[Messa
     return list(
         db.scalars(
             select(Message).where(Message.conversation_id == conversation_id).order_by(Message.id)
-        )
-    )
-
-
-def itinerary_slots(db: Session, itinerary_id: int, user_id: int) -> list[Slot]:
-    get_itinerary_or_404(db, itinerary_id, user_id)
-    return list(
-        db.scalars(
-            select(Slot)
-            .where(Slot.itinerary_id == itinerary_id)
-            .order_by(Slot.day_index, Slot.position)
-        )
-    )
-
-
-def itinerary_segments(db: Session, itinerary_id: int, user_id: int) -> list[TravelSegment]:
-    get_itinerary_or_404(db, itinerary_id, user_id)
-    return list(
-        db.scalars(
-            select(TravelSegment)
-            .where(TravelSegment.itinerary_id == itinerary_id)
-            .order_by(TravelSegment.day_index, TravelSegment.id)
         )
     )

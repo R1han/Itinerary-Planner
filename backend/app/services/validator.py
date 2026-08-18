@@ -219,10 +219,3 @@ def repair_plan(
             f"Gave up repairing after {MAX_REPAIR_PASSES} passes ({len(remaining)} issues left)."
         )
     return plan
-
-
-def assert_valid(plan: Plan, profile: PartyProfile) -> None:
-    """Raise if a plan is invalid. Used at the API boundary as a last line of defence."""
-    violations = validate_plan(plan, profile)
-    if violations:
-        raise ValueError("; ".join(str(v) for v in violations))
