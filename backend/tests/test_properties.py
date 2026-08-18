@@ -138,14 +138,55 @@ def test_planner_never_exceeds_the_budget_cap(catalog, party, num_days, budget):
     party=a_party(),
     num_days=st.integers(min_value=1, max_value=5),
 )
-def test_no_place_is_ever_booked_twice(catalog, party, num_days):
+def test_only_restaurants_are_ever_booked_twice(catalog, party, num_days):
+    """Attractions stay unique; a restaurant may come back when it is on the way.
+
+    Stated as "whatever repeats is dining" rather than "nothing repeats", so the property still
+    catches an attraction sneaking in twice however the catalog is shaped.
+    """
     profile = build_profile(party, "family_visit")
     plan = generate_plan(
         catalog, profile, distance_travel(), start_date=TOMORROW, num_days=num_days,
         total_budget=50_000.0, origin=ORIGIN,
     )
-    booked = [slot.place.id for day in plan.days for slot in day.slots]
-    assert len(booked) == len(set(booked))
+
+    seen: set[int] = set()
+    repeated = []
+    for day in plan.days:
+        for slot in day.slots:
+            if slot.place.id in seen:
+                repeated.append(slot.place)
+            seen.add(slot.place.id)
+
+    assert all(p.category in DINING_CATEGORIES for p in repeated), [
+        (p.name, p.category) for p in repeated if p.category not in DINING_CATEGORIES
+    ]
+
+    attractions = [
+        slot.place.id
+        for day in plan.days
+        for slot in day.slots
+        if slot.place.category not in DINING_CATEGORIES
+    ]
+    assert len(attractions) == len(set(attractions))
+
+
+@SLOW
+@given(
+    catalog=a_catalog(),
+    party=a_party(),
+    num_days=st.integers(min_value=1, max_value=5),
+)
+def test_a_day_never_stops_at_the_same_place_twice_running(catalog, party, num_days):
+    """Consecutive identical slots would draw a zero-length leg on the map."""
+    profile = build_profile(party, "family_visit")
+    plan = generate_plan(
+        catalog, profile, distance_travel(), start_date=TOMORROW, num_days=num_days,
+        total_budget=50_000.0, origin=ORIGIN,
+    )
+    for day in plan.days:
+        ids = [slot.place.id for slot in day.slots]
+        assert all(a != b for a, b in zip(ids, ids[1:])), [s.place.name for s in day.slots]
 
 
 @SLOW

@@ -916,3 +916,202 @@ def test_a_search_followed_by_a_yes_is_what_writes_the_event(db, orchestrator, m
     )
     db.commit()
     assert [e.title for e in db.query(Event).all()] == ["Desert Jazz Night"]
+
+
+# --- strict tool schemas -------------------------------------------------------------------------
+
+
+def test_every_tool_is_declared_strict():
+    for tool in TOOLS:
+        assert tool["function"].get("strict") is True, tool["function"]["name"]
+
+
+def test_every_tool_schema_satisfies_strict_mode():
+    """Strict mode has no optional properties: everything in `required`, every object closed.
+
+    A schema that breaks these rules is rejected by the API, and a rejected schema fails the
+    whole chat request — so this is checked here rather than discovered in production.
+    """
+    for tool in TOOLS:
+        parameters = tool["function"]["parameters"]
+        assert parameters["additionalProperties"] is False, tool["function"]["name"]
+        assert set(parameters["required"]) == set(parameters["properties"]), (
+            tool["function"]["name"],
+            set(parameters["properties"]) ^ set(parameters["required"]),
+        )
+
+
+def test_a_formerly_optional_argument_is_declared_nullable():
+    """It has to still be omittable in spirit, and null is how strict mode spells that."""
+    by_name = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
+
+    assert "null" in by_name["get_itinerary"]["properties"]["itinerary_id"]["type"]
+    assert "null" in by_name["edit_stop"]["properties"]["start_time"]["type"]
+    assert "null" in by_name["save_family_details"]["properties"]["likes"]["type"]
+    # A required one stays a plain scalar.
+    assert by_name["edit_stop"]["properties"]["slot_id"]["type"] == "integer"
+
+
+def test_no_schema_carries_a_keyword_strict_mode_may_reject():
+    """`default`, `minimum` and friends are dropped; the handlers still enforce the ranges."""
+    banned = {"default", "minimum", "maximum", "minItems", "maxItems"}
+
+    def walk(node):
+        assert not (banned & set(node)), node
+        for child in node.get("properties", {}).values():
+            walk(child)
+        if "items" in node:
+            walk(node["items"])
+
+    for tool in TOOLS:
+        walk(tool["function"]["parameters"])
+
+
+ALL_NULL_CALLS = [
+    ("save_family_details", {"adults": 2, "children_ages": None, "likes": None, "dislikes": None}),
+    ("create_event", {"title": "X", "event_type": "birthday", "date": FUTURE, "notes": None}),
+    ("get_upcoming_events", {"horizon_days": None}),
+    ("get_itinerary", {"itinerary_id": None}),
+    ("record_preference", {"kind": "like", "subject": "beaches", "category": None}),
+    ("add_prayer_breaks", {"itinerary_id": None}),
+    ("set_transport", {"mode": "own_car", "itinerary_id": None}),
+    ("make_day_cheaper", {"day": 1, "itinerary_id": None}),
+    ("edit_stop", {"slot_id": 1, "action": "remove", "start_time": None, "itinerary_id": None}),
+]
+
+
+@pytest.mark.parametrize(("name", "args"), ALL_NULL_CALLS, ids=[c[0] for c in ALL_NULL_CALLS])
+def test_a_handler_survives_the_nulls_strict_mode_forces_it_to_send(db, orchestrator, name, args):
+    """Strict mode sends every property, so optional ones arrive as None rather than missing.
+
+    `args.get("horizon_days", 60)` returns None for a present-but-null key, and int(None) raises.
+    A tool error is a message, not a crash — but "unsupported operand" is not a message.
+    """
+    result = orchestrator().call_tool(name, args)
+    assert isinstance(result, dict)
+    problem = str(result.get("error", ""))
+    assert "NoneType" not in problem and "int()" not in problem, problem
+
+
+def test_find_live_events_survives_a_null_horizon(db, orchestrator, monkeypatch):
+    monkeypatch.setattr("app.services.orchestrator.find_live_events", lambda *a, **k: [])
+    result = orchestrator().call_tool(
+        "find_live_events", {"query": "concerts", "horizon_days": None}
+    )
+    assert result == {"found": 0, "events": []}
+
+
+def test_generate_itinerary_survives_the_nulls(db, orchestrator):
+    result = orchestrator().call_tool(
+        "generate_itinerary",
+        {"event_id": None, "start_date": None, "days": 2, "budget": 3000, "prayer_breaks": None},
+    )
+    assert "NoneType" not in str(result.get("error", "")), result
+
+
+def test_describing_a_call_survives_nulls_too(db):
+    """The activity row is built from the same arguments, and it runs before the handler does."""
+    from app.services.orchestrator import describe_tool_call
+
+    for name, args in ALL_NULL_CALLS:
+        label, _ = describe_tool_call(name, args)
+        assert label
+    assert describe_tool_call("get_upcoming_events", {"horizon_days": None})[1]
+
+
+# --- asking for a dinner should not produce a day out ---------------------------------------------
+
+
+def test_a_dinner_only_request_plans_one_evening_stop(client, planned, db):
+    """The reported bug: "plan a romantic dinner for my anniversary" returned an aquarium, a
+    lunch, a theme park and a dinner."""
+    from app.models import Itinerary, User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+
+    result = ChatOrchestrator(db, row, conversation).call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 5000, "start_date": FUTURE,
+         "focus": "dinner_only", "adults_only": True},
+    )
+
+    assert "error" not in result, result
+    built = db.get(Itinerary, result["itinerary_id"])
+    slots = list(built.slots)
+    assert len(slots) == 1, [s.place.name for s in slots]
+    assert slots[0].place.category in ("casual_dining", "fine_dining")
+    assert slots[0].start_time >= "17:00", slots[0].start_time
+
+
+def test_adults_only_charges_for_the_adults_and_not_the_children(client, planned, db):
+    """`planned` is a family of two; a couple's night out must not price the child."""
+    from app.models import User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+
+    couple = chat.call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 5000, "start_date": FUTURE,
+         "focus": "dinner_only", "adults_only": True},
+    )
+    payload = chat.call_tool("get_itinerary", {"itinerary_id": couple["itinerary_id"]})
+    breakdown = payload["days"][0]["stops"][0]
+    assert breakdown["cost"] > 0
+
+    from app.services.itinerary import itinerary_payload
+    from app.models import Itinerary
+
+    full = itinerary_payload(db, db.get(Itinerary, couple["itinerary_id"]))
+    costs = full["days"][0]["slots"][0]["cost_breakdown"]
+    assert len(costs["adults"]) == 1, costs
+    assert not costs["children"], costs
+
+
+def test_a_full_day_request_is_unchanged(client, planned, db):
+    """The default must not move — everything else depends on it."""
+    from app.models import Itinerary, User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+
+    result = ChatOrchestrator(db, row, conversation).call_tool(
+        "generate_itinerary", {"days": 1, "budget": 5000, "start_date": FUTURE}
+    )
+    assert len(list(db.get(Itinerary, result["itinerary_id"]).slots)) > 1
+
+
+def test_an_unknown_focus_is_rejected(db, orchestrator):
+    result = orchestrator().call_tool(
+        "generate_itinerary", {"days": 1, "budget": 5000, "start_date": FUTURE, "focus": "brunch"}
+    )
+    assert "Unknown focus" in result.get("error", "")
+
+
+def test_the_trace_says_it_is_finding_a_restaurant_not_building_a_trip(db):
+    from app.services.orchestrator import describe_tool_call
+
+    label, detail = describe_tool_call(
+        "generate_itinerary",
+        {"days": 1, "budget": 5000, "focus": "dinner_only", "adults_only": True},
+    )
+    assert label == "Finding a restaurant"
+    assert "dinner only" in detail and "adults only" in detail
+
+
+def test_the_prompt_tells_the_model_to_match_the_scope_of_the_request(db, orchestrator):
+    prompt = orchestrator().system_prompt()
+    assert "focus='dinner_only'" in prompt
+    assert "not a day out with a restaurant at the end of it" in prompt
+    assert "adults_only" in prompt

@@ -27,6 +27,10 @@ from .budget import Attendee, CostBreakdown, slot_cost_breakdown
 DINING_CATEGORIES = frozenset({"casual_dining", "fine_dining"})
 MAX_DAYS = 5
 MAX_SLOTS_PER_DAY = 6
+# How much of a day a request covers. `dinner_only` shrinks the day to its evening meal.
+FULL_DAY = "full_day"
+DINNER_ONLY = "dinner_only"
+PLAN_FOCUS = (FULL_DAY, DINNER_ONLY)
 # How long we are willing to idle outside a venue waiting for it to open.
 MAX_WAIT_MIN = 40
 # A meal may start a little after its window closes, but not hours later: a "lunch" that a long
@@ -53,6 +57,15 @@ MAX_HOP_KM = 60
 # How long a meal is assumed to take when guessing what can still follow it. Only used to rule
 # out attractions that could not fit afterwards, so a rough figure is enough.
 NOMINAL_MEAL_MIN = 60
+# How far out of the way a place already in the plan may be before returning to it stops being
+# worth it. Attractions are never revisited at any distance — seeing the same aquarium twice is
+# not a trip — but a good restaurant on the road you are already driving is, and the catalog has
+# far fewer restaurants than attractions, so uniqueness there costs meals rather than variety.
+REPEAT_MAX_DETOUR_KM = 10.0
+# Nudge against a place already in the plan, small enough that a genuinely better restaurant
+# still wins and large enough to break a tie. "Repeat the highest-scored one" means it has to
+# actually be the highest, not merely equal to somewhere new.
+REPEAT_TIEBREAK = 0.05
 # UAE summer. Between these hours in these months, an air-conditioned venue is worth a nudge —
 # the spec calls malls and indoor attractions the "midday heat fallback".
 HOT_MONTHS = frozenset({5, 6, 7, 8, 9})
@@ -163,6 +176,8 @@ class PartyProfile:
     day_start: int = 9 * 60
     day_end: int = 21 * 60 + 30
     meal_windows: tuple[tuple[str, int, int], ...] = ()
+    # How many stops a day may hold. Lowered to 1 when only a meal was asked for.
+    max_stops: int = MAX_SLOTS_PER_DAY
     attendees: list[Attendee] = field(default_factory=list)
 
     @property
@@ -320,6 +335,27 @@ def preference_signal(place: PlaceCandidate, preferences: Sequence[PreferenceSig
             continue
         signal += pref.strength if pref.kind == "like" else -pref.strength * 1.4
     return max(-2.0, min(2.0, signal))
+
+
+def dinner_only(profile: PartyProfile) -> PartyProfile:
+    """Narrow a profile to the evening meal and nothing else.
+
+    "Plan a romantic dinner" used to produce a whole day — an aquarium, a lunch and a theme park
+    — because generation always filled day_start to day_end and every meal window. Rather than
+    teach the planner a second mode, the day itself is shrunk to the dinner window and capped at
+    one stop; everything downstream keeps working unchanged.
+    """
+    dinner = next((w for w in profile.meal_windows if w[0] == "dinner"), None)
+    if dinner is None:
+        return profile
+
+    _, start, end = dinner
+    profile.meal_windows = (dinner,)
+    profile.day_start = start
+    profile.day_end = end
+    profile.max_stops = 1
+    profile.needs_midday_rest = False
+    return profile
 
 
 def score_place(
@@ -499,6 +535,20 @@ def next_anchor(
     return (best.lat, best.lng) if best is not None else origin
 
 
+def may_revisit(
+    candidate: PlaceCandidate, previous: tuple[float, float], anchor: tuple[float, float]
+) -> bool:
+    """Whether a place already in the plan may appear again from where we currently are.
+
+    Dining only, and only when stopping costs the day next to nothing. Being the highest-scored
+    option is not enough on a second visit — the detour has to be near zero, or the plan starts
+    driving back to a favourite instead of finding something new.
+    """
+    if candidate.category not in DINING_CATEGORIES:
+        return False
+    return geographic_penalty(candidate, previous, anchor) <= REPEAT_MAX_DETOUR_KM
+
+
 def geographic_penalty(
     candidate: PlaceCandidate, previous: tuple[float, float], anchor: tuple[float, float]
 ) -> float:
@@ -539,11 +589,12 @@ def assemble_day(
     filled_meals: set[str] = set()
     previous: tuple[float, float] = origin
     previous_position: int | None = None
+    previous_place_id: int | None = None
 
     pool = list(candidates)
     meal_unit = _cheapest_meal(pool, profile)
 
-    while len(day.slots) < MAX_SLOTS_PER_DAY and cursor < profile.day_end:
+    while len(day.slots) < profile.max_stops and cursor < profile.day_end:
         # A midday rest for young children is a gap in the schedule, not a slot. It must yield to
         # a meal that is currently due: taking the rest first pushed the cursor past the end of
         # the lunch window, which then counted as missed — so a family with a small child got a
@@ -573,12 +624,16 @@ def assemble_day(
             pool,
             key=lambda p: scores.get(p.id, 0.0)
             - PROXIMITY_PENALTY_PER_KM * geographic_penalty(p, previous, anchor)
+            - (REPEAT_TIEBREAK if p.id in used else 0.0)
             + (INDOOR_HEAT_BONUS if hot and p.indoor else 0.0),
             reverse=True,
         )
 
         for place in ordered:
-            if place.id in used:
+            # Two slots running at one place would draw a zero-length leg on the map.
+            if place.id == previous_place_id:
+                continue
+            if place.id in used and not may_revisit(place, previous, anchor):
                 continue
             is_dining = place.category in DINING_CATEGORIES
             if due and not is_dining:
@@ -671,6 +726,7 @@ def assemble_day(
         cursor = slot.end_min
         previous = (slot.place.lat, slot.place.lng)
         previous_position = slot.position
+        previous_place_id = slot.place.id
         if due_label:
             filled_meals.add(due_label)
 
@@ -843,6 +899,7 @@ def rebuild_segments(day: DayPlan, travel_fn: TravelFn, origin: tuple[float, flo
         slot.cost.total = round(slot.cost.admission + info.est_cost, 2)
         previous = (slot.place.lat, slot.place.lng)
         previous_position = slot.position
+        previous_place_id = slot.place.id
 
     day.segments = segments
     return day

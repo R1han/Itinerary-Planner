@@ -163,3 +163,107 @@ def test_the_result_count_is_bounded():
         for i in range(MAX_EVENTS + 10)
     ]
     assert len(run(many)) == MAX_EVENTS
+
+
+# --- the extractor asks for a shape, not just for JSON --------------------------------------------
+
+
+class RecordingOpenAI:
+    """Captures the request the extractor builds, and replies with whatever it is given."""
+
+    def __init__(self, content: str = '{"events": []}') -> None:
+        self.content = content
+        self.kwargs: dict = {}
+        chat = type("Chat", (), {})()
+        chat.completions = self
+        self.chat = chat
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        message = type("Message", (), {"content": self.content})()
+        choice = type("Choice", (), {"message": message})()
+        return type("Response", (), {"choices": [choice]})()
+
+
+def _extract_with(monkeypatch, client, pages=None):
+    from app.services import websearch
+
+    monkeypatch.setattr(websearch, "wrap_openai", lambda c: c)
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai", type("M", (), {"OpenAI": lambda **_: client})
+    )
+    extractor = websearch.LLMExtractor("test-key")
+    return extractor.extract(pages or [{"title": "t", "url": "u", "content": "some page text"}],
+                             date(2026, 8, 18))
+
+
+def test_the_extractor_constrains_the_reply_to_a_schema(monkeypatch):
+    """json_object only promises parseable JSON. The shape was described in prose and enforced
+    nowhere, so a reply keyed "results" instead of "events" read as "no events found"."""
+    client = RecordingOpenAI()
+    _extract_with(monkeypatch, client)
+
+    fmt = client.kwargs["response_format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["json_schema"]["strict"] is True
+
+
+def test_the_schema_satisfies_what_strict_mode_requires(monkeypatch):
+    """strict mode rejects a schema unless every property is required and objects are closed."""
+    client = RecordingOpenAI()
+    _extract_with(monkeypatch, client)
+    schema = client.kwargs["response_format"]["json_schema"]["schema"]
+
+    def check(node):
+        if node.get("type") == "object":
+            assert node.get("additionalProperties") is False, node
+            assert set(node.get("required", [])) == set(node["properties"]), node
+            for child in node["properties"].values():
+                check(child)
+        if node.get("type") == "array":
+            check(node["items"])
+
+    check(schema)
+    assert set(schema["properties"]) == {"events"}
+
+
+def test_the_event_type_enum_is_in_the_schema_not_only_the_prompt(monkeypatch):
+    from app.services.websearch import EVENT_TYPES
+
+    client = RecordingOpenAI()
+    _extract_with(monkeypatch, client)
+    row = client.kwargs["response_format"]["json_schema"]["schema"]["properties"]["events"]["items"]
+    assert set(row["properties"]["event_type"]["enum"]) == set(EVENT_TYPES)
+
+
+def test_a_schema_shaped_reply_is_returned_unchanged(monkeypatch):
+    client = RecordingOpenAI(
+        '{"events": [{"title": "Desert Jazz", "date": "2026-09-01", "event_type": "other"}]}'
+    )
+    assert _extract_with(monkeypatch, client) == [
+        {"title": "Desert Jazz", "date": "2026-09-01", "event_type": "other"}
+    ]
+
+
+def test_an_empty_corpus_never_reaches_the_model(monkeypatch):
+    client = RecordingOpenAI()
+    assert _extract_with(monkeypatch, client, pages=[{"title": "", "url": "", "content": ""}]) == []
+    assert client.kwargs == {}, "spent a call on nothing"
+
+
+def test_a_refusal_is_logged_rather_than_read_as_no_events(monkeypatch, caplog):
+    """A refusal and an empty search look identical downstream unless one of them says so."""
+    import logging
+
+    client = RecordingOpenAI()
+
+    def create(**kwargs):
+        client.kwargs = kwargs
+        message = type("Message", (), {"content": None, "refusal": "I can't help with that"})()
+        choice = type("Choice", (), {"message": message})()
+        return type("Response", (), {"choices": [choice]})()
+
+    client.create = create
+    with caplog.at_level(logging.WARNING):
+        assert _extract_with(monkeypatch, client) == []
+    assert "refused" in caplog.text

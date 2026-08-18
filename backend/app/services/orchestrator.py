@@ -47,7 +47,11 @@ HISTORY_LIMIT = 20
 EVENT_TYPES = ["birthday", "anniversary", "family_visit", "graduation", "eid", "holiday", "other"]
 
 # Note the absence of any user_id parameter — deliberate, and load-bearing.
-TOOLS = [
+#
+# Written with the ordinary required/optional split and rewritten for strict mode below, because
+# strict mode's shape (everything required, optional spelled as nullable) is unreadable to write
+# by hand and easy to get subtly wrong across eleven tools.
+_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
@@ -56,11 +60,11 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "adults": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "adults": {"type": "integer", "description": "1 to 12."},
                     "children_ages": {
                         "type": "array",
-                        "items": {"type": "integer", "minimum": 0, "maximum": 17},
-                        "description": "One entry per child, their age in years.",
+                        "items": {"type": "integer"},
+                        "description": "One entry per child, their age in years, 0 to 17.",
                     },
                     "likes": {"type": "array", "items": {"type": "string"}},
                     "dislikes": {"type": "array", "items": {"type": "string"}},
@@ -94,7 +98,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "horizon_days": {"type": "integer", "minimum": 1, "maximum": 730, "default": 60}
+                    "horizon_days": {
+                        "type": "integer",
+                        "description": "1 to 730. Null means the default of 60.",
+                    }
                 },
             },
         },
@@ -120,9 +127,7 @@ TOOLS = [
                     },
                     "horizon_days": {
                         "type": "integer",
-                        "minimum": 1,
-                        "maximum": 365,
-                        "default": 90,
+                        "description": "1 to 365. Null means the default of 90.",
                     },
                 },
                 "required": ["query"],
@@ -134,7 +139,7 @@ TOOLS = [
         "function": {
             "name": "generate_itinerary",
             "description": (
-                "Build a complete itinerary for an event. The server rejects this if the intake "
+                "Build an itinerary for an event. The server rejects this if the intake "
                 "checklist is incomplete; ask for whatever is missing and try again."
             ),
             "parameters": {
@@ -142,9 +147,26 @@ TOOLS = [
                 "properties": {
                     "event_id": {"type": "integer"},
                     "start_date": {"type": "string", "description": "ISO date, YYYY-MM-DD"},
-                    "days": {"type": "integer", "minimum": 1, "maximum": 5},
-                    "budget": {"type": "number", "minimum": 1},
-                    "prayer_breaks": {"type": "boolean", "default": False},
+                    "days": {"type": "integer", "description": "1 to 5."},
+                    "budget": {"type": "number", "description": "In AED, greater than zero."},
+                    "prayer_breaks": {"type": "boolean"},
+                    "focus": {
+                        "type": "string",
+                        "enum": list(itinerary_service.PLAN_FOCUS),
+                        "description": (
+                            "'full_day' plans attractions and every meal. Use 'dinner_only' when "
+                            "the user asked for a meal and nothing else — it plans one evening "
+                            "stop, not a day out. Defaults to 'full_day'."
+                        ),
+                    },
+                    "adults_only": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the children are not coming — a couple's anniversary, a "
+                            "night out. Changes what the planner optimises for and who is "
+                            "charged, so set it whenever the user or the event notes say so."
+                        ),
+                    },
                 },
                 "required": ["days", "budget"],
             },
@@ -183,7 +205,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "day": {"type": "integer", "minimum": 1, "description": "1-based day number."},
+                    "day": {"type": "integer", "description": "1-based day number."},
                     "itinerary_id": {"type": "integer"},
                 },
                 "required": ["day"],
@@ -263,6 +285,69 @@ TOOLS = [
 ]
 
 
+# Strict mode accepts a subset of JSON Schema. These keywords are dropped rather than risked: an
+# unsupported one is rejected by the API, and a rejected schema fails the whole chat request. Every
+# bound they expressed is re-checked in the handler anyway, and restated in the description so the
+# model still sees it.
+_UNSUPPORTED_KEYWORDS = frozenset({"default", "minimum", "maximum", "minItems", "maxItems"})
+
+
+def _nullable(spec: dict) -> dict:
+    kind = spec.get("type")
+    types = kind if isinstance(kind, list) else [kind]
+    return spec if "null" in types else {**spec, "type": [*types, "null"]}
+
+
+def _strict_parameters(parameters: dict) -> dict:
+    """Rewrite one tool's parameters for strict mode.
+
+    Strict mode has no optional properties: everything is listed in `required` and objects are
+    closed. An argument that used to be left out is declared nullable instead, and therefore
+    arrives as None rather than missing — which is what `_arg` exists to absorb.
+    """
+    properties = parameters.get("properties", {})
+    optional = set(properties) - set(parameters.get("required", []))
+
+    rewritten = {}
+    for name, spec in properties.items():
+        cleaned = {k: v for k, v in spec.items() if k not in _UNSUPPORTED_KEYWORDS}
+        if isinstance(cleaned.get("items"), dict):
+            cleaned["items"] = {
+                k: v for k, v in cleaned["items"].items() if k not in _UNSUPPORTED_KEYWORDS
+            }
+        rewritten[name] = _nullable(cleaned) if name in optional else cleaned
+
+    return {
+        "type": "object",
+        "properties": rewritten,
+        "required": list(rewritten),
+        "additionalProperties": False,
+    }
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            **tool["function"],
+            "strict": True,
+            "parameters": _strict_parameters(tool["function"].get("parameters", {})),
+        },
+    }
+    for tool in _TOOL_DEFINITIONS
+]
+
+
+def _arg(args: dict, name: str, default):
+    """`args.get` that treats an explicit null the same as an absent key.
+
+    Strict schemas require every property, so an optional argument arrives as None. Plain
+    `args.get(name, default)` returns that None — and int(None) is a crash, not a tool error.
+    """
+    value = args.get(name)
+    return default if value is None else value
+
+
 def sse(event_type: str, data) -> str:
     """One Server-Sent Event frame."""
     return f"data: {json.dumps({'type': event_type, 'data': data}, default=str)}\n\n"
@@ -306,10 +391,10 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
         return "Adding an event", detail or None
 
     if name == "get_upcoming_events":
-        return "Checking your calendar", f"next {int(args.get('horizon_days', 60))} days"
+        return "Checking your calendar", f"next {int(_arg(args, 'horizon_days', 60))} days"
 
     if name == "find_live_events":
-        query = str(args.get("query", "")).strip()
+        query = str(_arg(args, "query", "")).strip()
         return "Searching for live events", query or None
 
     if name == "generate_itinerary":
@@ -322,30 +407,35 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
             bits.append(f"from {args['start_date']}")
         if args.get("prayer_breaks"):
             bits.append("with prayer breaks")
+        if args.get("adults_only"):
+            bits.append("adults only")
+        if args.get("focus") == "dinner_only":
+            bits = ["dinner only", *bits]
+            return "Finding a restaurant", " · ".join(bits) or None
         return "Building your itinerary", " · ".join(bits) or None
 
     if name == "get_itinerary":
         return "Reading the current plan", None
 
     if name == "make_day_cheaper":
-        return "Finding cheaper options", f"day {int(args.get('day', 1))}"
+        return "Finding cheaper options", f"day {int(_arg(args, 'day', 1))}"
 
     if name == "add_prayer_breaks":
         return "Adding prayer breaks", None
 
     if name == "set_transport":
-        mode = str(args.get("mode", ""))
+        mode = str(_arg(args, "mode", ""))
         return "Switching transport", "own car" if mode == "own_car" else "taxi"
 
     if name == "edit_stop":
-        action = str(args.get("action", ""))
+        action = str(_arg(args, "action", ""))
         if action == "adjust":
             return "Moving a stop", f"to {args.get('start_time')}" if args.get("start_time") else None
         return "Removing a stop", None
 
     if name == "record_preference":
-        kind = str(args.get("kind", "like"))
-        subject = str(args.get("subject", "")).strip()
+        kind = str(_arg(args, "kind", "like"))
+        subject = str(_arg(args, "subject", "")).strip()
         verb = "likes" if kind == "like" else "dislikes"
         return "Noting a preference", f"{verb} {subject}" if subject else None
 
@@ -464,6 +554,11 @@ class ChatOrchestrator:
             f"Dislikes: {', '.join(dislikes)}\n"
             f"Remembered from earlier sessions:\n{memory_text}\n"
             f"On their calendar:\n{calendar_text}\n\n"
+            "Plan what was asked for and no more. A request for a dinner is generate_itinerary "
+            "with focus='dinner_only' — one evening stop — not a day out with a restaurant at the "
+            "end of it. Set adults_only when the children are not coming, which an anniversary "
+            "usually implies and the event's notes often say outright; without it the evening is "
+            "scored for the youngest child in the family.\n\n"
             "Those calendar entries are facts you already have. If the user mentions one of them "
             "— by name or by occasion — use its date and its notes and never ask for a date you "
             "have been given. get_upcoming_events is only for looking further ahead than the "
@@ -528,8 +623,8 @@ class ChatOrchestrator:
             return {"error": str(exc)}
 
     def _save_family_details(self, args: dict) -> dict:
-        adults = max(1, int(args.get("adults", 1)))
-        ages = [int(age) for age in args.get("children_ages", [])]
+        adults = max(1, int(_arg(args, "adults", 1)))
+        ages = [int(age) for age in _arg(args, "children_ages", [])]
 
         self.db.query(FamilyMember).filter(FamilyMember.user_id == self.user.id).delete()
         for _ in range(adults):
@@ -537,9 +632,9 @@ class ChatOrchestrator:
         for age in ages:
             self.db.add(FamilyMember(user_id=self.user.id, role="child", age=age))
 
-        for subject in args.get("likes", []):
+        for subject in _arg(args, "likes", []):
             self._remember("like", str(subject))
-        for subject in args.get("dislikes", []):
+        for subject in _arg(args, "dislikes", []):
             self._remember("dislike", str(subject))
 
         self.db.flush()
@@ -576,7 +671,7 @@ class ChatOrchestrator:
         return {"created": True, "event_id": event.id, "title": event.title}
 
     def _get_upcoming_events(self, args: dict) -> dict:
-        horizon = int(args.get("horizon_days", 60))
+        horizon = int(_arg(args, "horizon_days", 60))
         today = date.today()
         events = (
             self.db.query(Event)
@@ -612,7 +707,7 @@ class ChatOrchestrator:
         """
         rows = find_live_events(
             str(args.get("query") or ""),
-            horizon_days=int(args.get("horizon_days", 90)),
+            horizon_days=int(_arg(args, "horizon_days", 90)),
         )
         existing = {
             (title.lower(), when)
@@ -659,10 +754,13 @@ class ChatOrchestrator:
         if start_date < date.today():
             return {"error": "That start date is in the past."}
 
-        days = int(args.get("days", 3))
+        days = int(_arg(args, "days", 3))
         if not 1 <= days <= 5:
             return {"error": "Trips can be at most 5 days."}
-        budget = float(args.get("budget", 0))
+        focus = str(_arg(args, "focus", itinerary_service.FULL_DAY))
+        if focus not in itinerary_service.PLAN_FOCUS:
+            return {"error": f"Unknown focus {focus!r}."}
+        budget = float(_arg(args, "budget", 0))
         if budget <= 0:
             return {"error": "I still need a budget in AED."}
 
@@ -681,8 +779,10 @@ class ChatOrchestrator:
                 event_id=event.id if event else None,
                 title=event.title if event else None,
                 currency=self.user.default_currency,
-                prayer_breaks=bool(args.get("prayer_breaks", False)),
+                prayer_breaks=bool(_arg(args, "prayer_breaks", False)),
                 transport_mode=current.transport_mode if current else itinerary_service.TAXI,
+                adults_only=bool(_arg(args, "adults_only", False)),
+                focus=focus,
             )
         except itinerary_service.IntakeIncomplete as exc:
             return {"error": "intake_incomplete", "missing_fields": exc.missing}
@@ -801,7 +901,7 @@ class ChatOrchestrator:
         before = itinerary_service.itinerary_payload(self.db, itinerary)["budget"]["total"]
         try:
             itinerary_service.cheaper_day(
-                self.db, itinerary, self.user, int(args.get("day", 1)) - 1
+                self.db, itinerary, self.user, int(_arg(args, "day", 1)) - 1
             )
         except ValueError as exc:
             return {"error": str(exc)}
@@ -824,7 +924,7 @@ class ChatOrchestrator:
         if error:
             return error
 
-        mode = str(args.get("mode", ""))
+        mode = str(_arg(args, "mode", ""))
         if mode not in itinerary_service.TRANSPORT_MODES:
             return {"error": f"Unknown transport mode {mode!r}."}
 
@@ -841,7 +941,7 @@ class ChatOrchestrator:
         # slot_id from someone else's plan finds nothing rather than editing it.
         slot = (
             self.db.query(Slot)
-            .filter(Slot.id == int(args.get("slot_id", 0)), Slot.itinerary_id == itinerary.id)
+            .filter(Slot.id == int(_arg(args, "slot_id", 0)), Slot.itinerary_id == itinerary.id)
             .one_or_none()
         )
         if slot is None:
@@ -853,7 +953,7 @@ class ChatOrchestrator:
                 itinerary,
                 self.user,
                 slot,
-                action=str(args.get("action", "")),
+                action=str(_arg(args, "action", "")),
                 start_time=args.get("start_time"),
             )
         except ValueError as exc:
@@ -861,7 +961,7 @@ class ChatOrchestrator:
         return self._plan_result(itinerary)
 
     def _record_preference(self, args: dict) -> dict:
-        self._remember(str(args.get("kind", "like")), str(args.get("subject", "")),
+        self._remember(str(_arg(args, "kind", "like")), str(_arg(args, "subject", "")),
                        args.get("category"))
         return {"recorded": True}
 

@@ -50,7 +50,9 @@ def test_young_children_shorten_slots_and_add_a_midday_rest():
     assert profile.w_kid > profile.w_teen
     assert profile.max_slot_min <= 120
     assert profile.needs_midday_rest is True
-    assert profile.day_end <= 20 * 60
+    # An early finish relative to the adults-only profile, which runs to 23:30 — not an
+    # absolute clock time. Widened to 20:30 in d282731 so dinner has room to land.
+    assert profile.day_end <= 20 * 60 + 30
 
 
 def test_teens_weight_teen_score_and_allow_long_slots():
@@ -280,9 +282,19 @@ def test_young_children_get_a_protected_midday_gap():
         assert following.start_min - previous.end_min >= 60
 
 
-def test_no_place_is_used_twice_across_the_trip():
+def test_no_attraction_is_used_twice_across_the_trip():
+    """Attractions stay unique — seeing the same aquarium twice is not a trip.
+
+    Restaurants are exempt: a good one on the road you are already driving is worth returning
+    to, and that exemption is gated on the detour rather than left open. See `may_revisit`.
+    """
     plan, _ = _plan(family(2, (7, 13)), days=3, budget=6000.0)
-    booked = [slot.place.id for day in plan.days for slot in day.slots]
+    booked = [
+        slot.place.id
+        for day in plan.days
+        for slot in day.slots
+        if slot.place.category not in DINING_CATEGORIES
+    ]
     assert len(booked) == len(set(booked))
 
 
@@ -588,8 +600,10 @@ def test_lunch_is_measured_against_where_the_day_goes_next_not_only_home():
 
     names = [slot.place.name for slot in plan.days[0].slots]
     assert "Afternoon Sight" in names, f"the scenario did not reach the afternoon: {names}"
-    assert "Roadside Kitchen" in names, f"took the backtrack instead: {names}"
-    assert "Backtrack Grill" not in names
+    # The lunch slot specifically — Backtrack Grill is a perfectly good dinner later on, since
+    # by then the day really is heading home. What matters is which one lunch picked.
+    assert names.index("Roadside Kitchen") < names.index("Afternoon Sight"), names
+    assert "Backtrack Grill" not in names[: names.index("Afternoon Sight")], names
 
 
 def test_the_last_meal_of_the_day_is_still_anchored_on_home():
@@ -620,3 +634,137 @@ def test_an_attraction_already_used_is_not_an_anchor():
     pool = _lunch_between_two_attractions()
     assert next_anchor(pool, profile, origin, cursor=12 * 60, used={1, 2},
                        day_month=TOMORROW.month) == origin
+
+
+# --- returning to a restaurant that is on the way -----------------------------------------------
+
+
+def test_a_restaurant_on_the_way_may_be_revisited():
+    from app.services.planner import may_revisit
+
+    previous, anchor = (24.60, 54.3773), (24.70, 54.3773)
+    on_the_way = place(1, "Star Cafe", "casual_dining", lat=24.65, lng=54.3773)
+    assert may_revisit(on_the_way, previous, anchor) is True
+
+
+def test_a_restaurant_off_the_way_may_not_be_revisited():
+    """Being the best is not enough on a second visit — it has to cost the day nothing."""
+    from app.services.planner import may_revisit
+
+    previous, anchor = (24.60, 54.3773), (24.70, 54.3773)
+    detour = place(1, "Star Cafe", "casual_dining", lat=24.30, lng=54.3773)
+    assert may_revisit(detour, previous, anchor) is False
+
+
+def test_an_attraction_is_never_revisited_however_convenient():
+    from app.services.planner import may_revisit
+
+    previous, anchor = (24.60, 54.3773), (24.70, 54.3773)
+    right_there = place(1, "Sight", "aquarium", lat=24.65, lng=54.3773)
+    assert may_revisit(right_there, previous, anchor) is False
+
+
+def test_one_good_central_restaurant_can_serve_both_meals_of_a_day():
+    """A single restaurant sitting between every stop, and nothing else to eat at.
+
+    Before, the second meal was simply skipped: the place was already used, so it was invisible
+    to the planner however convenient it was.
+    """
+    pool = [
+        place(1, "Morning Sight", "aquarium", lat=24.60, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=120, kid_score=0.9),
+        place(2, "Afternoon Sight", "museum", lat=24.70, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=120, kid_score=0.9),
+        place(10, "Star Cafe", "casual_dining", lat=24.65, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=60, kid_score=0.95),
+    ]
+    plan = generate_plan(
+        pool,
+        build_profile(family(2, (7, 13)), "birthday"),
+        distance_travel(),
+        start_date=TOMORROW,
+        num_days=1,
+        total_budget=4500.0,
+        origin=(24.4539, 54.3773),
+    )
+
+    names = [slot.place.name for slot in plan.days[0].slots]
+    assert names.count("Star Cafe") == 2, names
+    assert names.count("Morning Sight") == 1
+    assert names.count("Afternoon Sight") == 1
+
+
+def test_a_revisit_never_lands_back_to_back():
+    """Two consecutive slots at one place would draw a zero-length leg on the map."""
+    pool = [
+        place(1, "Only Sight", "aquarium", lat=24.60, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=120),
+        place(10, "Star Cafe", "casual_dining", lat=24.62, lng=54.3773, emirate="Abu Dhabi",
+              avg_duration_min=60, kid_score=0.99),
+    ]
+    plan = generate_plan(
+        pool,
+        build_profile(family(2, (7, 13)), "birthday"),
+        distance_travel(),
+        start_date=TOMORROW,
+        num_days=1,
+        total_budget=4500.0,
+        origin=(24.4539, 54.3773),
+    )
+    names = [slot.place.name for slot in plan.days[0].slots]
+    assert all(a != b for a, b in zip(names, names[1:])), names
+
+
+# --- planning only part of a day ------------------------------------------------------------------
+
+
+def test_a_dinner_only_profile_plans_exactly_one_stop():
+    """The reported bug: "plan a romantic dinner" produced an aquarium, a lunch and a theme park.
+
+    generate_itinerary always filled day_start→day_end and every meal window; there was no way to
+    ask for one stop.
+    """
+    from app.services.planner import dinner_only
+
+    profile = dinner_only(build_profile(family(2), "anniversary"))
+    pool = [
+        place(1, "Sight", "aquarium", lat=24.50, lng=54.3773, avg_duration_min=120),
+        place(2, "Cafe", "casual_dining", lat=24.50, lng=54.3773, avg_duration_min=90),
+        place(3, "Fine Place", "fine_dining", lat=24.52, lng=54.3773, avg_duration_min=120,
+              romance_score=0.95),
+    ]
+    plan = generate_plan(pool, profile, distance_travel(), start_date=TOMORROW, num_days=1,
+                         total_budget=5000.0, origin=(24.4539, 54.3773))
+
+    slots = plan.days[0].slots
+    assert len(slots) == 1, [s.place.name for s in slots]
+    assert slots[0].place.category in DINING_CATEGORIES
+
+
+def test_a_dinner_only_plan_lands_in_the_evening():
+    from app.services.planner import dinner_only
+
+    profile = dinner_only(build_profile(family(2), "anniversary"))
+    assert profile.day_start >= 17 * 60
+    assert len(profile.meal_windows) == 1
+    assert profile.meal_windows[0][0] == "dinner"
+    assert profile.max_stops == 1
+
+
+def test_dinner_only_leaves_the_full_day_profile_alone():
+    """The default shape must not move — every other plan depends on it."""
+    full = build_profile(family(2, (7, 13)), "birthday")
+    assert full.max_stops > 1
+    assert len(full.meal_windows) == 2
+    assert full.day_start == 9 * 60
+
+
+def test_an_adults_only_anniversary_scores_for_romance_not_for_children():
+    """With the children left at home the romantic branch fires, which is what makes a plan
+    reach for fine dining instead of a theme park."""
+    whole_family = build_profile(family(2, (7, 13)), "anniversary")
+    just_the_two = build_profile(family(2), "anniversary")
+
+    assert whole_family.w_kid == 1.0 and whole_family.w_romance < 0.5
+    assert just_the_two.w_romance == 1.0 and just_the_two.w_kid == 0.0
+    assert just_the_two.evening_bias is True

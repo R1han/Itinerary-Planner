@@ -32,7 +32,11 @@ from .planner import (
     PlannedSlot,
     PreferenceSignal,
     TravelInfo,
+    DINNER_ONLY,
+    FULL_DAY,
+    PLAN_FOCUS,
     build_profile,
+    dinner_only,
     generate_plan,
     rebuild_segments,
     reflow_day,
@@ -103,13 +107,24 @@ def missing_intake_fields(db: Session, user: User) -> list[str]:
 
 
 def build_context(
-    db: Session, user: User, event: Event | None, *, start_lat: float, start_lng: float
+    db: Session, user: User, event: Event | None, *, start_lat: float, start_lng: float,
+    adults_only: bool = False, focus: str = FULL_DAY,
 ) -> PlanContext:
     attendees = family_attendees(db, user.id)
+    if adults_only:
+        # An anniversary "just the two of us" is still recorded against a household with kids in
+        # it. Leaving them in the party means `romantic` never fires, and the whole evening gets
+        # scored for a seven-year-old.
+        attendees = [a for a in attendees if a.role == "adult"] or attendees
     event_type = event.event_type if event else "other"
+
+    profile = build_profile(attendees, event_type)
+    if focus == DINNER_ONLY:
+        profile = dinner_only(profile)
+
     return PlanContext(
         user=user,
-        profile=build_profile(attendees, event_type),
+        profile=profile,
         preferences=preference_signals(db, user.id),
         origin=(start_lat, start_lng),
     )
@@ -133,6 +148,8 @@ def generate(
     currency: str = "AED",
     prayer_breaks: bool = False,
     transport_mode: str = TAXI,
+    adults_only: bool = False,
+    focus: str = FULL_DAY,
 ) -> Itinerary:
     """Plan a trip and persist it. Raises IntakeIncomplete before doing any work."""
     missing = missing_intake_fields(db, user)
@@ -147,7 +164,14 @@ def generate(
         if event is None:
             raise ValueError("Unknown event")
 
-    context = build_context(db, user, event, start_lat=start_lat, start_lng=start_lng)
+    # A dinner is one evening whatever the request said.
+    if focus == DINNER_ONLY:
+        num_days = 1
+
+    context = build_context(
+        db, user, event, start_lat=start_lat, start_lng=start_lng,
+        adults_only=adults_only, focus=focus,
+    )
     candidates = retrieve_candidates(
         db,
         context.profile,

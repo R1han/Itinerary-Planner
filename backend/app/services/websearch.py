@@ -103,9 +103,35 @@ EXTRACTION_PROMPT = (
     "title like 'Top 30 things to do'.\n"
     "- Skip anything you are unsure about. Returning fewer, correct events is better than guessing.\n"
     "- Do not invent events, dates, prices or venues.\n\n"
-    'Reply with JSON: {"events": [{"title": str, "date": "YYYY-MM-DD", '
-    f'"event_type": one of {list(EVENT_TYPES)}}}]}}'
+    "Return an empty list rather than a doubtful one."
 )
+
+# The reply's shape, enforced by the API rather than described in prose. `json_object` mode only
+# promised parseable JSON: a reply keyed "results", or a row with no date, parsed fine and then
+# vanished in `to_event_row`, so a shape mismatch reached the user as "nothing found".
+#
+# strict mode's rules: every property listed in `required`, every object closed with
+# `additionalProperties: false`. Nothing here is optional, so that costs us nothing.
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "events": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "event_type": {"type": "string", "enum": list(EVENT_TYPES)},
+                },
+                "required": ["title", "date", "event_type"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["events"],
+    "additionalProperties": False,
+}
 
 
 class LLMExtractor:
@@ -121,25 +147,42 @@ class LLMExtractor:
     def extract(self, pages: list[dict], today: date) -> list[dict]:
         from openai import OpenAI
 
+        # Pages with no body are skipped rather than headed — otherwise the "PAGE:"/"URL:"
+        # labels alone make the corpus non-empty and we pay for a call with nothing to read.
         corpus = "\n\n".join(
-            f"PAGE: {page.get('title', '')}\nURL: {page.get('url', '')}\n"
-            f"{str(page.get('content') or '')[:SNIPPET_CHARS]}"
+            f"PAGE: {page.get('title', '')}\nURL: {page.get('url', '')}\n{body[:SNIPPET_CHARS]}"
             for page in pages
+            if (body := str(page.get("content") or "").strip())
         )
-        if not corpus.strip():
+        if not corpus:
             return []
 
         client = wrap_openai(OpenAI(api_key=self.api_key))
         response = client.chat.completions.create(
             model=self.model,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "live_events",
+                    "strict": True,
+                    "schema": EXTRACTION_SCHEMA,
+                },
+            },
             temperature=0,
             messages=[
                 {"role": "system", "content": f"{EXTRACTION_PROMPT}\n\nToday is {today.isoformat()}."},
                 {"role": "user", "content": corpus},
             ],
         )
-        payload = json.loads(response.choices[0].message.content or "{}")
+        message = response.choices[0].message
+        # Structured outputs can come back as a refusal instead of content. Left unlogged it
+        # looks identical to "the search found nothing", which is the failure this change exists
+        # to stop hiding.
+        if getattr(message, "refusal", None):
+            log.warning("event extraction refused: %s", message.refusal)
+            return []
+
+        payload = json.loads(message.content or "{}")
         events = payload.get("events")
         return list(events) if isinstance(events, list) else []
 
