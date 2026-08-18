@@ -102,7 +102,11 @@ _TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_upcoming_events",
-            "description": "List the user's upcoming events, and whether each is already planned.",
+            "description": (
+                "List the user's upcoming events. Each carries a `status` of \"planned\" or "
+                "\"no plan yet\", and `without_a_plan` names the unplanned ones outright — use "
+                "that rather than working it out."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -766,7 +770,11 @@ class ChatOrchestrator:
         calendar_text = "\n".join(
             f"- event_id {event.id}: {event.title} — {event.date.isoformat()}, {event.event_type}"
             + (f", notes: {event.notes}" if event.notes else "")
-            + (" (already planned)" if event.planned else "")
+            # Both states named. Marking only the planned ones made "not planned" the ABSENCE
+            # of a marker, and absence is the easiest signal in the world to read backwards —
+            # which is exactly what happened: two planned events reported as unplanned and the
+            # one unplanned event reported as done.
+            + (" — PLANNED already" if event.planned else " — NO PLAN YET")
             for event in upcoming
         ) or "- nothing on the calendar yet"
 
@@ -975,10 +983,15 @@ class ChatOrchestrator:
                     "event_type": event.event_type,
                     "date": event.date.isoformat(),
                     "days_away": (event.date - today).days,
-                    "planned": event.planned,
+                    # Words, not a boolean. Answering "which have we NOT planned" from
+                    # `planned: false` means negating a flag; reading "no plan yet" does not.
+                    "status": "planned" if event.planned else "no plan yet",
                 }
                 for event in events
-            ]
+            ],
+            # The question this list gets asked most often, answered rather than left to be
+            # derived. The model got the flags right and the sentence backwards.
+            "without_a_plan": [event.title for event in events if not event.planned],
         }
 
     def _find_live_events(self, args: dict) -> dict:

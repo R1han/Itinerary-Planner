@@ -935,7 +935,14 @@ def test_a_planned_event_is_marked_as_such_in_the_prompt(db, orchestrator):
     db.commit()
 
     assert "Eid trip" in chat.system_prompt()
-    assert "already planned" in chat.system_prompt()
+    assert "PLANNED already" in chat.system_prompt()
+
+    # And the other state is marked too. Only marking the planned ones made "not planned" the
+    # absence of a marker, which is what got read backwards.
+    chat.call_tool("create_event", {"title": "Open day", "event_type": "other", "date": FUTURE})
+    db.commit()
+    line = next(l for l in chat.system_prompt().splitlines() if "Open day" in l)
+    assert line.endswith("NO PLAN YET"), line
 
 
 def test_the_prompt_tells_the_model_not_to_ask_for_a_date_it_already_has(db, orchestrator):
@@ -2284,3 +2291,28 @@ def test_the_warning_survives_the_turn_it_was_given_in(client, planned, db):
     db.commit()
 
     assert db.get(Conversation, chat.conversation.id).rebuild_warned is True
+
+
+def test_the_calendar_answers_which_events_have_no_plan(client, planned, db, orchestrator):
+    """The reported bug: two planned events reported as unplanned, and the unplanned one as done.
+
+    The flags were right — `Event.planned` is set on generate and the database agreed. The model
+    was handed three booleans and asked to negate them, and got the sentence backwards. So it is
+    handed words, and the negation it kept fumbling is done for it.
+    """
+    chat = orchestrator()
+    chat.call_tool("create_event", {"title": "Has a plan", "event_type": "eid", "date": FUTURE})
+    chat.call_tool("create_event", {"title": "Has none", "event_type": "other", "date": FUTURE})
+    db.commit()
+    db.query(Event).filter(Event.title == "Has a plan").update({"planned": True})
+    db.commit()
+
+    result = chat.call_tool("get_upcoming_events", {"horizon_days": 365})
+    by_title = {e["title"]: e for e in result["events"]}
+
+    assert by_title["Has a plan"]["status"] == "planned"
+    assert by_title["Has none"]["status"] == "no plan yet"
+    # No bare boolean left to invert.
+    assert "planned" not in by_title["Has none"]
+    # And the question is answered rather than left to be derived.
+    assert result["without_a_plan"] == ["Has none"]
