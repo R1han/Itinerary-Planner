@@ -1212,3 +1212,173 @@ def test_the_prompt_tells_the_model_to_swap_rather_than_remove(db, orchestrator)
     assert "action='replace'" in prompt
     assert "never remove it and hope" in prompt
     assert "add_stop" in prompt
+
+
+# --- the session is closed before the stream body runs ---------------------------------------------
+
+
+def test_the_plan_still_links_to_its_thread_after_the_session_is_closed(client, planned, db,
+                                                                        monkeypatch):
+    """The reported bug: a plan built in chat, and a right pane that comes up empty on reload.
+
+    FastAPI exits `yield` dependencies before the response body is sent, so by the time the SSE
+    generator runs, get_db has already closed the request session and every instance the
+    orchestrator was handed is detached. Writes to a detached instance are dropped silently:
+    messages kept inserting, `conversation.itinerary_id` never updated, and `updated_at` stayed
+    frozen at the moment the row was created.
+
+    The suite shares one session between client and fixtures, so this is closed explicitly —
+    otherwise the condition that broke production cannot arise here at all.
+    """
+    from app.models import Conversation, Itinerary, User
+    from app.services.orchestrator import ChatOrchestrator, sse
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id, title="New plan")
+    db.add(conversation)
+    db.commit()
+
+    chat = ChatOrchestrator(db, row, conversation)
+
+    def fake_llm(self, user_message: str):
+        del user_message
+        result = self.call_tool(
+            "generate_itinerary", {"days": 1, "budget": 4500, "start_date": FUTURE}
+        )
+        assert "error" not in result, result
+        self.record("assistant", "done")
+        self.db.commit()
+        yield sse("done", {"conversation_id": self.conversation.id})
+
+    monkeypatch.setattr(ChatOrchestrator, "_llm", fake_llm)
+
+    conversation_id = conversation.id
+    db.close()  # exactly what the dependency's `finally` does, before the body streams
+    list(chat.stream("plan it"))
+
+    db.expire_all()
+    linked = db.get(Conversation, conversation_id)
+    newest = db.query(Itinerary).order_by(Itinerary.id.desc()).first()
+    assert linked.itinerary_id == newest.id, "the plan belongs to no thread"
+
+
+def test_a_closed_session_still_advances_the_threads_timestamp(client, planned, db, monkeypatch):
+    """`updated_at` frozen at creation was the tell — every conversation UPDATE was being lost."""
+    from app.models import Conversation, User
+    from app.services.orchestrator import ChatOrchestrator, sse
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id, title="New plan")
+    db.add(conversation)
+    db.commit()
+    conversation_id, before = conversation.id, conversation.updated_at
+
+    monkeypatch.setattr(
+        ChatOrchestrator,
+        "_llm",
+        lambda self, m: iter([sse("done", {"conversation_id": self.conversation.id})]),
+    )
+    chat = ChatOrchestrator(db, row, conversation)
+    db.close()
+    list(chat.stream("hello"))
+
+    db.expire_all()
+    assert db.get(Conversation, conversation_id).updated_at > before
+
+
+# --- binding a plan to the right event ------------------------------------------------------------
+
+
+def test_the_calendar_in_the_prompt_carries_the_event_ids(db, orchestrator):
+    """Injecting the calendar without ids made event_id a guess.
+
+    The model could read "Milad un Nabi, 2026-08-21" off the prompt, pass that date correctly,
+    and still bind the plan to a different event because it had no id to quote.
+    """
+    chat = orchestrator()
+    chat.call_tool(
+        "create_event", {"title": "Milad un Nabi", "event_type": "eid", "date": FUTURE}
+    )
+    db.commit()
+    event = db.query(Event).filter(Event.title == "Milad un Nabi").one()
+
+    prompt = chat.system_prompt()
+    assert f"event_id {event.id}" in prompt, prompt[prompt.index("On their calendar:"):][:300]
+
+
+def test_an_event_id_that_contradicts_the_start_date_is_refused(db, orchestrator, planned):
+    """Right date, wrong id — exactly what happened. Saying so beats mislabelling the plan."""
+    from app.models import User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+
+    other = date.fromisoformat(FUTURE) + timedelta(days=1)
+    chat.call_tool(
+        {"title": "Graduation", "event_type": "graduation", "date": other.isoformat()}
+        and "create_event",
+        {"title": "Graduation", "event_type": "graduation", "date": other.isoformat()},
+    )
+    chat.call_tool("create_event", {"title": "Milad un Nabi", "event_type": "eid", "date": FUTURE})
+    db.commit()
+
+    graduation = db.query(Event).filter(Event.title == "Graduation").one()
+    milad = db.query(Event).filter(Event.title == "Milad un Nabi").one()
+
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 4000, "start_date": FUTURE, "event_id": graduation.id},
+    )
+
+    assert "error" in result, result
+    assert "Milad un Nabi" in result["error"], result["error"]
+    assert str(milad.id) in result["error"], result["error"]
+
+
+def test_an_event_id_matching_its_own_date_is_accepted(db, orchestrator, planned):
+    from app.models import Itinerary, User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    chat.call_tool("create_event", {"title": "Milad un Nabi", "event_type": "eid", "date": FUTURE})
+    db.commit()
+    milad = db.query(Event).filter(Event.title == "Milad un Nabi").one()
+
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 4000, "start_date": FUTURE, "event_id": milad.id},
+    )
+    assert "error" not in result, result
+    assert db.get(Itinerary, result["itinerary_id"]).title == "Milad un Nabi"
+
+
+def test_an_event_on_no_particular_date_is_left_alone(db, orchestrator, planned):
+    """A trip that starts a day after its event is legitimate; only a *contradiction* is refused."""
+    from app.models import User
+
+    _, _, plan = planned
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+
+    later = (date.fromisoformat(FUTURE) + timedelta(days=3)).isoformat()
+    chat.call_tool("create_event", {"title": "Cousins", "event_type": "family_visit", "date": FUTURE})
+    db.commit()
+    cousins = db.query(Event).filter(Event.title == "Cousins").one()
+
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 4000, "start_date": later, "event_id": cousins.id},
+    )
+    assert "error" not in result, result

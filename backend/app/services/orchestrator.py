@@ -530,8 +530,26 @@ class ChatOrchestrator:
         self.db = db
         self.user = user
         self.conversation = conversation
+        # Captured now, while the instances are certainly still usable. See `_rebind`.
+        self._user_id = user.id
+        self._conversation_id = conversation.id
         self.memory = MemoryService(db, user.id)
         self.touched_itinerary: Itinerary | None = None
+
+    def _rebind(self) -> None:
+        """Re-load the user and conversation from the session by id.
+
+        FastAPI exits `yield` dependencies *before* the response body is sent (>= 0.106), so by
+        the time this generator runs, `get_db`'s `finally: db.close()` has already fired and every
+        instance handed to __init__ is detached. The session itself still works — it simply opens
+        a new transaction — which is why this failed so quietly: `db.add(Message(...))` inserted
+        happily while `conversation.itinerary_id = x` was silently dropped on flush. The symptom
+        was a plan that existed but belonged to no thread, so the right pane came up empty.
+        """
+        self.user = self.db.get(User, self._user_id) or self.user
+        self.conversation = (
+            self.db.get(Conversation, self._conversation_id) or self.conversation
+        )
 
     # --- context -----------------------------------------------------------------------------
 
@@ -564,7 +582,7 @@ class ChatOrchestrator:
         dislikes = [p.subject for p in preferences if p.kind == "dislike"] or ["none recorded"]
         memory_text = "\n".join(f"- {item['text']}" for item in recalled) or "- nothing yet"
         calendar_text = "\n".join(
-            f"- {event.title} — {event.date.isoformat()}, {event.event_type}"
+            f"- event_id {event.id}: {event.title} — {event.date.isoformat()}, {event.event_type}"
             + (f", notes: {event.notes}" if event.notes else "")
             + (" (already planned)" if event.planned else "")
             for event in upcoming
@@ -604,8 +622,9 @@ class ChatOrchestrator:
             "scored for the youngest child in the family.\n\n"
             "Those calendar entries are facts you already have. If the user mentions one of them "
             "— by name or by occasion — use its date and its notes and never ask for a date you "
-            "have been given. get_upcoming_events is only for looking further ahead than the "
-            "list above.\n\n"
+            "have been given, and pass its event_id exactly as listed. Do not guess an id: the "
+            "plan is titled after the event you name, so the wrong one mislabels the whole trip. "
+            "get_upcoming_events is only for looking further ahead than the list above.\n\n"
             "Everything listed above is already on file — never ask the user to repeat it. Ask "
             "only for what is genuinely missing: usually just the budget and the dates, and an "
             "event's own date is a fine default start date. When you have enough, call "
@@ -797,6 +816,26 @@ class ChatOrchestrator:
             return {"error": "I still need the dates for the trip."}
         if start_date < date.today():
             return {"error": "That start date is in the past."}
+
+        # The reported bug: the model read the date off the calendar correctly and passed a
+        # different event's id, so a Milad un Nabi outing was built, titled and marked planned as
+        # a Graduation Ceremony. The date is what the user actually said out loud; when it names
+        # a different event, that is a contradiction rather than a preference.
+        if event is not None and event.date != start_date:
+            on_that_day = self.db.scalars(
+                select(Event).where(
+                    Event.user_id == self.user.id, Event.date == start_date
+                )
+            ).first()
+            if on_that_day is not None and on_that_day.id != event.id:
+                return {
+                    "error": (
+                        f"event_id {event.id} is {event.title!r} on {event.date.isoformat()}, but "
+                        f"you asked to start on {start_date.isoformat()}, which is "
+                        f"{on_that_day.title!r} (event_id {on_that_day.id}). Use that id, or a "
+                        f"start date that matches the event you meant."
+                    )
+                }
 
         days = int(_arg(args, "days", 3))
         if not 1 <= days <= 5:
@@ -1056,6 +1095,7 @@ class ChatOrchestrator:
 
     @traced("chat.stream", run_type="chain")
     def stream(self, user_message: str) -> Iterator[str]:
+        self._rebind()
         self.record("user", user_message)
         self.db.commit()
         # A failure here propagates to the router, which turns it into an `error` frame. The
