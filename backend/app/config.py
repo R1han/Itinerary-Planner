@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     langsmith_api_key: str | None = None
     langsmith_project: str = "rihla-itinerary-planner"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
-    langsmith_tracing: bool = True  # honoured only when an API key is present
+    langsmith_tracing: bool = True  
 
     # --- domain ------------------------------------------------------------------
     default_currency: str = "AED"
