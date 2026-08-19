@@ -22,7 +22,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="Rihla — UAE Event-Based Itinerary Planner",
+    title="Rihla",
     version="1.0.0",
     lifespan=lifespan,
 )
