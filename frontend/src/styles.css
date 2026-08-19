@@ -905,6 +905,20 @@ a:hover {
   background: var(--ink-28);
 }
 
+.composer__emirate {
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--ink-16);
+  background: var(--muted);
+  font-size: 12px;
+  outline: none;
+}
+
+.composer__emirate:focus {
+  border-color: var(--teal);
+}
+
 /* ============================================================ right pane */
 
 .rightpane {
