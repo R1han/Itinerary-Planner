@@ -1960,6 +1960,7 @@ class ChatOrchestrator:
                 messages=messages,
                 tools=TOOLS,
                 stream=True,
+                stream_options={"include_usage": True},
             )
 
             content = ""
@@ -2046,7 +2047,10 @@ class ChatOrchestrator:
             # empty bubble — the tool rows scrolled past and nothing explained them. Taking the
             # tools away is what makes this terminate: the model has no move left but to answer.
             for chunk in client.chat.completions.create(
-                model=settings.openai_chat_model, messages=messages, stream=True
+                model=settings.openai_chat_model,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True},
             ):
                 if chunk.choices and chunk.choices[0].delta.content:
                     answer += chunk.choices[0].delta.content
