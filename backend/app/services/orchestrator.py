@@ -200,9 +200,13 @@ _TOOL_DEFINITIONS = [
                     "max_price_adult": {
                         "type": "number",
                         "description": (
-                            "Most an adult ticket may cost, in AED. Use it whenever the user "
-                            "mentions a budget or asks for something cheap; 0 finds the free "
-                            "ones. Null means no ceiling."
+                            "Most ONE adult ticket may cost, in AED — not the party's, not the "
+                            "slot's. Filtering by the remaining budget itself finds places that "
+                            "still blow it the moment every adult and paying child is priced in, "
+                            "so when picking a replacement for a specific slot with a known "
+                            "budget left, divide that figure by party size first. Use it "
+                            "whenever the user mentions a budget or asks for something cheap; 0 "
+                            "finds the free ones. Null means no ceiling."
                         ),
                     },
                     "name": {
