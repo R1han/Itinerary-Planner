@@ -1145,6 +1145,8 @@ class ChatOrchestrator:
             "— by name or by occasion — use its date and its notes and never ask for a date you "
             "have been given, and pass its event_id exactly as listed. Do not guess an id: the "
             "plan is titled after the event you name, so the wrong one mislabels the whole trip. "
+            "Only pass the event_id if the date of the event and date specified in the user query matches"
+            "or else pass event_id as None. "
             "get_upcoming_events is only for looking further ahead than the list above.\n\n"
             "A plan is saved the moment it is built and again on every edit — there is no "
             "finalising, confirming or committing step, and nothing to call when the user says "
@@ -1167,7 +1169,7 @@ class ChatOrchestrator:
             "generate_itinerary; the server validates the checklist and will tell you if something "
             "is still missing, so prefer trying over interrogating. When an event is coming up and "
             "unplanned, offer to plan it. Keep replies short and concrete — the itinerary itself "
-            "is shown beside the chat."
+            "is shown beside the chat.\n\n"
         )
 
     def history(self) -> list[dict]:
