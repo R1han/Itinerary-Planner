@@ -1375,10 +1375,10 @@ def test_the_trace_says_swapping_not_removing(db):
     assert detail == "the park · for mall"
 
 
-def test_the_prompt_tells_the_model_to_swap_rather_than_remove(db, orchestrator):
+def test_the_prompt_tells_the_model_to_default_to_swap_but_allow_remove(db, orchestrator):
     prompt = orchestrator().system_prompt()
     assert "action='replace'" in prompt
-    assert "never remove it and hope" in prompt
+    assert "action='remove'" in prompt
     assert "add_stop" in prompt
 
 
