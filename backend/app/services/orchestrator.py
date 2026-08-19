@@ -489,15 +489,21 @@ _TOOL_DEFINITIONS = [
                             "Which stop to change, in the user's own words — the place's name "
                             "('Shakespeare and Co'), or what kind it is ('the shopping stop', "
                             "'the park'). The server matches it against the plan, so there is no "
-                            "id to look up and nothing to remember between messages."
+                            "id to look up and nothing to remember between messages. If the same "
+                            "place sits twice on one day (a lunch and a dinner there), day alone "
+                            "will NOT break the tie — include 'breakfast', 'lunch' or 'dinner' in "
+                            "this text too, whichever the user meant, e.g. 'Makani Al Ain dinner'."
                         ),
                     },
                     "day": {
                         "type": "integer",
                         "description": (
                             "1-based day number, when the user gave one ('day 4 dinner'). Narrows "
-                            "the match to that day — pass it whenever the user names a day, "
-                            "especially if a first attempt without it comes back ambiguous."
+                            "the match to that day — pass it whenever the user names a day. If a "
+                            "first attempt without it comes back ambiguous because the name shows "
+                            "up on more than one day, this alone resolves it; if it still comes "
+                            "back ambiguous, the duplicates are on the SAME day and only adding "
+                            "the meal word to `stop` (see above) will resolve it."
                         ),
                     },
                     "action": {"type": "string", "enum": ["remove", "adjust", "replace"]},
@@ -1040,8 +1046,12 @@ class ChatOrchestrator:
             "edit_stop with action='replace'; never remove it and hope; "
             "removing leaves the day one stop short. Name the stop the way the user did and edit_stop will "
             "find it; there are no ids to fetch or remember. If it comes back saying the name "
-            "matches more than one stop, retry the same call with day set — that alone resolves "
-            "it; never repeat the identical call expecting a different result. A replace that comes "
+            "matches more than one stop, retry with day set — that resolves it when the "
+            "duplicates are on different days. If it STILL comes back ambiguous, the same place "
+            "sits twice on that one day (e.g. lunch and dinner at the same restaurant); resolve "
+            "that by adding 'breakfast', 'lunch' or 'dinner' to the stop text itself, matching "
+            "what the user meant — day alone cannot tell those two apart. Never repeat the "
+            "identical call expecting a different result. A replace that comes "
             "back needing confirmation has already found something; what it needs is permission. "
             "window_overrun means the day would finish later than planned — say which place and "
             "when it ends. day_reorder means nothing of that kind is open at that stop's hour but "
