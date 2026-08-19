@@ -492,6 +492,14 @@ _TOOL_DEFINITIONS = [
                             "id to look up and nothing to remember between messages."
                         ),
                     },
+                    "day": {
+                        "type": "integer",
+                        "description": (
+                            "1-based day number, when the user gave one ('day 4 dinner'). Narrows "
+                            "the match to that day — pass it whenever the user names a day, "
+                            "especially if a first attempt without it comes back ambiguous."
+                        ),
+                    },
                     "action": {"type": "string", "enum": ["remove", "adjust", "replace"]},
                     "place": {
                         "type": "string",
@@ -1031,7 +1039,9 @@ class ChatOrchestrator:
             "whatever the server judges best, not the one they asked for. To swap one stop use "
             "edit_stop with action='replace'; never remove it and hope; "
             "removing leaves the day one stop short. Name the stop the way the user did and edit_stop will "
-            "find it; there are no ids to fetch or remember. A replace that comes "
+            "find it; there are no ids to fetch or remember. If it comes back saying the name "
+            "matches more than one stop, retry the same call with day set — that alone resolves "
+            "it; never repeat the identical call expecting a different result. A replace that comes "
             "back needing confirmation has already found something; what it needs is permission. "
             "window_overrun means the day would finish later than planned — say which place and "
             "when it ends. day_reorder means nothing of that kind is open at that stop's hour but "
@@ -1759,7 +1769,7 @@ class ChatOrchestrator:
         # description can only ever match a stop in the plan the conversation is about.
         try:
             slot = itinerary_service.find_stop(
-                self.db, itinerary, str(_arg(args, "stop", ""))
+                self.db, itinerary, str(_arg(args, "stop", "")), day=args.get("day")
             )
         except ValueError as exc:
             return {"error": str(exc)}

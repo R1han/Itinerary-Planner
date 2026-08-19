@@ -2054,6 +2054,43 @@ def test_an_ambiguous_description_asks_rather_than_guesses(client, planned, db):
         find_stop(db, itinerary, doubled.replace("_", " "))
 
 
+def test_a_repeated_name_on_one_day_is_told_apart_by_day_and_meal(client, planned, db):
+    """The same place can sit twice on one day — a lunch and a dinner at the same restaurant.
+
+    A bare name, even with the day given, is genuinely ambiguous between the two. But "day 4
+    dinner" is what the user actually says, and it has to land on the later of the two rather
+    than loop forever asking a question it already has the answer to.
+    """
+    from app.models import Itinerary, Slot
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    day0 = (
+        db.query(Slot)
+        .filter(Slot.itinerary_id == itinerary.id, Slot.day_index == 0)
+        .order_by(Slot.position)
+        .all()
+    )
+    original = day0[0]
+
+    duplicate = Slot(
+        itinerary_id=itinerary.id, day_index=0, position=max(s.position for s in day0) + 1,
+        place_id=original.place_id, start_time="23:59", end_time="23:59",
+    )
+    db.add(duplicate)
+    db.commit()
+
+    with pytest.raises(ValueError, match="more than one stop"):
+        find_stop(db, itinerary, original.place.name)
+
+    with pytest.raises(ValueError, match="more than one stop"):
+        find_stop(db, itinerary, original.place.name, day=1)
+
+    found = find_stop(db, itinerary, f"{original.place.name} dinner", day=1)
+    assert found.id == duplicate.id
+
+
 def test_an_empty_description_is_an_omission_not_a_match(client, planned, db):
     """Every stop contains the empty string, so this read as ambiguity instead of a mistake."""
     from app.models import Itinerary

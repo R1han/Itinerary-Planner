@@ -796,13 +796,16 @@ def _placements_in_day(
 _CATEGORY_WORDS = {"shopping": "mall", "restaurant": "dining", "food": "dining", "leisure": "park"}
 
 
-def find_stop(db: Session, itinerary: Itinerary, description: str) -> Slot:
+def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int | None = None) -> Slot:
     """Which stop the user meant, from the words they used for it.
 
     The chat has no slot ids to offer — they exist only in the database, so a model that has not
     just read the plan can only invent one, and did. It has the user's own phrasing instead
     ("the shopping stop", "Shakespeare and Co", "the park at the end"), which is the thing the
     server can actually resolve, because the conversation already says which plan is meant.
+
+    `day` (1-based) scopes the search to one day, for when the same place name shows up more than
+    once in the plan — "day 4 dinner" is unambiguous even when "dinner" alone is not.
 
     Raises with the plan's real contents listed, so a miss is answerable without another lookup.
     """
@@ -814,6 +817,12 @@ def find_stop(db: Session, itinerary: Itinerary, description: str) -> Slot:
     )
     if not slots:
         raise ValueError("This plan has no stops in it yet.")
+
+    if day is not None:
+        scoped = [s for s in slots if s.day_index == day - 1]
+        if not scoped:
+            raise ValueError(f"Day {day} has no stops.")
+        slots = scoped
 
     text = " ".join(description.lower().split())
     if not text:
@@ -839,10 +848,19 @@ def find_stop(db: Session, itinerary: Itinerary, description: str) -> Slot:
         if len(match) == 1:
             return match[0]
         if match:
+            # The same place can sit twice on one day (a lunch and a dinner at the same
+            # restaurant) — a name or category match alone can't tell those apart, but "dinner"
+            # in the user's own words can: it's the later of the two.
+            if "breakfast" in text:
+                return min(match, key=lambda s: s.start_time)
+            if "dinner" in text:
+                return max(match, key=lambda s: s.start_time)
             raise ValueError(
                 f"{description!r} matches more than one stop — "
-                + "; ".join(f"{s.place.name} on day {s.day_index + 1}" for s in match)
-                + ". Say which one."
+                + "; ".join(
+                    f"{s.place.name} at {s.start_time} on day {s.day_index + 1}" for s in match
+                )
+                + ". Say which one, or which day."
             )
 
     raise ValueError(f"This plan has no stop like {description!r}. It has: {listing()}.")
