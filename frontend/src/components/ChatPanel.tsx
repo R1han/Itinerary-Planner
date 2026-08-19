@@ -370,39 +370,21 @@ export function ChatPanel() {
 
         {notice && <div className="notice-text">{notice}</div>}
 
+        {/*
+          This used to be an assistant-styled bubble reading "Here's an N-day plan, budget ..."
+          with the totals under it, rendered from client state after every turn a plan existed.
+          Nobody said it. It appeared over a reply that had just explained the change did NOT go
+          through, and it is the same bug the server now checks for — a change claimed in chat
+          that nothing performed — reproduced where no server-side check can see it.
+
+          The chips stay: they are navigation, not a claim about what happened. What went is the
+          prose and the avatar that made derived numbers look like something the assistant said.
+        */}
         {itinerary && !streaming && (
-          <>
-            <div className="msg">
-              <div className="msg__avatar">
-                <Sparkle size={13} />
-              </div>
-              <div className="bubble bubble--assistant">
-                <p>
-                  Here&apos;s a {itinerary.days.length}-day plan, budget{' '}
-                  <strong>
-                    {itinerary.currency} {itinerary.budget.cap.toLocaleString()}
-                  </strong>
-                  .
-                </p>
-                <DayChips />
-                <p className="summary-note">
-                  Estimated total is{' '}
-                  <strong>
-                    {itinerary.currency} {Math.round(itinerary.budget.total).toLocaleString()}
-                  </strong>{' '}
-                  —{' '}
-                  {itinerary.budget.over_budget
-                    ? `${itinerary.currency} ${Math.abs(
-                        Math.round(itinerary.budget.remaining),
-                      ).toLocaleString()} over.`
-                    : `${itinerary.currency} ${Math.round(
-                        itinerary.budget.remaining,
-                      ).toLocaleString()} under.`}
-                </p>
-              </div>
-            </div>
+          <div className="plan-affordances" aria-label="Plan shortcuts">
+            <DayChips />
             <SuggestionChips />
-          </>
+          </div>
         )}
       </div>
 

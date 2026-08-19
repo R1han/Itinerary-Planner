@@ -1987,6 +1987,23 @@ def _chunk(content=None, tool=None):
     return type("Chunk", (), {"choices": [choice]})()
 
 
+def _spoken(frames: str) -> str:
+    """The prose the user actually saw, reassembled from the `token` frames.
+
+    The reply is held back until it has been checked and then replayed in chunks, so it arrives
+    as several frames and a substring search over the raw stream can land in the JSON between
+    two of them.
+    """
+    text = ""
+    for line in frames.splitlines():
+        if not line.startswith("data: "):
+            continue
+        frame = json.loads(line[len("data: "):])
+        if frame.get("type") == "token":
+            text += frame["data"]
+    return text
+
+
 def test_a_turn_that_spends_every_round_on_tools_still_answers(client, planned, db, monkeypatch):
     """The reported bug: three assistant messages saved as an empty string.
 
@@ -2008,11 +2025,19 @@ def test_a_turn_that_spends_every_round_on_tools_still_answers(client, planned, 
 
     frames = "".join(chat.stream("what does the plan look like?"))
 
-    assert "Here is where things stand." in frames
+    assert "Here is where things stand." in _spoken(frames)
     saved = [m for m in _messages(db, chat) if m.role == "assistant"][-1]
     assert saved.content, "an empty bubble is what the user actually saw"
-    # The rescue round must not hand the tools back, or it can loop forever.
-    assert "tools" not in fake.calls[-1]
+
+    # The last round must not be able to act, or the turn can loop forever. It is pinned rather
+    # than stripped: taking the tools away left the model able to describe an action and unable to
+    # take one, which is how a turn that ran out of rounds ended up narrating an edit it never
+    # made. It can still see what exists, and it is told to report the trace and claim no more.
+    last = fake.calls[-1]
+    assert last["tool_choice"] == "none"
+    assert "tools" in last, "the model should still know what it could have called"
+    assert any(orch_msg["role"] == "system" and "every tool round" in orch_msg["content"]
+               for orch_msg in last["messages"])
 
 
 def _messages(db, chat):

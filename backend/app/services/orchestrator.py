@@ -2268,120 +2268,15 @@ class ChatOrchestrator:
         yield from self._llm(user_message)
 
     def _llm(self, user_message: str) -> Iterator[str]:
-        from openai import OpenAI
+        """The turn itself, which lives in turn.py.
 
-        client = wrap_openai(OpenAI(api_key=settings.openai_api_key))
-        messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt(user_message)},
-            *self.history(),
-        ]
+        Kept as a one-line delegate rather than folded away: this is the seam the whole test suite
+        stubs the model at, and moving it would have meant editing every one of those tests during
+        the change most likely to need them honest.
+        """
+        from .turn import run_turn
 
-        answer = ""
-        for _ in range(MAX_TOOL_ROUNDS):
-            stream = client.chat.completions.create(
-                model=settings.openai_chat_model,
-                messages=messages,
-                tools=TOOLS,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-
-            content = ""
-            pending: dict[int, dict] = {}
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-
-                if delta.content:
-                    content += delta.content
-                    yield sse("token", delta.content)
-
-                for call in delta.tool_calls or []:
-                    slot = pending.setdefault(
-                        call.index, {"id": "", "name": "", "arguments": ""}
-                    )
-                    if call.id:
-                        slot["id"] = call.id
-                    if call.function and call.function.name:
-                        slot["name"] = call.function.name
-                    if call.function and call.function.arguments:
-                        slot["arguments"] += call.function.arguments
-
-            if not pending:
-                answer = content
-                break
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [
-                        {
-                            "id": call["id"],
-                            "type": "function",
-                            "function": {"name": call["name"], "arguments": call["arguments"] or "{}"},
-                        }
-                        for call in pending.values()
-                    ],
-                }
-            )
-
-            for call in pending.values():
-                try:
-                    arguments = json.loads(call["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                label, detail = describe_tool_call(call["name"], arguments)
-                yield sse(
-                    "tool",
-                    {"id": call["id"], "name": call["name"], "label": label, "detail": detail},
-                )
-
-                result = self.call_tool(call["name"], arguments)
-                self.db.commit()
-
-                yield sse(
-                    "tool_done",
-                    {
-                        "id": call["id"],
-                        "outcome": summarise_tool_result(call["name"], result),
-                        "failed": bool(isinstance(result, dict) and result.get("error")),
-                    },
-                )
-
-                # Surface a blocked intake to the client as well as to the model, so the chat can
-                # render the numbered checklist from the design. The model will also ask in prose;
-                # the checklist makes what is missing scannable.
-                if isinstance(result, dict) and result.get("error") == "intake_incomplete":
-                    yield sse("intake_required", {"missing_fields": result.get("missing_fields", [])})
-
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": json.dumps(result, default=str),
-                    }
-                )
-                yield from self._emit_updates()
-
-        if not answer:
-            # Every round went on tool calls, so the loop ran out mid-work and the user got an
-            # empty bubble — the tool rows scrolled past and nothing explained them. Taking the
-            # tools away is what makes this terminate: the model has no move left but to answer.
-            for chunk in client.chat.completions.create(
-                model=settings.openai_chat_model,
-                messages=messages,
-                stream=True,
-                stream_options={"include_usage": True},
-            ):
-                if chunk.choices and chunk.choices[0].delta.content:
-                    answer += chunk.choices[0].delta.content
-                    yield sse("token", chunk.choices[0].delta.content)
-
-        self.record("assistant", answer)
-        self.db.commit()
-        yield sse("done", {"conversation_id": self.conversation.id})
+        yield from run_turn(self, user_message)
 
     def _emit_updates(self) -> Iterator[str]:
         """Push the right pane's new state as soon as a tool changed it."""

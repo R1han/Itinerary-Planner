@@ -703,6 +703,14 @@ a:hover {
   flex: none;
 }
 
+/* The day and suggestion chips, once the fabricated "Here's an N-day plan" bubble around them
+ * was removed. Indented to the message column (28px avatar + 11px gap) so they still line up
+ * with the conversation, but deliberately not styled as a bubble: they are navigation, not
+ * something the assistant said. */
+.plan-affordances {
+  margin-left: 39px;
+}
+
 .day-chips {
   display: flex;
   flex-wrap: wrap;
@@ -736,18 +744,6 @@ a:hover {
 .day-chip--4 {
   background: var(--rail-idle);
   color: var(--ink-6);
-}
-
-.summary-note {
-  margin: 10px 0 0;
-  font-size: 13.5px;
-  line-height: 1.55;
-  color: var(--ink-72);
-}
-
-.summary-note strong {
-  font-weight: 600;
-  color: var(--ink);
 }
 
 /* The assistant's activity trace: one row per tool call. Deliberately quiet — it is context for
