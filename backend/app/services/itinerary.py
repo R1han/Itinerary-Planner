@@ -821,7 +821,15 @@ def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int |
     if day is not None:
         scoped = [s for s in slots if s.day_index == day - 1]
         if not scoped:
-            raise ValueError(f"Day {day} has no stops.")
+            # A wrong guess here used to read as "the plan has no stops at all" and send the
+            # model straight for a rebuild. Naming the days that DO have stops lets it retry
+            # with the right one (or drop `day` outright) instead of concluding there's nothing
+            # to edit.
+            real_days = sorted({s.day_index + 1 for s in slots})
+            raise ValueError(
+                f"Day {day} has no stops. This plan's stops are on day(s) {real_days} — "
+                "retry with one of those, or drop `day` and let the stop's name resolve it."
+            )
         slots = scoped
 
     text = " ".join(description.lower().split())

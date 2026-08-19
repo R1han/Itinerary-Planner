@@ -1125,7 +1125,7 @@ class ChatOrchestrator:
             "`emirates`, unless the rest of the message names a different one.\n\n"
             "The family listed above is who a plan is priced for by default. When anyone else "
             "is coming, pass `party_size` — the TOTAL number of people, exactly as the user "
-            "said it. 'Seven of us' is party_size 7; never subtract the family yourself. Add "
+            "said it. 'Seven of us' is party_size 7; 'two of us' is party_size 2. Add "
             "`guests` as well only when one of the extras is a child, so their age reaches the "
             "ticket bands. Party size decides the vehicle, the fares and every ticket, so never "
             "just acknowledge a headcount in prose and plan without passing it.\n\n"
@@ -1514,6 +1514,13 @@ class ChatOrchestrator:
         # own carve-out ("or agreed to start over") is exactly what a reply like "sure, I can
         # sacrifice some budget" reads as. Only the conversation's *own* plan is protected: a new
         # thread still plans freely even though the user has older plans elsewhere.
+        #
+        # A second reported bug, same root cause: shown a list of cheaper restaurants and told
+        # "choose Beirut Restaurant", the model reached for this tool instead of edit_stop. This
+        # tool has no `place` argument at all, so the named choice had nowhere to go — the
+        # rebuild silently re-solved the day and landed on whatever the optimiser picked instead
+        # of what the user asked for. The refusal below now says so explicitly, at the exact
+        # point the model is about to make that choice.
         if current is not None and current.id == self.conversation.itinerary_id:
             # `replace_existing` alone is not permission. Setting it is free, and the model set
             # it on its first attempt — "let us finalize it" became a rebuild that threw away
@@ -1532,8 +1539,13 @@ class ChatOrchestrator:
                         "Adding, removing or swapping a single stop is add_stop or edit_stop, "
                         "never this. Nothing else needs this tool: a plan is saved as it is "
                         "built and edited, so there is no finalising, confirming or committing "
-                        "to do. If the user genuinely wants to start over, tell them the current "
-                        "plan will be discarded, and ask. Their ANSWER is what unlocks this."
+                        "to do. If the user is choosing one specific place out of options you "
+                        "listed ('choose Beirut Restaurant') that is edit_stop with "
+                        "place='Beirut Restaurant', never this tool — this tool has no `place` "
+                        "argument, so a named choice made through it is silently dropped and "
+                        "the solver picks whatever it likes instead. If the user genuinely wants "
+                        "to start over, tell them the current plan will be discarded, and ask. "
+                        "Their ANSWER is what unlocks this."
                     )
                 }
             if not warned_before_this_turn:
