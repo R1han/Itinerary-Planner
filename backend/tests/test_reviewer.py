@@ -198,3 +198,50 @@ def test_every_verdict_the_schema_allows_round_trips(verdict):
 def test_the_default_verdict_is_ok():
     assert Verdict().is_ok
     assert Verdict().unsupported_claims == []
+
+
+def test_a_whole_plan_result_reaches_the_reviewer_intact():
+    """Live validation caught this: at 400 characters the trace stopped inside day two of a
+    three-day plan, the reviewer reported day three as unsupported — correctly, from what it
+    could see — and the assistant deleted a real day from its reply. A limit set too low does not
+    make the reviewer blind, it makes it confidently wrong."""
+    plan = {
+        "itinerary_id": 1,
+        "start_date": "2026-12-10",
+        "days": [
+            {
+                "day": day,
+                "date": f"2026-12-{9 + day}",
+                "theme": "Adventure & Wildlife",
+                "subtotal": 1688.74,
+                "stops": ["Abu Dhabi Falcon Hospital", "Emirates Park Zoo", "Al Khatim Desert Safari"],
+            }
+            for day in (1, 2, 3)
+        ],
+        "total": 4377.97, "cap": 6000.0, "remaining": 1622.03,
+        "transport_mode": "taxi", "vehicle": "one vehicle", "party_size": 3,
+        "emirates": ["Abu Dhabi"], "travel": {"total": 288.7},
+    }
+    rendered = render_trace([
+        {"name": "generate_itinerary", "args": {"days": 3}, "applied": True, "result": plan}
+    ])
+
+    assert "truncated" not in rendered, "a plan must not be cut off before the reviewer sees it"
+    for day in (1, 2, 3):
+        assert f'"day": {day}' in rendered, f"day {day} never reached the reviewer"
+
+
+def test_a_five_day_plan_also_fits():
+    plan = {
+        "days": [
+            {"day": d, "date": f"2026-12-{9 + d}", "theme": "Theme Park & Adventure",
+             "subtotal": 1873.75,
+             "stops": ["SeaWorld Abu Dhabi", "Yas Kartzone", "Yas Marina Waterfront Cafe"]}
+            for d in range(1, 6)
+        ],
+        "total": 9000.0, "cap": 9000.0, "emirates": ["Abu Dhabi"],
+    }
+    rendered = render_trace([
+        {"name": "replace_plan", "args": {}, "applied": True, "result": plan}
+    ])
+    assert "truncated" not in rendered

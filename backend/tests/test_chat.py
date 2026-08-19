@@ -2813,6 +2813,20 @@ def _dubai_day(db, planned, days: int = 2):
     return chat
 
 
+def _remember_turn(chat, name, args, result, *, applied=False):
+    """End a turn the way the loop does, so the next one inherits what was asked.
+
+    A question only counts as put once it is on the record — which is what stops the model
+    granting itself an answer by passing the argument.
+    """
+    from app.services.orchestrator import persisted_trace
+
+    chat.record("assistant", "I put that to you.", tool_calls=persisted_trace(
+        [{"name": name, "args": args, "applied": applied, "result": result}]
+    ))
+    chat.db.commit()
+
+
 def test_moving_the_starting_point_keeps_the_trip_where_it_is(client, planned, db):
     """The reported bug, first half: "we live in Abu Dhabi" was answered by claiming the whole
     plan had moved to Abu Dhabi, twice, while returning the identical Dubai itinerary.
@@ -2844,6 +2858,14 @@ def test_only_replace_plan_can_move_the_region(client, planned, db):
     chat = _dubai_day(db, planned)
     before = chat.call_tool("get_itinerary", {})
     itinerary_id = before["itinerary_id"]
+
+    # Replacing throws away every stop, so it asks once before it does.
+    asked = chat.call_tool("replace_plan", {"emirates": ["Abu Dhabi"]})
+    assert asked["applied"] is False
+    assert asked["needs_confirmation"] == "plan_replacement"
+    assert asked["plan_is_unchanged"], "the plan as it stands travels with the question"
+
+    _remember_turn(chat, "replace_plan", {"emirates": ["Abu Dhabi"]}, asked)
 
     moved = chat.call_tool("replace_plan", {"emirates": ["Abu Dhabi"]})
 
@@ -2878,6 +2900,14 @@ def test_dropping_a_middle_day_asks_before_it_moves_anything(client, planned, db
     assert asked["plan_is_unchanged"] == [s["name"] for d in before["days"] for s in d["stops"]]
     assert chat.touched_itinerary is None, "a question must not nudge the right pane"
     assert chat.call_tool("get_itinerary", {})["num_days"] == 3
+
+    # Passing the argument is not the same as the user having answered. Live validation caught
+    # the model calling drop_day(day=2, shift_later_days=False) unprompted — inventing an answer
+    # to the one question the tool exists to ask.
+    guessed = chat.call_tool("drop_day", {"day": 2, "shift_later_days": False})
+    assert guessed["needs_confirmation"] == "day_shift_choice", "the model answered for the user"
+
+    _remember_turn(chat, "drop_day", {"day": 2}, asked)
 
     answered = chat.call_tool("drop_day", {"day": 2, "shift_later_days": True})
     assert "error" not in answered, answered
@@ -2973,8 +3003,12 @@ def test_no_other_tool_is_intercepted(client, planned, db):
 
     chat = _dubai_day(db, planned)
     for name in ("get_itinerary", "find_places", "edit_stop", "set_origin", "drop_day",
-                 "replace_plan", "reschedule_itinerary", "record_preference"):
+                 "reschedule_itinerary", "record_preference", "add_stop", "make_day_cheaper"):
         assert policy.intercept(chat, name, {}) is None, name
+
+    # The two that are: both throw away work the user approved.
+    assert policy.intercept(chat, "generate_itinerary", {}) is not None
+    assert policy.intercept(chat, "replace_plan", {}) is not None
 
 
 # --- the trace survives the turn ---------------------------------------------------------------
@@ -3086,3 +3120,42 @@ def test_a_real_turn_stores_what_it_called(client, planned, db, monkeypatch):
     called = saved.tool_calls_json["calls"]
     assert [c["name"] for c in called] == ["get_itinerary"]
     assert called[0]["applied"] is False, "reading the plan is not changing it"
+
+
+def test_a_turn_that_came_back_asking_is_not_second_guessed(client, planned, db, monkeypatch):
+    """A confirmation turn has one right reply — the question. Live validation showed what asking
+    a reviewer anyway costs: it answered `needs_tools` ("read the plan before summarising it"),
+    and the rewrite came back as a tidy summary of the unchanged plan with the question gone.
+    Safe, and useless — the user waits on an answer nobody asked them for."""
+    from app.services import reviewer as rev
+    from app.services.turn import _check
+
+    consulted = []
+    monkeypatch.setattr(rev, "review", lambda *a, **k: consulted.append(a) or rev.Verdict())
+
+    trace = [{
+        "name": "drop_day", "args": {"day": 2}, "applied": False,
+        "result": {"applied": False, "needs_confirmation": "day_shift_choice",
+                   "question_for_the_user": "shift the later days, or leave day 2 free?"},
+    }]
+    verdict = _check("drop day 2", trace, "Shall I shift the later days earlier, or leave it free?")
+
+    assert verdict.is_ok
+    assert consulted == [], "the reviewer was asked to weigh in on a question"
+
+
+def test_a_confirmation_that_also_lies_is_still_caught(client, planned, db, monkeypatch):
+    """The skip above is only safe because claim_check runs first."""
+    from app.services import reviewer as rev
+    from app.services.turn import _check
+
+    consulted = []
+    monkeypatch.setattr(rev, "review", lambda *a, **k: consulted.append(a) or rev.Verdict())
+
+    trace = [{
+        "name": "drop_day", "args": {"day": 2}, "applied": False,
+        "result": {"applied": False, "needs_confirmation": "day_shift_choice"},
+    }]
+    _check("drop day 2", trace, "I have removed day 2 for you.")
+
+    assert consulted, "a claim with nothing applied must still reach the reviewer"

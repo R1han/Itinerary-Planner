@@ -36,9 +36,18 @@ from .tracing import traced, wrap_openai
 
 log = logging.getLogger(__name__)
 
-# Long enough to carry an error message, a `question_for_the_user`, or a day's stop names; short
-# enough that fourteen of them plus a draft stay a small prompt.
-RESULT_CHARS = 400
+# Must comfortably hold a WHOLE plan result, which is the largest thing a tool returns and the
+# one the reviewer is most often asked about.
+#
+# This was 400, and live validation showed exactly why that is not a detail. A three-day plan
+# serialises to ~760 characters, so the trace the reviewer saw stopped inside day two. It then
+# reported — correctly, from what it could see — that day three was unsupported, and the assistant
+# dutifully deleted a real day from its reply. A truncation limit set too low does not make the
+# reviewer blind, it makes it confidently wrong, and the loop turns that into lost information.
+#
+# A five-day plan is around 1,200. This leaves room and still keeps a fourteen-call turn inside a
+# few thousand tokens.
+RESULT_CHARS = 2000
 
 OK = "ok"
 NEEDS_TOOLS = "needs_tools"

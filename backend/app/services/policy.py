@@ -146,6 +146,15 @@ CONSENT_DOES_NOT_GRANT_ITSELF = (
 )
 
 
+REPLACING_LOSES_THE_STOPS = (
+    "Replacing this plan re-solves it from scratch. Every stop goes, and so does every edit the "
+    "user has approved — only the dates, the budget and the party carry over. Tell them that in "
+    "plain words, name what they are about to lose, and ask. Their answer is what unlocks this. "
+    "If they only want the trip to set off from somewhere else, that is set_origin and it keeps "
+    "the whole plan."
+)
+
+
 def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
     """Refuse a call that must not happen, or None to let it through.
 
@@ -154,7 +163,85 @@ def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
     """
     if name == "generate_itinerary":
         return _rebuild_is_not_an_edit(orchestrator, args)
+    if name == "replace_plan":
+        return _replacing_needs_the_users_word(orchestrator, args)
+    if name == "drop_day":
+        _shift_is_not_ours_to_choose(orchestrator, args)
     return None
+
+
+def asked_before(orchestrator: Any, kind: str) -> bool:
+    """Did the assistant already put this question to the user, in an earlier turn?
+
+    Read from the persisted trace rather than taken on the model's word, for the same reason
+    `replace_existing` does not grant itself: setting an argument is free, and a model with a
+    blank to fill will fill it. The last assistant row is necessarily from a previous turn,
+    because this turn's reply has not been recorded yet.
+    """
+    from ..models import Message
+
+    row = (
+        orchestrator.db.query(Message)
+        .filter(
+            Message.conversation_id == orchestrator.conversation.id,
+            Message.role == "assistant",
+        )
+        .order_by(Message.id.desc())
+        .first()
+    )
+    if row is None:
+        return False
+    for call in (row.tool_calls_json or {}).get("calls") or []:
+        if (call.get("result") or {}).get("needs_confirmation") == kind:
+            return True
+    return False
+
+
+def _replacing_needs_the_users_word(orchestrator: Any, args: dict) -> dict | None:
+    """Ask once before throwing away every stop in the plan.
+
+    Live validation is what put this here. "Change the location of the plan to Abu Dhabi" went
+    straight through: the region moved, which is what the user asked for, and every edit they had
+    made went with it without anyone mentioning that it would. The tool description said to ask
+    first, and a description is advice.
+    """
+    current = orchestrator._resolve_itinerary()
+    if current is None:
+        return {
+            "error": (
+                "There is no plan in this conversation to replace. Build one with "
+                "generate_itinerary."
+            )
+        }
+    if asked_before(orchestrator, "plan_replacement"):
+        return None
+
+    emirates = [e for e in (args.get("emirates") or []) if e]
+    return orchestrator._unapplied(
+        current,
+        "plan_replacement",
+        ValueError(REPLACING_LOSES_THE_STOPS),
+        proposed_emirates=emirates or None,
+    )
+
+
+def _shift_is_not_ours_to_choose(orchestrator: Any, args: dict) -> None:
+    """Make `drop_day` put its question, rather than answer it on the user's behalf.
+
+    Also from live validation. Told "Drop day 2", the model called
+    `drop_day(day=2, shift_later_days=False)` — inventing an answer to the one question the tool
+    exists to ask, and leaving a silent gap in the middle of the trip. The handler only asks when
+    the argument is absent, so the argument is removed unless the question has actually been put.
+
+    Mutates `args` rather than returning a refusal, deliberately: what should happen next is the
+    handler raising DayShiftChoiceRequired, which is already shaped so a question cannot be read
+    as an answer.
+    """
+    if args.get("shift_later_days") is None:
+        return
+    if asked_before(orchestrator, "day_shift_choice"):
+        return
+    args["shift_later_days"] = None
 
 
 def _rebuild_is_not_an_edit(orchestrator: Any, args: dict) -> dict | None:

@@ -216,6 +216,18 @@ def _check(user_message: str, trace: list[dict], draft: str) -> reviewer.Verdict
     if not flagged and not mutated:
         return reviewer.Verdict()
 
+    # A turn that came back asking has exactly one right reply — the question — and there is
+    # nothing left for a judgement to add once claim_check has passed. Live validation showed the
+    # cost of asking anyway: told "change the location of the plan", the assistant drafted the
+    # confirmation, the reviewer answered `needs_tools` ("read the plan before summarising it"),
+    # and the rewrite came back as a tidy summary of the unchanged plan with the question gone.
+    # Safe, and useless — the user is left waiting on an answer nobody asked them for.
+    if not flagged and not any(entry["applied"] for entry in trace) and any(
+        isinstance(entry.get("result"), dict) and entry["result"].get("needs_confirmation")
+        for entry in trace
+    ):
+        return reviewer.Verdict()
+
     if flagged:
         log.info("claim_check flagged %d sentence(s) with nothing applied", len(flagged))
     return reviewer.review(user_message, trace, draft)
