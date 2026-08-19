@@ -54,10 +54,11 @@ log = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 6
 HISTORY_LIMIT = 20
 
-# The frontend folds the "starting emirate" dropdown into the message text so the model's own
-# tool-call reasoning can pick it up (see ChatPanel.tsx) — strip it back out before persisting so
-# saved/replayed history reads like what the user actually typed.
-_STARTING_EMIRATE_PREFIX = re.compile(r"^\[Starting emirate: [^\]]*\]\s*")
+# The frontend folds the "starting emirate" dropdown into the message text (see ChatPanel.tsx) so
+# it travels with the message; captured here as a deterministic hint rather than left for the
+# model to translate, and stripped back out before persisting so saved/replayed history reads
+# like what the user actually typed.
+_STARTING_EMIRATE_PREFIX = re.compile(r"^\[Starting emirate: ([^\]]*)\]\s*")
 
 EVENT_TYPES = ["birthday", "anniversary", "family_visit", "graduation", "eid", "holiday", "other"]
 
@@ -972,6 +973,10 @@ class ChatOrchestrator:
         # Whether the warning predates this turn. Snapshotted because the guard itself sets the
         # flag, and a value it just wrote is not evidence the user has answered.
         self.warned_at_turn_start = bool(getattr(conversation, "rebuild_warned", False))
+        # Set fresh each turn in `stream()`. A `[Starting emirate: ...]` prefix is a deterministic
+        # signal from the UI dropdown, not prose for the model to reinterpret — relying on the
+        # model to translate it into the `emirates` tool arg proved unreliable in practice.
+        self.starting_emirate_hint: str | None = None
 
     def _rebind(self) -> None:
         """Re-load the user and conversation from the session by id.
@@ -1110,7 +1115,10 @@ class ChatOrchestrator:
             "the seven emirates are valid, so map a city to the emirate containing it: Al Ain "
             "and Liwa are Abu Dhabi, Khor Fakkan is Sharjah. Leaving it empty draws from the "
             "whole country, and the catalog is densest in Dubai, so an unset region quietly "
-            "returns a Dubai trip no matter what the user asked for.\n\n"
+            "returns a Dubai trip no matter what the user asked for. A message may open with "
+            "`[Starting emirate: <emirate>]` — that's the emirate picked in the UI dropdown, not "
+            "idle context. Treat it exactly like the user naming that place and pass it as "
+            "`emirates`, unless the rest of the message names a different one.\n\n"
             "The family listed above is who a plan is priced for by default. When anyone else "
             "is coming, pass `party_size` — the TOTAL number of people, exactly as the user "
             "said it. 'Seven of us' is party_size 7; never subtract the family yourself. Add "
@@ -1535,6 +1543,8 @@ class ChatOrchestrator:
                 }
 
         emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
+        if not emirates and self.starting_emirate_hint in EMIRATES:
+            emirates = [self.starting_emirate_hint]
         if not emirates and current is not None:
             emirates = current.emirates_json or []
 
@@ -1922,6 +1932,8 @@ class ChatOrchestrator:
         self._rebind()
         self.rebuild_refused = False
         self.warned_at_turn_start = bool(self.conversation.rebuild_warned)
+        match = _STARTING_EMIRATE_PREFIX.match(user_message)
+        self.starting_emirate_hint = match.group(1).strip() if match else None
         self.record("user", _STARTING_EMIRATE_PREFIX.sub("", user_message, count=1))
         self.db.commit()
         # A failure here propagates to the router, which turns it into an `error` frame. The
