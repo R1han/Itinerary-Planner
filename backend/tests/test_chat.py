@@ -90,6 +90,13 @@ def test_the_spec_tools_are_all_exposed():
     # is asked to change plans it has no way to change — and answers by describing edits it never
     # made; and find_places, without which the catalog is unreachable and "what is there to see
     # in the UAE" is answered from the model's own knowledge — places the planner cannot book.
+    #
+    # And three that exist because every field an Itinerary is built with was write-once except
+    # start_date and transport_mode. Asked to change any of the others the model had no legal move,
+    # so it said it had done it anyway: "change the location of the plan to Abu Dhabi" was answered
+    # twice with the same unchanged Dubai plan. set_origin moves where the trip sets off from and
+    # keeps every stop; replace_plan is the only thing that can move the REGION, because no Dubai
+    # place survives the trip becoming an Abu Dhabi one; drop_day removes a day.
     assert names == spec_tools | {
         "get_itinerary",
         "find_live_events",
@@ -100,6 +107,9 @@ def test_the_spec_tools_are_all_exposed():
         "set_transport",
         "add_stop",
         "reschedule_itinerary",
+        "set_origin",
+        "drop_day",
+        "replace_plan",
     }
 
 
@@ -2757,3 +2767,115 @@ def test_a_listing_without_a_query_stays_alphabetical(catalog, orchestrator):
     names = [place["name"] for place in result["places"]]
     assert names == sorted(names)
     assert "matched_by" not in result
+
+
+# --- the plan can be moved, shortened and re-solved ---------------------------------------------
+
+
+def _dubai_day(db, planned, days: int = 2):
+    """A plan that lands in Dubai, so moving it somewhere else is a real change."""
+    from app.models import Conversation, User
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    built = chat.call_tool("generate_itinerary", {
+        "days": days, "budget": 6000, "start_date": FUTURE, "emirates": ["Dubai"],
+    })
+    assert "error" not in built, built
+    return chat
+
+
+def test_moving_the_starting_point_keeps_the_trip_where_it_is(client, planned, db):
+    """The reported bug, first half: "we live in Abu Dhabi" was answered by claiming the whole
+    plan had moved to Abu Dhabi, twice, while returning the identical Dubai itinerary.
+
+    It says where the car sets off, not what the trip is — so the stops stay and only the driving
+    is re-costed. The tool that changes what the trip IS is replace_plan, and it costs the stops.
+    """
+    chat = _dubai_day(db, planned)
+    before = chat.call_tool("get_itinerary", {})
+    names = [s["name"] for d in before["days"] for s in d["stops"]]
+    origin_before = chat._resolve_itinerary().start_lat
+
+    moved = chat.call_tool("set_origin", {"emirate": "Abu Dhabi"})
+
+    assert "error" not in moved, moved
+    assert moved["origin_emirate"] == "Abu Dhabi"
+    # _plan_result lists a day's stops by name, so these are strings, not slot dicts.
+    assert [name for d in moved["days"] for name in d["stops"]] == names, "a stop was lost"
+    assert chat._resolve_itinerary().start_lat < origin_before, "the origin did not move south"
+
+
+def test_only_replace_plan_can_move_the_region(client, planned, db):
+    """The reported bug, second half: "change the location of the plan to Abu Dhabi".
+
+    emirates_json was written once, at creation, and no tool could touch it — so the model had no
+    legal move, and said it had done it anyway. Every Dubai stop has to go, because none of them
+    exist in Abu Dhabi; what must NOT go is the plan's identity, which the conversation points at.
+    """
+    chat = _dubai_day(db, planned)
+    before = chat.call_tool("get_itinerary", {})
+    itinerary_id = before["itinerary_id"]
+
+    moved = chat.call_tool("replace_plan", {"emirates": ["Abu Dhabi"]})
+
+    assert "error" not in moved, moved
+    assert moved["itinerary_id"] == itinerary_id, "a new row would orphan the conversation"
+    assert chat.conversation.itinerary_id == itinerary_id
+    assert moved["emirates"] == ["Abu Dhabi"]
+    assert moved["replaced"], "the reply has to be able to say what was given up"
+
+    from app.models import Place
+
+    stops = [name for d in moved["days"] for name in d["stops"]]
+    assert stops, "the re-solved plan has no stops"
+    emirates = {
+        row.emirate
+        for name in stops
+        if (row := db.query(Place).filter(Place.name == name).first()) is not None
+    }
+    assert emirates == {"Abu Dhabi"}, emirates
+
+
+def test_dropping_a_middle_day_asks_before_it_moves_anything(client, planned, db):
+    """Shift the later days up, or leave the day free? An event on a later date decides it, so
+    there is no safe default — and the question travels with the plan as it really stands."""
+    chat = _dubai_day(db, planned, days=3)
+    before = chat.call_tool("get_itinerary", {})
+
+    asked = chat.call_tool("drop_day", {"day": 2})
+
+    assert asked["applied"] is False
+    assert asked["needs_confirmation"] == "day_shift_choice"
+    assert asked["plan_is_unchanged"] == [s["name"] for d in before["days"] for s in d["stops"]]
+    assert chat.touched_itinerary is None, "a question must not nudge the right pane"
+    assert chat.call_tool("get_itinerary", {})["num_days"] == 3
+
+    answered = chat.call_tool("drop_day", {"day": 2, "shift_later_days": True})
+    assert "error" not in answered, answered
+    assert answered["remaining_days"] == 2, "the trip did not get shorter"
+
+
+def test_the_last_day_goes_without_a_question(client, planned, db):
+    chat = _dubai_day(db, planned, days=3)
+    dropped = chat.call_tool("drop_day", {"day": 3})
+    assert "error" not in dropped, dropped
+    assert dropped["remaining_days"] == 2
+
+
+def test_where_the_family_lives_is_not_where_the_current_trip_goes(client, planned, db):
+    """Recording a home emirate sets the default origin for plans built later. It must not
+    silently re-point a plan that already exists — that one moves through set_origin, or not at
+    all."""
+    chat = _dubai_day(db, planned)
+    origin_before = chat._resolve_itinerary().start_lat
+    home_before = chat.user.home_base_lat
+
+    saved = chat.call_tool("save_family_details", {"adults": 2, "home_emirate": "Sharjah"})
+
+    assert saved["home_emirate"] == "Sharjah"
+    assert chat.user.home_base_lat != home_before, "the home base was not recorded"
+    assert chat._resolve_itinerary().start_lat == origin_before, "the live plan was moved too"

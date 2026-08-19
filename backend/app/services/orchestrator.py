@@ -97,6 +97,16 @@ _TOOL_DEFINITIONS = [
                     },
                     "likes": {"type": "array", "items": {"type": "string"}},
                     "dislikes": {"type": "array", "items": {"type": "string"}},
+                    "home_emirate": {
+                        "type": "string",
+                        "enum": list(EMIRATES),
+                        "description": (
+                            "Where the family lives. Record it whenever they say so — it is where "
+                            "future plans set off from, so saying it once should be enough. It "
+                            "does not touch a plan that already exists: moving that one's "
+                            "starting point is set_origin."
+                        ),
+                    },
                 },
                 "required": ["adults"],
             },
@@ -397,6 +407,126 @@ _TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["start_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_origin",
+            "description": (
+                "Move where an existing plan sets off from — day one's starting point and the "
+                "map's first pin. Every stop stays exactly where it is; only the drive into each "
+                "day and its fare change. This is what 'we live in Abu Dhabi' or 'start us from "
+                "Sharjah' asks for. It does NOT move the trip: if the user wants the PLACES to be "
+                "somewhere else, none of the current ones can come along and that is replace_plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emirate": {
+                        "type": "string",
+                        "enum": list(EMIRATES),
+                        "description": "Where the trip should set off from.",
+                    },
+                },
+                "required": ["emirate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "drop_day",
+            "description": (
+                "Remove one whole day from an existing plan. Every other day keeps its stops. "
+                "Dropping a day that is not the last one comes back asking, because the days "
+                "after it can either shift earlier — the trip ends a day sooner — or hold their "
+                "dates and leave that day free. Put the choice to the user, wait, and only then "
+                "retry with shift_later_days."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {
+                        "type": "integer",
+                        "description": "Which day to remove, 1-based, as the plan is numbered.",
+                    },
+                    "shift_later_days": {
+                        "type": "boolean",
+                        "description": (
+                            "True pulls the later days up, ending the trip a day sooner. False "
+                            "leaves them on their dates with the dropped day free. Set it only "
+                            "once the user has answered — never guess, and never set it "
+                            "unasked."
+                        ),
+                    },
+                },
+                "required": ["day"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_plan",
+            "description": (
+                "Re-solve THIS plan, keeping the same trip: the conversation and the event stay "
+                "attached, and anything you do not pass stays as it is — but every stop is "
+                "replaced. This is the ONLY way a plan changes emirate: 'make it Abu Dhabi "
+                "instead of Dubai' cannot be done stop by stop, because none of the Dubai places "
+                "exist there. It is also how a genuine start-over happens. Every edit the user "
+                "approved is lost, so say that in plain words and get their answer FIRST. If they "
+                "only want the trip to set off from somewhere else, that is set_origin and it "
+                "costs them nothing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emirates": {
+                        "type": "array",
+                        "description": (
+                            "Confine the re-solved trip to these emirates. A CITY belongs to one "
+                            "of the seven: 'Al Ain' means ['Abu Dhabi']. Leave empty to keep the "
+                            "region the plan already has."
+                        ),
+                        "items": {"type": "string", "enum": list(EMIRATES)},
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": (
+                            "ISO date, YYYY-MM-DD. Leave empty to keep the plan's dates — moving "
+                            "dates alone is reschedule_itinerary, which keeps every stop."
+                        ),
+                    },
+                    "days": {"type": "integer", "description": "1 to 5. Empty keeps the current."},
+                    "budget": {
+                        "type": "number",
+                        "description": "The WHOLE trip in AED. Empty keeps the current cap.",
+                    },
+                    "budget_per_day": {
+                        "type": "number",
+                        "description": (
+                            "Budget for EACH day in AED — use this whenever the user says per "
+                            "day, a day, daily or nightly. Never pass both this and `budget`."
+                        ),
+                    },
+                    "focus": {
+                        "type": "string",
+                        "enum": list(itinerary_service.PLAN_FOCUS),
+                        "description": "'dinner_only' plans one evening stop, not a day out.",
+                    },
+                    "adults_only": {"type": "boolean"},
+                    "prayer_breaks": {"type": "boolean"},
+                    "party_size": {
+                        "type": "integer",
+                        "description": (
+                            "Total people, exactly as the user said it. Empty keeps the party the "
+                            "plan was priced for."
+                        ),
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -892,6 +1022,20 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
         verb = "likes" if kind == "like" else "dislikes"
         return "Noting a preference", f"{verb} {subject}" if subject else None
 
+    if name == "set_origin":
+        where = str(_arg(args, "emirate", "")).strip()
+        return "Moving the starting point", f"to {where}" if where else None
+
+    if name == "drop_day":
+        day = _arg(args, "day", None)
+        return "Removing a day", f"day {day}" if day else None
+
+    if name == "replace_plan":
+        # Labelled by where it lands, because that is the part the user asked for; that every stop
+        # is replaced is the outcome's job to say, not the row's.
+        where = ", ".join(str(e) for e in (_arg(args, "emirates", []) or []))
+        return "Rebuilding the plan", f"in {where}" if where else None
+
     return name.replace("_", " ").capitalize(), None
 
 
@@ -1057,6 +1201,14 @@ class ChatOrchestrator:
             "you only described in prose. If a tool call errors or times out, say the change did "
             "not go through and the plan is unchanged; never present a failed call as done.\n\n"
             "# Editing plans\n"
+            "Where the user lives and where the trip goes are different questions, and answering "
+            "one with the other is how a plan gets reported as moved while nothing moves. "
+            "'We live in Abu Dhabi', 'start us from Sharjah' is set_origin: the stops all stay "
+            "and only the driving is re-costed. 'Make the trip Abu Dhabi instead of Dubai' is "
+            "replace_plan, because not one Dubai place exists in Abu Dhabi — say that every stop "
+            "goes and get their answer before you call it. Removing a whole day is drop_day, and "
+            "for any day but the last it comes back asking whether the later days shift earlier "
+            "or keep their dates; put that to the user rather than choosing.\n\n"
             "You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
             "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
             "for an existing plan is reschedule_itinerary, never generate_itinerary — it keeps "
@@ -1233,6 +1385,9 @@ class ChatOrchestrator:
             "find_places": self._find_places,
             "generate_itinerary": self._generate_itinerary,
             "get_itinerary": self._get_itinerary,
+            "set_origin": self._set_origin,
+            "drop_day": self._drop_day,
+            "replace_plan": self._replace_plan,
             "reschedule_itinerary": self._reschedule_itinerary,
             "make_day_cheaper": self._make_day_cheaper,
             "add_prayer_breaks": self._add_prayer_breaks,
@@ -1264,8 +1419,20 @@ class ChatOrchestrator:
         for subject in _arg(args, "dislikes", []):
             self._remember("dislike", str(subject))
 
+        saved = {"saved": True, "adults": adults, "children_ages": ages}
+
+        # Where they live, not where a trip goes: this sets the default origin for plans built
+        # from here on and leaves any existing plan alone. Moving that one's starting point is
+        # set_origin, which keeps its stops.
+        home = str(_arg(args, "home_emirate", "") or "").strip()
+        if home in EMIRATES:
+            centroid = itinerary_service.emirate_centroid(self.db, [home])
+            if centroid is not None:
+                self.user.home_base_lat, self.user.home_base_lng = centroid
+                saved["home_emirate"] = home
+
         self.db.flush()
-        return {"saved": True, "adults": adults, "children_ages": ages}
+        return saved
 
     def _create_event(self, args: dict) -> dict:
         try:
@@ -1560,18 +1727,24 @@ class ChatOrchestrator:
             if not bool(_arg(args, "replace_existing", False)):
                 return {
                     "error": (
-                        "This conversation already has a plan, and generating another one "
-                        "replaces it completely — every edit the user has approved is lost. "
-                        "Adding, removing or swapping a single stop is add_stop or edit_stop, "
-                        "never this. Nothing else needs this tool: a plan is saved as it is "
-                        "built and edited, so there is no finalising, confirming or committing "
-                        "to do. If the user is choosing one specific place out of options you "
-                        "listed ('choose Beirut Restaurant') that is edit_stop with "
+                        "This conversation already has a plan, and this tool builds a SEPARATE "
+                        "one — the current plan, and every edit the user approved, is abandoned "
+                        "along with the thread that points at it. There is a tool for whatever "
+                        "was actually meant. Adding, removing or swapping one stop is add_stop "
+                        "or edit_stop. Different dates, same stops, is reschedule_itinerary. "
+                        "Setting off from somewhere else — 'we live in Abu Dhabi', 'start us "
+                        "from Sharjah' — is set_origin, and it costs nothing. Removing a whole "
+                        "day is drop_day. Moving the trip's REGION, or genuinely starting over, "
+                        "is replace_plan: it re-solves in place, so the conversation and the "
+                        "event stay attached. Nothing else needs this tool: a plan is saved as "
+                        "it is built and edited, so there is no finalising, confirming or "
+                        "committing to do. If the user is choosing one specific place out of "
+                        "options you listed ('choose Beirut Restaurant') that is edit_stop with "
                         "place='Beirut Restaurant', never this tool — this tool has no `place` "
                         "argument, so a named choice made through it is silently dropped and "
-                        "the solver picks whatever it likes instead. If the user genuinely wants "
-                        "to start over, tell them the current plan will be discarded, and ask. "
-                        "Their ANSWER is what unlocks this."
+                        "the solver picks whatever it likes instead. If they truly want a "
+                        "separate plan rather than this one re-solved, tell them the current "
+                        "plan will be discarded, and ask. Their ANSWER is what unlocks this."
                     )
                 }
             if not warned_before_this_turn:
@@ -1753,6 +1926,162 @@ class ChatOrchestrator:
         if itinerary is None:
             return None, {"error": "No plan has been generated yet, so there is nothing to edit."}
         return itinerary, None
+
+    def _set_origin(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to move."}
+
+        emirate = str(_arg(args, "emirate", "")).strip()
+        if emirate not in EMIRATES:
+            return {"error": f"{emirate!r} is not one of the seven emirates: {', '.join(EMIRATES)}."}
+
+        centroid = itinerary_service.emirate_centroid(self.db, [emirate])
+        if centroid is None:
+            return {"error": f"The catalog has nothing in {emirate}, so there is nowhere to start from."}
+
+        before = {
+            slot["place"].name
+            for day in itinerary_service.itinerary_payload(self.db, itinerary)["days"]
+            for slot in day["slots"]
+        }
+        itinerary_service.set_origin(self.db, itinerary, self.user, centroid[0], centroid[1])
+        result = self._plan_result(itinerary)
+        result["origin_emirate"] = emirate
+        # Every stop should survive a move that only changed the driving, but repair_plan is still
+        # the authority — a longer first leg can push a day past a venue's closing time. Saying so
+        # is the difference between this and the bug it replaces.
+        dropped = sorted(before - {name for day in result["days"] for name in day["stops"]})
+        if dropped:
+            result["dropped_after_the_move"] = dropped
+        return result
+
+    def _drop_day(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to edit."}
+
+        try:
+            day = int(_arg(args, "day", 0))
+        except (TypeError, ValueError):
+            return {"error": f"{args.get('day')!r} is not a day number."}
+
+        shift = args.get("shift_later_days")
+        try:
+            itinerary_service.drop_day(
+                self.db, itinerary, self.user, day,
+                shift_later_days=None if shift is None else bool(shift),
+            )
+        except itinerary_service.DayShiftChoiceRequired as exc:
+            return self._unapplied(
+                itinerary, "day_shift_choice", exc,
+                proposed_day=exc.day,
+                proposed_choices=["shift_later_days_true", "shift_later_days_false"],
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        result = self._plan_result(itinerary)
+        result["dropped_day"] = day
+        # Stated rather than left to be counted off the day list: leaving a day free keeps the
+        # trip the same length, and shifting shortens it, and the reply has to get that right.
+        result["remaining_days"] = itinerary.num_days
+        return result
+
+    def _replace_plan(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to replace."}
+
+        start = args.get("start_date")
+        if start is None:
+            new_start = itinerary.start_date
+        else:
+            try:
+                new_start = date.fromisoformat(str(start))
+            except (TypeError, ValueError):
+                return {"error": f"{start!r} is not an ISO date"}
+            if new_start < date.today():
+                return {"error": "That start date is in the past. Please choose a future date."}
+
+        days = int(_arg(args, "days", itinerary.num_days) or itinerary.num_days)
+        if not 1 <= days <= itinerary_service.MAX_DAYS:
+            return {"error": f"A plan runs 1 to {itinerary_service.MAX_DAYS} days, not {days}."}
+
+        budget = _arg(args, "budget", None)
+        per_day = _arg(args, "budget_per_day", None)
+        if budget is not None and per_day is not None:
+            return {
+                "error": (
+                    "Pass either budget or budget_per_day, never both. Ask the user which figure "
+                    "governs if they gave two that do not reconcile."
+                )
+            }
+        if per_day is not None:
+            total_budget = float(per_day) * days
+        elif budget is not None:
+            total_budget = float(budget)
+        else:
+            total_budget = itinerary.total_budget
+
+        focus = str(_arg(args, "focus", itinerary_service.FULL_DAY))
+        if focus not in itinerary_service.PLAN_FOCUS:
+            return {"error": f"{focus!r} is not a plan focus."}
+
+        emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
+        if not emirates and self.starting_emirate_hint in EMIRATES:
+            emirates = [self.starting_emirate_hint]
+        if not emirates:
+            emirates = itinerary.emirates_json or []
+
+        # The origin follows the region, the same way it does on generation — a plan re-solved
+        # into Abu Dhabi that still sets off from a Dubai address prices every first leg wrong.
+        start_lat, start_lng = itinerary.start_lat, itinerary.start_lng
+        centroid = itinerary_service.emirate_centroid(self.db, emirates)
+        if centroid is not None:
+            start_lat, start_lng = centroid
+
+        guests = _guests(args) or itinerary_service.guest_attendees(self.db, itinerary.id)
+        total = int(_arg(args, "party_size", 0) or 0)
+        if total > 0:
+            household = len(itinerary_service.family_attendees(self.db, self.user.id))
+            guests = _fit_party(household, total, guests)
+
+        before = [
+            slot["place"].name
+            for day in itinerary_service.itinerary_payload(self.db, itinerary)["days"]
+            for slot in day["slots"]
+        ]
+        try:
+            itinerary_service.generate(
+                self.db,
+                self.user,
+                start_date=new_start,
+                num_days=days,
+                total_budget=total_budget,
+                start_lat=start_lat,
+                start_lng=start_lng,
+                event_id=itinerary.event_id,
+                currency=itinerary.currency,
+                prayer_breaks=bool(_arg(args, "prayer_breaks", False)),
+                transport_mode=itinerary.transport_mode,
+                adults_only=bool(_arg(args, "adults_only", False)),
+                focus=focus,
+                guests=guests,
+                emirates=emirates or None,
+                into=itinerary,
+            )
+        except itinerary_service.IntakeIncomplete as exc:
+            return {"error": "intake_incomplete", "missing_fields": exc.missing}
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        self.conversation.rebuild_warned = False  # spent — the next one must ask again
+        result = self._plan_result(itinerary)
+        # Named so the reply can say what the user actually gave up, rather than describing the
+        # new plan as though nothing was lost.
+        result["replaced"] = before
+        return result
 
     def _reschedule_itinerary(self, args: dict) -> dict:
         itinerary, error = self._open_plan(args)

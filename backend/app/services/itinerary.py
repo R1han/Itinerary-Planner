@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -46,6 +46,7 @@ from .planner import (
     DINING_CATEGORIES,
     DINNER_ONLY,
     FULL_DAY,
+    MAX_DAYS,
     MAX_HOP_KM,
     PLAN_FOCUS,
     build_profile,
@@ -192,8 +193,15 @@ def generate(
     focus: str = FULL_DAY,
     guests: Sequence[Attendee] = (),
     emirates: Sequence[str] | None = None,
+    into: Itinerary | None = None,
 ) -> Itinerary:
-    """Plan a trip and persist it. Raises IntakeIncomplete before doing any work."""
+    """Plan a trip and persist it. Raises IntakeIncomplete before doing any work.
+
+    `into` re-solves onto an existing itinerary row instead of creating one. The stops are
+    replaced — that is what the caller asked for — but the row's identity survives, so the
+    conversation pointing at it and the event it was planned for stay attached. Building a fresh
+    row and abandoning the old one is what left a rebuilt plan belonging to no thread.
+    """
     missing = missing_intake_fields(db, user)
     if missing:
         raise IntakeIncomplete(missing)
@@ -248,21 +256,36 @@ def generate(
             insert_prayer_breaks(day, travel_fn, context.origin)
         plan = repair_plan(plan, context.profile, travel_fn, context.origin)
 
-    itinerary = Itinerary(
-        user_id=user.id,
-        event_id=event.id if event else None,
-        title=title or (event.title if event else "UAE trip"),
-        start_date=start_date,
-        num_days=num_days,
-        total_budget=total_budget,
-        currency=currency,
-        status="ready",
-        start_lat=start_lat,
-        start_lng=start_lng,
-        transport_mode=transport_mode,
-        emirates_json=list(context.emirates) if context.emirates else None,
-    )
-    db.add(itinerary)
+    if into is None:
+        itinerary = Itinerary(
+            user_id=user.id,
+            event_id=event.id if event else None,
+            title=title or (event.title if event else "UAE trip"),
+        )
+        db.add(itinerary)
+    else:
+        itinerary = into
+        # Silence keeps what the row already has: re-solving a plan into Abu Dhabi says nothing
+        # about which event it is for or what it is called, and inventing "UAE trip" over the
+        # user's own title would lose more than the stops did.
+        if event is not None:
+            itinerary.event_id = event.id
+        if title:
+            itinerary.title = title
+        elif event is not None:
+            itinerary.title = event.title
+        # The party is restated on every solve, so leaving the old rows would double it.
+        db.query(Guest).filter(Guest.itinerary_id == itinerary.id).delete()
+
+    itinerary.start_date = start_date
+    itinerary.num_days = num_days
+    itinerary.total_budget = total_budget
+    itinerary.currency = currency
+    itinerary.status = "ready"
+    itinerary.start_lat = start_lat
+    itinerary.start_lng = start_lng
+    itinerary.transport_mode = transport_mode
+    itinerary.emirates_json = list(context.emirates) if context.emirates else None
     db.flush()
 
     # Stored so that everything reached later — a transport switch, a cheaper day, the payload's
@@ -1568,6 +1591,110 @@ def reschedule(db: Session, itinerary: Itinerary, user: User, new_start_date: da
     context = context_for(db, itinerary, user)
     itinerary.start_date = new_start_date
     plan = load_plan(db, itinerary)
+
+    travel_service = _travel_service(db, itinerary, context)
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+
+    plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
+def emirate_centroid(db: Session, emirates: Sequence[str]) -> tuple[float, float] | None:
+    """The middle of the catalog across these emirates, or None if it holds nothing there."""
+    if not emirates:
+        return None
+    lat, lng = db.execute(
+        select(func.avg(Place.lat), func.avg(Place.lng)).where(Place.emirate.in_(list(emirates)))
+    ).one()
+    return (lat, lng) if lat is not None else None
+
+
+@traced("itinerary.set_origin", run_type="chain")
+def set_origin(db: Session, itinerary: Itinerary, user: User, lat: float, lng: float) -> Plan:
+    """Move where the trip sets off from, keeping every stop.
+
+    Deliberately not a relocation: "we live in Abu Dhabi" says where the car starts, not what the
+    trip is. The places and their order are untouched — only the leg from the origin into each
+    day's first stop moves. That is why the segments are rebuilt rather than re-priced:
+    `recost_travel` recomputes the fare from the distance already on the row, and here the
+    distance is the thing that changed.
+    """
+    itinerary.start_lat, itinerary.start_lng = lat, lng
+    # Read the context after the move, so `context.origin` is the new one.
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+
+    travel_service = _travel_service(db, itinerary, context)
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+
+    for day in plan.days:
+        rebuild_segments(day, travel_fn, context.origin)
+
+    plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
+class DayShiftChoiceRequired(ValueError):
+    """Dropping a day that is not the last one leaves a choice only the user can make.
+
+    The days after it can slide up — the trip ends a day sooner — or hold their dates and leave
+    the dropped day free. An event anchored to one of those later dates is what makes the
+    difference matter, and neither answer is safe to assume, so this asks instead of picking.
+    """
+
+    def __init__(self, day: int, num_days: int) -> None:
+        super().__init__(
+            f"Day {day} is not the last of {num_days}. Ask the user whether the days after it "
+            f"should shift earlier, ending the trip a day sooner, or keep their dates and leave "
+            f"day {day} free — then retry with shift_later_days set."
+        )
+        self.day = day
+        self.num_days = num_days
+
+
+@traced("itinerary.drop_day", run_type="chain")
+def drop_day(
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    day: int,
+    *,
+    shift_later_days: bool | None = None,
+) -> Plan:
+    """Remove one whole day. `day` is 1-based, the way the plan is numbered to the user.
+
+    The budget cap is left alone. It is a ceiling the user set for the trip, not a per-day
+    allowance to hand back, and lowering it here would quietly push `repair_plan` into dropping
+    stops from the days they kept.
+    """
+    index = day - 1
+    if itinerary.num_days <= 1:
+        raise ValueError("This plan is a single day — dropping it would leave nothing.")
+    if not 0 <= index < itinerary.num_days:
+        raise ValueError(f"This plan runs {itinerary.num_days} days, so there is no day {day}.")
+
+    is_last = index == itinerary.num_days - 1
+    if not is_last and shift_later_days is None:
+        raise DayShiftChoiceRequired(day, itinerary.num_days)
+
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+    plan.days = [d for d in plan.days if d.day_index != index]
+
+    if is_last or shift_later_days:
+        for later in plan.days:
+            if later.day_index > index:
+                later.day_index -= 1
+                later.day_date -= timedelta(days=1)
+                for slot in later.slots:
+                    slot.day_index = later.day_index
+        itinerary.num_days -= 1
+    # Otherwise the day keeps its place in the calendar with nothing in it, which is what leaving
+    # it free means: every date after it stays where the user already has it.
 
     travel_service = _travel_service(db, itinerary, context)
     travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])

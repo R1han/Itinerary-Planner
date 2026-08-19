@@ -797,3 +797,128 @@ def test_a_later_edit_still_respects_the_region(client, mixed_family):
     assert all(o["place"]["emirate"] == "Abu Dhabi" for o in options), [
         (o["place"]["name"], o["place"]["emirate"]) for o in options
     ]
+
+
+# --- moving a plan: the origin, a dropped day, and a re-solve in place --------------------------
+
+
+def _orm(db, user_email: str, plan_id: int):
+    """The ORM pair the service functions take, for a plan built through the API above."""
+    from app.models import Itinerary, User
+
+    return db.get(Itinerary, plan_id), db.query(User).filter(User.email == user_email).one()
+
+
+def test_moving_the_origin_keeps_every_stop_and_re_costs_the_driving(client, mixed_family, db):
+    """"We live in Abu Dhabi" moves where the car sets off, not what the trip is.
+
+    The reported bug answered it by claiming the whole plan had moved and changing nothing at all.
+    Nothing about the places changes here; the legs into each day do.
+    """
+    from app.services.itinerary import set_origin
+
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0, emirates=["Dubai"])
+    itinerary, user = _orm(db, "family@rihla.app", plan["id"])
+
+    before = [(s["place"]["name"], s["start_time"]) for d in plan["days"] for s in d["slots"]]
+    travel_before = sum(seg["est_cost"] for d in plan["days"] for seg in d["segments"])
+
+    # Al Ain, a long way from any Dubai stop, so the first leg of each day certainly changes.
+    after = set_origin(db, itinerary, user, 24.2075, 55.7447)
+
+    assert [(s.place.name, s.start_time) for d in after.days for s in d.slots] == before
+    assert itinerary.start_lat == 24.2075
+    travel_after = sum(seg.info.est_cost for d in after.days for seg in d.segments)
+    assert travel_after != travel_before, "the driving was not re-costed"
+
+
+def test_dropping_a_middle_day_asks_before_moving_anyone_else(client, mixed_family, db):
+    """Shift the later days up, or leave the day free? An event on a later date decides it."""
+    from app.services.itinerary import DayShiftChoiceRequired, drop_day
+
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=3, total_budget=9000.0, emirates=["Abu Dhabi"])
+    itinerary, user = _orm(db, "family@rihla.app", plan["id"])
+
+    with pytest.raises(DayShiftChoiceRequired):
+        drop_day(db, itinerary, user, 2)
+
+    db.refresh(itinerary)
+    assert itinerary.num_days == 3, "the question must not have moved anything"
+
+
+def test_dropping_a_day_with_a_shift_pulls_the_later_days_up(client, mixed_family, db):
+    from app.services.itinerary import drop_day
+
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=3, total_budget=9000.0, emirates=["Abu Dhabi"])
+    itinerary, user = _orm(db, "family@rihla.app", plan["id"])
+    start = itinerary.start_date
+    day3 = [s["place"]["name"] for s in plan["days"][2]["slots"]]
+
+    after = drop_day(db, itinerary, user, 2, shift_later_days=True)
+
+    assert itinerary.num_days == 2
+    assert [d.day_index for d in after.days] == [0, 1]
+    assert after.days[1].day_date == start + timedelta(days=1), "day 3 kept its old date"
+    assert [s.place.name for s in after.days[1].slots] == day3, "day 3's stops did not come along"
+
+
+def test_leaving_a_dropped_day_free_moves_nobody(client, mixed_family, db):
+    from app.services.itinerary import drop_day
+
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=3, total_budget=9000.0, emirates=["Abu Dhabi"])
+    itinerary, user = _orm(db, "family@rihla.app", plan["id"])
+    day3 = [s["place"]["name"] for s in plan["days"][2]["slots"]]
+
+    after = drop_day(db, itinerary, user, 2, shift_later_days=False)
+
+    assert itinerary.num_days == 3, "the trip still runs the same dates"
+    assert not [d for d in after.days if d.day_index == 1], "day 2 still has stops"
+    kept = next(d for d in after.days if d.day_index == 2)
+    assert [s.place.name for s in kept.slots] == day3
+
+
+def test_dropping_the_last_day_needs_no_question(client, mixed_family, db):
+    """There is nothing after it to move, so there is no choice to put to the user."""
+    from app.services.itinerary import drop_day
+
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=3, total_budget=9000.0, emirates=["Abu Dhabi"])
+    itinerary, user = _orm(db, "family@rihla.app", plan["id"])
+
+    drop_day(db, itinerary, user, 3)
+    assert itinerary.num_days == 2
+
+
+def test_re_solving_in_place_moves_the_region_and_keeps_the_row(client, mixed_family, db):
+    """The reported bug: "change the location of the plan to Abu Dhabi" was unanswerable.
+
+    emirates_json was written once, at creation, and nothing could ever change it — so the model
+    had no legal move and said it had done it anyway. Re-solving keeps the row, because the
+    conversation and the event both point at it.
+    """
+    from app.services.itinerary import generate as solve
+
+    headers, _ = mixed_family
+    plan = generate(client, headers, num_days=2, total_budget=6000.0, emirates=["Dubai"])
+    itinerary, user = _orm(db, "family@rihla.app", plan["id"])
+    assert {s["place"]["emirate"] for d in plan["days"] for s in d["slots"]} == {"Dubai"}
+
+    moved = solve(
+        db, user,
+        start_date=itinerary.start_date, num_days=itinerary.num_days,
+        total_budget=itinerary.total_budget,
+        start_lat=24.4539, start_lng=54.3773,
+        emirates=["Abu Dhabi"], into=itinerary,
+    )
+
+    assert moved.id == itinerary.id, "a new row would orphan the conversation"
+    assert moved.emirates_json == ["Abu Dhabi"]
+    assert moved.title == itinerary.title, "the user's own title survived"
+    from app.services.itinerary import load_plan
+
+    stops = [s.place for d in load_plan(db, moved).days for s in d.slots]
+    assert stops and all(p.emirate == "Abu Dhabi" for p in stops), [p.name for p in stops]
