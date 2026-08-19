@@ -398,18 +398,29 @@ def attendees_clear_min_age(place: PlaceCandidate, profile: PartyProfile) -> boo
 
 
 def ensure_dining(
-    bucket: list[PlaceCandidate], dining_pool: Sequence[PlaceCandidate], minimum: int = 3
+    bucket: list[PlaceCandidate],
+    dining_pool: Sequence[PlaceCandidate],
+    profile: PartyProfile,
+    minimum: int = 3,
 ) -> list[PlaceCandidate]:
-    """Top a day's cluster up with nearby restaurants if it has too few.
+    """Top a day's cluster up with nearby restaurants the party can actually eat at.
 
     Clustering is geographic and blind to category, so a cluster can legitimately come out with no
     dining in it at all — and that day then gets no lunch and no dinner, because the meal windows
     have nothing to choose from. The nearest restaurants to that cluster are added back.
+
+    "Enough" restaurants only counts ones every attendee clears the min_age for. A cluster whose
+    nearest three are all 12+ fine dining "has enough" by count alone but not by what a family with
+    a young child can sit down at — the day fills lunch there anyway (last resort) and then has
+    nothing left for dinner.
     """
     if not bucket:
         return bucket
 
-    have = [p for p in bucket if p.category in DINING_CATEGORIES]
+    have = [
+        p for p in bucket
+        if p.category in DINING_CATEGORIES and attendees_clear_min_age(p, profile)
+    ]
     if len(have) >= minimum:
         return bucket
 
@@ -418,7 +429,10 @@ def ensure_dining(
     centre_lng = sum(p.lng for p in bucket) / len(bucket)
 
     nearest = sorted(
-        (p for p in dining_pool if p.id not in present),
+        (
+            p for p in dining_pool
+            if p.id not in present and attendees_clear_min_age(p, profile)
+        ),
         key=lambda p: haversine_km(centre_lat, centre_lng, p.lat, p.lng),
     )
     return bucket + nearest[: minimum - len(have)]
@@ -777,7 +791,7 @@ def generate_plan(
     ranked = sorted(candidates, key=lambda p: scores[p.id], reverse=True)
     buckets = cluster_by_proximity(ranked, num_days, origin)
     dining_pool = [p for p in ranked if p.category in DINING_CATEGORIES]
-    buckets = [ensure_dining(bucket, dining_pool) for bucket in buckets]
+    buckets = [ensure_dining(bucket, dining_pool, profile) for bucket in buckets]
 
     plan = Plan(total_budget=total_budget, currency=currency)
     used: set[int] = set()

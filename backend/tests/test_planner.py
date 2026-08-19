@@ -440,9 +440,10 @@ def test_a_cluster_without_restaurants_is_topped_up():
 
     cluster = [place(i, f"Sight {i}", "park", lat=25.2 + i * 0.01, lng=55.2) for i in range(1, 6)]
     dining = [place(50 + i, f"Cafe {i}", "casual_dining", lat=25.9, lng=55.9) for i in range(3)]
+    profile = build_profile(family(2), "other")
 
     assert not [p for p in cluster if p.category in DINING_CATEGORIES]
-    topped = ensure_dining(cluster, dining, minimum=3)
+    topped = ensure_dining(cluster, dining, profile, minimum=3)
     assert len([p for p in topped if p.category in DINING_CATEGORIES]) == 3
     assert all(p in topped for p in cluster), "the original cluster must be preserved"
 
@@ -451,7 +452,31 @@ def test_ensure_dining_leaves_a_cluster_that_already_has_enough_alone():
     from app.services.planner import ensure_dining
 
     cluster = [place(i, f"Cafe {i}", "casual_dining") for i in range(1, 5)]
-    assert ensure_dining(cluster, [], minimum=3) is cluster
+    profile = build_profile(family(2), "other")
+    assert ensure_dining(cluster, [], profile, minimum=3) is cluster
+
+
+def test_ensure_dining_skips_restaurants_the_party_is_too_young_for():
+    """The nearest restaurants to a cluster can all be off-limits to the party.
+
+    A cluster with three age-restricted restaurants "has enough" by count alone, but a family
+    with a young child can eat at none of them — so the day fills lunch and then has nothing
+    left for dinner. `ensure_dining` must count and top up with only the places the party can
+    actually sit down at.
+    """
+    from app.services.planner import ensure_dining
+
+    cluster = [place(i, f"Sight {i}", "park", lat=25.2 + i * 0.01, lng=55.2) for i in range(1, 3)]
+    restricted = [
+        place(50 + i, f"Adults Only {i}", "fine_dining", lat=25.2, lng=55.2, min_age=12)
+        for i in range(3)
+    ]
+    eligible = place(60, "Family Cafe", "casual_dining", lat=25.9, lng=55.9, min_age=0)
+    profile = build_profile(family(2, (7,)), "other")
+
+    topped = ensure_dining(cluster, restricted + [eligible], profile, minimum=3)
+    usable = [p for p in topped if p.category in DINING_CATEGORIES and p.min_age <= 7]
+    assert usable, "cluster has no restaurant the family can actually eat at"
 
 
 # --- a day must not leave its own region --------------------------------------------------------
