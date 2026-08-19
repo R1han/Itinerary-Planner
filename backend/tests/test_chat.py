@@ -2975,3 +2975,114 @@ def test_no_other_tool_is_intercepted(client, planned, db):
     for name in ("get_itinerary", "find_places", "edit_stop", "set_origin", "drop_day",
                  "replace_plan", "reschedule_itinerary", "record_preference"):
         assert policy.intercept(chat, name, {}) is None, name
+
+
+# --- the trace survives the turn ---------------------------------------------------------------
+
+
+def test_history_never_hands_the_api_a_tool_call_it_cannot_match(client, planned, db):
+    """The API requires a role:"tool" message per tool_call_id immediately after an assistant
+    row that carries tool_calls. Those rows are not stored, so replaying the trace structurally
+    would be rejected outright rather than degrading. It goes back as prose."""
+    from app.services.orchestrator import persisted_trace
+
+    chat = _dubai_day(db, planned)
+    chat.record("assistant", "Here you go.", tool_calls=persisted_trace([
+        {"name": "edit_stop", "args": {"stop": "the park"}, "applied": False,
+         "result": {"needs_confirmation": "day_reorder", "question_for_the_user": "may it re-time?"}},
+    ]))
+    db.commit()
+
+    for entry in chat.history():
+        assert set(entry) == {"role", "content"}, entry
+
+
+def test_a_refused_proposal_is_still_on_record_next_turn(client, planned, db):
+    """The confirmation protocol spans two turns: _unapplied returns the proposal and the plan as
+    it really stands, and the user answers "yes" in their NEXT message. Everything structured
+    about that question used to be thrown away, leaving the model to reconstruct it from its own
+    prose — the one source already known to be wrong about this."""
+    from app.services.orchestrator import persisted_trace
+
+    chat = _dubai_day(db, planned)
+    chat.record("assistant", "Shall I re-time the day?", tool_calls=persisted_trace([
+        {
+            "name": "edit_stop",
+            "args": {"stop": "the park", "action": "replace", "category": "museum"},
+            "applied": False,
+            "result": {
+                "applied": False,
+                "needs_confirmation": "day_reorder",
+                "question_for_the_user": "nothing of that kind is open at that hour",
+                "proposed_place": "Louvre Abu Dhabi",
+                "plan_is_unchanged": ["the park", "a cafe"],
+            },
+        },
+    ]))
+    db.commit()
+
+    replayed = "\n".join(entry["content"] for entry in chat.history())
+
+    assert "NOT applied" in replayed, "the next turn has to know nothing happened"
+    assert "day_reorder" in replayed
+    assert "Louvre Abu Dhabi" in replayed, "the proposal itself has to survive"
+    assert "the park" in replayed
+
+
+def test_the_plan_itself_is_not_copied_into_history(client, planned, db):
+    """The plan is persisted and authoritative; re-reading it is one tool call away. What is not
+    recoverable is what was asked and refused, so that is all that is carried."""
+    from app.services.orchestrator import persisted_trace
+
+    stored = persisted_trace([
+        {"name": "get_itinerary", "args": {}, "applied": False,
+         "result": {"days": [{"stops": ["a"] * 50}], "total": 1940.05, "cap": 2000}},
+    ])
+    assert stored["calls"][0]["result"] == {}, "a read carries nothing forward"
+
+
+def test_a_turn_of_pure_tool_calls_no_longer_vanishes(client, planned, db):
+    """history() drops empty-content rows, so a turn that was all tools and no prose disappeared
+    from the replay entirely."""
+    from app.services.orchestrator import persisted_trace
+
+    chat = _dubai_day(db, planned)
+    chat.record("assistant", "", tool_calls=persisted_trace([
+        {"name": "set_transport", "args": {"mode": "own_car"}, "applied": True, "result": {}},
+    ]))
+    db.commit()
+
+    replayed = [e for e in chat.history() if "set_transport" in e["content"]]
+    assert replayed, "the turn left no trace at all"
+    assert "applied" in replayed[0]["content"]
+
+
+def test_nothing_called_means_nothing_stored(client, planned, db):
+    from app.services.orchestrator import persisted_trace
+
+    assert persisted_trace([]) is None
+
+
+def test_a_real_turn_stores_what_it_called(client, planned, db, monkeypatch):
+    """End to end, not just the helpers: the loop has to actually hand the trace to record()."""
+    from app.services import orchestrator as orch
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+
+    fake = _FakeStream([
+        [_chunk(tool=("get_itinerary", "{}"))],
+        [_chunk(content="Your plan is on screen.")],
+    ])
+    monkeypatch.setattr(orch, "wrap_openai", lambda c: c)
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai", type("M", (), {"OpenAI": lambda **_: fake})
+    )
+
+    "".join(chat.stream("what does the plan look like?"))
+
+    saved = [m for m in _messages(db, chat) if m.role == "assistant"][-1]
+    assert saved.tool_calls_json is not None, "the turn recorded no trace at all"
+    called = saved.tool_calls_json["calls"]
+    assert [c["name"] for c in called] == ["get_itinerary"]
+    assert called[0]["applied"] is False, "reading the plan is not changing it"

@@ -1040,6 +1040,56 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
     return name.replace("_", " ").capitalize(), None
 
 
+# What a call is worth remembering into the next turn. Not the whole result: the plan itself is
+# persisted and authoritative, so re-reading it is a tool call away. What is NOT recoverable is
+# what was asked and refused — a proposal that was never applied exists nowhere but here.
+_CARRIED_RESULT_KEYS = frozenset(
+    {"error", "needs_confirmation", "question_for_the_user", "plan_is_unchanged"}
+)
+
+
+def persisted_trace(trace: list[dict]) -> dict | None:
+    """Shape this turn's calls for `Message.tool_calls_json`. None when nothing was called."""
+    calls = []
+    for entry in trace:
+        result = entry.get("result")
+        carried = (
+            {
+                key: value
+                for key, value in result.items()
+                if key in _CARRIED_RESULT_KEYS or key.startswith("proposed_")
+            }
+            if isinstance(result, dict)
+            else {}
+        )
+        calls.append(
+            {
+                "name": entry.get("name"),
+                "args": entry.get("args") or {},
+                "applied": bool(entry.get("applied")),
+                "result": carried,
+            }
+        )
+    # A dict rather than a bare list, because the column is typed as one and a later turn may want
+    # to carry something alongside the calls.
+    return {"calls": calls} if calls else None
+
+
+def replay_trace(payload: dict | None) -> str:
+    """One line per call, for splicing into history as prose."""
+    calls = (payload or {}).get("calls") or []
+    lines = []
+    for call in calls:
+        # Spelled out rather than left as a flag: "NOT applied" is the fact the next turn most
+        # needs and the one the model has most often read past.
+        state = "applied" if call.get("applied") else "NOT applied — nothing changed"
+        line = f"{call.get('name')}({json.dumps(call.get('args') or {}, default=str)}) → {state}"
+        if call.get("result"):
+            line += f", {json.dumps(call['result'], default=str)}"
+        lines.append(line)
+    return " | ".join(lines)
+
+
 def summarise_tool_result(name: str, result: dict) -> str:
     """One phrase describing what the tool did, so the row resolves instead of hanging."""
     if not isinstance(result, dict):
@@ -1350,6 +1400,18 @@ class ChatOrchestrator:
         )
 
     def history(self) -> list[dict]:
+        """The conversation as the model sees it, with each turn's tool trace attached as prose.
+
+        Prose, and never as `tool_calls` on the assistant row: the API hard-requires a `role:
+        "tool"` message for every `tool_call_id` immediately after, those rows are not stored, and
+        a request missing them is rejected outright rather than degrading.
+
+        Carrying the trace at all is what makes the confirmation protocol survive a turn.
+        `_unapplied` returns `applied: false` with the proposal and the plan as it really stands;
+        the user answers "yes" in their next message; and until now everything structured about
+        that question had been thrown away, leaving the model to reconstruct it from its own prose
+        — the one source already known to be wrong about this.
+        """
         rows = (
             self.db.query(Message)
             .filter(Message.conversation_id == self.conversation.id)
@@ -1357,11 +1419,21 @@ class ChatOrchestrator:
             .limit(HISTORY_LIMIT)
             .all()
         )
-        return [
-            {"role": row.role, "content": row.content}
-            for row in reversed(rows)
-            if row.role in ("user", "assistant") and row.content
-        ]
+
+        history: list[dict] = []
+        for row in reversed(rows):
+            if row.role not in ("user", "assistant"):
+                continue
+            content = row.content or ""
+            if row.role == "assistant" and row.tool_calls_json:
+                replayed = replay_trace(row.tool_calls_json)
+                if replayed:
+                    # A turn that was all tool calls and no prose used to vanish from the replay
+                    # entirely, because the row's content was empty.
+                    content = f"{content}\n[tools that turn: {replayed}]".strip()
+            if content:
+                history.append({"role": row.role, "content": content})
+        return history
 
     def record(self, role: str, content: str, tool_calls: dict | None = None) -> Message:
         message = Message(

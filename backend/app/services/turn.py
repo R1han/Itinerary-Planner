@@ -36,7 +36,13 @@ from typing import Any
 
 from ..config import settings
 from . import policy, reviewer
-from .orchestrator import MAX_TOOL_ROUNDS, describe_tool_call, sse, summarise_tool_result
+from .orchestrator import (
+    MAX_TOOL_ROUNDS,
+    describe_tool_call,
+    persisted_trace,
+    sse,
+    summarise_tool_result,
+)
 from .tracing import wrap_openai
 
 log = logging.getLogger(__name__)
@@ -258,6 +264,9 @@ def _respond(
     for index in range(0, len(answer), STREAM_CHUNK):
         yield sse("token", answer[index : index + STREAM_CHUNK])
 
-    orchestrator.record("assistant", answer)
+    # The trace is stored with the reply so the next turn inherits what was proposed and refused.
+    # Answering "yes" to a question whose evidence has been thrown away is how a confirmation
+    # became a swap that never happened.
+    orchestrator.record("assistant", answer, tool_calls=persisted_trace(trace))
     orchestrator.db.commit()
     yield sse("done", {"conversation_id": orchestrator.conversation.id})
