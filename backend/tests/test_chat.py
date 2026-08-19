@@ -2879,3 +2879,74 @@ def test_where_the_family_lives_is_not_where_the_current_trip_goes(client, plann
     assert saved["home_emirate"] == "Sharjah"
     assert chat.user.home_base_lat != home_before, "the home base was not recorded"
     assert chat._resolve_itinerary().start_lat == origin_before, "the live plan was moved too"
+
+
+# --- the deterministic layer, against a real plan ----------------------------------------------
+
+
+def test_the_fingerprint_changes_exactly_when_the_plan_does(client, planned, db):
+    """Ground truth for "did anything change", computed rather than believed.
+
+    Cheap on purpose: itinerary_payload is a full re-render with places and geometry attached,
+    and this runs twice a turn to answer a yes/no question.
+    """
+    from app.services.policy import plan_fingerprint
+
+    chat = _dubai_day(db, planned, days=2)
+    itinerary = chat._resolve_itinerary()
+
+    first = plan_fingerprint(db, itinerary)
+    assert plan_fingerprint(db, itinerary) == first, "reading the plan is not changing it"
+
+    chat.call_tool("get_itinerary", {})
+    assert plan_fingerprint(db, itinerary) == first, "a read moved the fingerprint"
+
+    chat.call_tool("set_transport", {"mode": "own_car"})
+    after_transport = plan_fingerprint(db, itinerary)
+    assert after_transport != first
+
+    chat.call_tool("set_origin", {"emirate": "Abu Dhabi"})
+    assert plan_fingerprint(db, itinerary) != after_transport, "moving the origin did not show"
+
+
+def test_a_refused_rebuild_never_reaches_the_handler(client, planned, db):
+    """The gate runs in policy.intercept, before the handler — so a rebuild that must not happen
+    cannot get as far as writing a row and then being tidied up."""
+    from app.models import Itinerary
+    from app.services import policy
+
+    chat = _dubai_day(db, planned)
+    rows_before = db.query(Itinerary).count()
+
+    refusal = policy.intercept(chat, "generate_itinerary", {"days": 1, "budget": 5000})
+
+    assert refusal is not None and "replace_plan" in refusal["error"]
+    assert db.query(Itinerary).count() == rows_before
+    # And the warning is now on record, which is what a later consent is measured against.
+    assert chat.conversation.rebuild_warned is True
+
+
+def test_consent_still_takes_two_turns_after_the_move(client, planned, db):
+    """`replace_existing` set in the same turn as the warning is the model granting itself
+    permission. Moving the gate out of the handler must not have loosened that."""
+    from app.services import policy
+
+    chat = _dubai_day(db, planned)
+    chat.warned_at_turn_start = False
+
+    same_turn = policy.intercept(chat, "generate_itinerary", {"days": 1, "replace_existing": True})
+    assert same_turn is not None and "does not grant itself" in same_turn["error"]
+
+    # A turn later, the user having spoken since, the same call is allowed through.
+    chat.warned_at_turn_start = True
+    assert policy.intercept(chat, "generate_itinerary", {"days": 1, "replace_existing": True}) is None
+
+
+def test_no_other_tool_is_intercepted(client, planned, db):
+    """Interception is a short list of refusals, not a gate every call has to argue with."""
+    from app.services import policy
+
+    chat = _dubai_day(db, planned)
+    for name in ("get_itinerary", "find_places", "edit_stop", "set_origin", "drop_day",
+                 "replace_plan", "reschedule_itinerary", "record_preference"):
+        assert policy.intercept(chat, name, {}) is None, name

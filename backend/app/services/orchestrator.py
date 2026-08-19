@@ -39,6 +39,7 @@ from ..models import (
     utcnow,
 )
 from . import itinerary as itinerary_service
+from . import policy
 from .budget import Attendee
 from .retrieval import EMIRATES, keyword_similarities, semantic_similarities
 from .memory import MemoryService
@@ -1398,6 +1399,12 @@ class ChatOrchestrator:
         }.get(name)
         if handler is None:
             return {"error": f"unknown tool {name}"}
+        # Deterministic refusals run BEFORE the handler, so a call that must not happen cannot
+        # have written anything on its way to being refused. The rules live in policy.py rather
+        # than in the system prompt, because prompt text is advice and this is not.
+        refusal = policy.intercept(self, name, arguments)
+        if refusal is not None:
+            return refusal
         try:
             return handler(arguments)
         except Exception as exc:  # noqa: BLE001 — a tool failure is a message, not a 500
@@ -1700,62 +1707,9 @@ class ChatOrchestrator:
         # family says "we have our own car", the plan is rebuilt, and the taxi fares come back.
         current = self._resolve_itinerary()
 
-        # The reported bug: asked to add one adventure, the model called this instead, a brand
-        # new itinerary row was created, the conversation was re-pointed at it, and the approved
-        # plan was orphaned — a stop the user never touched vanished and one they had swapped out
-        # came back. Prompt text was the only thing standing in the way of that, and the prompt's
-        # own carve-out ("or agreed to start over") is exactly what a reply like "sure, I can
-        # sacrifice some budget" reads as. Only the conversation's *own* plan is protected: a new
-        # thread still plans freely even though the user has older plans elsewhere.
-        #
-        # A second reported bug, same root cause: shown a list of cheaper restaurants and told
-        # "choose Beirut Restaurant", the model reached for this tool instead of edit_stop. This
-        # tool has no `place` argument at all, so the named choice had nowhere to go — the
-        # rebuild silently re-solved the day and landed on whatever the optimiser picked instead
-        # of what the user asked for. The refusal below now says so explicitly, at the exact
-        # point the model is about to make that choice.
-        if current is not None and current.id == self.conversation.itinerary_id:
-            # `replace_existing` alone is not permission. Setting it is free, and the model set
-            # it on its first attempt — "let us finalize it" became a rebuild that threw away
-            # every edit. Permission arrives a TURN after the warning, because that is how long
-            # it takes the user to answer, so the flag counts only once the warning has been
-            # given and the user has spoken since.
-            warned_before_this_turn = self.warned_at_turn_start
-            self.conversation.rebuild_warned = True
-            self.rebuild_refused = True
-
-            if not bool(_arg(args, "replace_existing", False)):
-                return {
-                    "error": (
-                        "This conversation already has a plan, and this tool builds a SEPARATE "
-                        "one — the current plan, and every edit the user approved, is abandoned "
-                        "along with the thread that points at it. There is a tool for whatever "
-                        "was actually meant. Adding, removing or swapping one stop is add_stop "
-                        "or edit_stop. Different dates, same stops, is reschedule_itinerary. "
-                        "Setting off from somewhere else — 'we live in Abu Dhabi', 'start us "
-                        "from Sharjah' — is set_origin, and it costs nothing. Removing a whole "
-                        "day is drop_day. Moving the trip's REGION, or genuinely starting over, "
-                        "is replace_plan: it re-solves in place, so the conversation and the "
-                        "event stay attached. Nothing else needs this tool: a plan is saved as "
-                        "it is built and edited, so there is no finalising, confirming or "
-                        "committing to do. If the user is choosing one specific place out of "
-                        "options you listed ('choose Beirut Restaurant') that is edit_stop with "
-                        "place='Beirut Restaurant', never this tool — this tool has no `place` "
-                        "argument, so a named choice made through it is silently dropped and "
-                        "the solver picks whatever it likes instead. If they truly want a "
-                        "separate plan rather than this one re-solved, tell them the current "
-                        "plan will be discarded, and ask. Their ANSWER is what unlocks this."
-                    )
-                }
-            if not warned_before_this_turn:
-                return {
-                    "error": (
-                        "replace_existing does not grant itself. The user has not been told this "
-                        "plan would be discarded and has not agreed to it — as of the start of "
-                        "this turn, nobody had raised it. Stop calling tools, tell them what "
-                        "would be lost, and ask. Their next message is when this works."
-                    )
-                }
+        # The gate that protects this conversation's own plan from being replaced by a brand new
+        # one now runs in policy.intercept, before this handler is entered at all — so a rebuild
+        # that must not happen cannot get as far as writing a row. See policy._rebuild_is_not_an_edit.
 
         emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
         if not emirates and self.starting_emirate_hint in EMIRATES:
