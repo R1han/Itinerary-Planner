@@ -80,6 +80,7 @@ html,
 body,
 #root {
   height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -342,6 +343,11 @@ a:hover {
   gap: 11px;
   overflow-y: auto;
   min-height: 0;
+  scrollbar-width: none;
+}
+
+.rail__list::-webkit-scrollbar {
+  display: none;
 }
 
 .rail__item {
