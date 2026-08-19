@@ -851,7 +851,7 @@ def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int |
             # The same place can sit twice on one day (a lunch and a dinner at the same
             # restaurant) — a name or category match alone can't tell those apart, but "dinner"
             # in the user's own words can: it's the later of the two.
-            if "breakfast" in text:
+            if "lunch" in text:
                 return min(match, key=lambda s: s.start_time)
             if "dinner" in text:
                 return max(match, key=lambda s: s.start_time)
