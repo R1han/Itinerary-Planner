@@ -1597,7 +1597,7 @@ class ChatOrchestrator:
                 start_lat=start_lat,
                 start_lng=start_lng,
                 event_id=event.id if event else None,
-                title=event.title if event else None,
+                title=event.title if event else f"New Plan: {start_date}",
                 currency=self.user.default_currency,
                 prayer_breaks=bool(_arg(args, "prayer_breaks", False)),
                 transport_mode=current.transport_mode if current else itinerary_service.TAXI,
@@ -1614,6 +1614,8 @@ class ChatOrchestrator:
         if event is not None:
             self.conversation.event_id = event.id
             self.conversation.title = event.title
+        else:
+            self.conversation.title = f"New Plan: {start_date}"
         self.db.flush()
         return self._plan_result(created)
 
