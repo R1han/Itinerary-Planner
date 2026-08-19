@@ -1308,11 +1308,24 @@ def patch_slot(
             if not all(person.age >= candidate.min_age for person in context.profile.attendees):
                 raise ValueError(f"{candidate.name} requires age {candidate.min_age}+")
 
+            # Named swaps skip `_best_alternative`'s budget filter, so without this check a swap
+            # that is simply too expensive falls through to repair_plan silently dropping the
+            # slot, which then surfaces downstream as "would cost the day a stop" — true, but not
+            # why, and the model has been seen inventing a schedule reason to fill that gap.
+            new_cost = slot_cost_breakdown(candidate, context.profile.attendees)
+            spare = plan.total_budget - plan.total_cost + target.cost.total
+            if new_cost.total > spare + 0.01:
+                raise ValueError(
+                    f"{candidate.name} costs {new_cost.total:.0f} {itinerary.currency}, and only "
+                    f"{spare:.0f} {itinerary.currency} of the budget is unspent. Time is not the "
+                    f"problem here."
+                )
+
             target.place = candidate
             duration = min(candidate.avg_duration_min, context.profile.max_slot_min)
             target.start_min = max(target.start_min, candidate.opens_at)
             target.end_min = target.start_min + duration
-            target.cost = slot_cost_breakdown(candidate, context.profile.attendees)
+            target.cost = new_cost
     else:
         raise ValueError(f"Unknown action {action!r}")
 
