@@ -5,6 +5,16 @@ import type { ChatMessage, StreamEvent } from '../types'
 import { Arrow, Check, Chevron, Gear, Sparkle } from './icons'
 import { Markdown } from './Markdown'
 
+const EMIRATES = [
+  'Abu Dhabi',
+  'Dubai',
+  'Sharjah',
+  'Ajman',
+  'Umm Al Quwain',
+  'Ras Al Khaimah',
+  'Fujairah',
+]
+
 /** The mock renders each day theme as a coloured chip; the palette cycles per day. */
 function DayChips() {
   const itinerary = useStore((s) => s.itinerary)
@@ -184,6 +194,7 @@ export function ChatPanel() {
   const sheetOpen = useStore((s) => s.sheetOpen)
 
   const [draft, setDraft] = useState('')
+  const [emirate, setEmirate] = useState('')
   const [intakeFields, setIntakeFields] = useState<string[]>([])
   const bodyRef = useRef<HTMLDivElement>(null)
   const draftRef = useRef<HTMLTextAreaElement>(null)
@@ -225,11 +236,15 @@ export function ChatPanel() {
     setStreaming(true)
     setStreamedText(() => '')
 
+    // The backend has no dedicated field for this — it's extracted from the message text by the
+    // chat model's own tool-call reasoning, same as any other place/date detail the user types.
+    const outgoing = emirate ? `[Starting emirate: ${emirate}] ${text}` : text
+
     let assistant = ''
     let thread = conversationId
 
     try {
-      await streamChat(text, conversationId, (event: StreamEvent) => {
+      await streamChat(outgoing, conversationId, (event: StreamEvent) => {
         switch (event.type) {
           case 'conversation':
             thread = event.data.conversation_id
@@ -392,6 +407,17 @@ export function ChatPanel() {
       </div>
 
       <div className="composer">
+        <select
+          className="composer__emirate"
+          value={emirate}
+          onChange={(event) => setEmirate(event.target.value)}
+          aria-label="Starting emirate"
+        >
+          <option value="">Starting emirate (optional)</option>
+          {EMIRATES.map((name) => (
+            <option key={name} value={name}>{name}</option>
+          ))}
+        </select>
         <div className="composer__box">
           <textarea
             ref={draftRef}
