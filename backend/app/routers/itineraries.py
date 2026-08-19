@@ -134,7 +134,10 @@ def add_stop(
     """Add one stop to a day, placed wherever it costs the day least."""
     itinerary = get_itinerary_or_404(db, itinerary_id, current.id)
     try:
-        service.add_stop(db, itinerary, current, day_index=day_index, category=payload.category)
+        service.add_stop(
+            db, itinerary, current,
+            day_index=day_index, category=payload.category, place_id=payload.place_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return service.itinerary_payload(db, itinerary)

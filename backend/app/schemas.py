@@ -334,9 +334,11 @@ PlaceCategory = Literal[
 
 
 class AddStopRequest(BaseModel):
-    """Put a new stop into a day. The server picks the best fit of that kind."""
+    """Put a new stop into a day. `place_id` asks for that exact place; otherwise the server
+    picks the best fit of `category`."""
 
     category: PlaceCategory | None = None
+    place_id: int | None = None
 
 
 class SlotPatch(BaseModel):

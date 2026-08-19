@@ -1264,6 +1264,34 @@ def test_a_removed_stop_can_be_added_back_from_chat(client, planned, db):
     assert len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) == gone + 1
 
 
+def test_add_stop_adds_the_exact_place_named_not_just_its_category(client, planned, db):
+    """Same bug as edit_stop's replace (see test_edit_stop_swaps_in_the_exact_place_named...),
+    for the plain add path: once the day has room, a named place must not become 'best fit for
+    its category' either.
+
+    Uses a runner-up the server already vouched fits this gap (from `alternatives`), rather than
+    a hardcoded place name, so the test does not depend on this plan's geography or opening hours
+    to make the point: asking BY NAME must not collapse into 'best fit of any kind'.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    stop = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]
+    chat.call_tool("edit_stop", {"stop": stop["name"], "action": "remove"})
+
+    preview = chat.call_tool("add_stop", {"day": 1})
+    assert "error" not in preview, preview
+    assert preview["alternatives"], "need a runner-up to prove `place` overrides the picker's own choice"
+    target = preview["alternatives"][0]
+    chat.call_tool("edit_stop", {"stop": preview["added"], "action": "remove"})
+
+    result = chat.call_tool("add_stop", {"day": 1, "place": target})
+
+    assert "error" not in result, result
+    assert result["added"] == target, result
+    names = [s["name"] for d in chat.call_tool("get_itinerary", {})["days"] for s in d["stops"]]
+    assert target in names
+
+
 def test_adding_a_stop_reports_what_else_was_available(db, planned):
     """So the reply can offer a different one instead of pretending there was no choice."""
     _, _, plan = planned
@@ -1282,6 +1310,28 @@ def test_a_full_day_refuses_a_stop_from_chat_too(client, planned, db):
     result = chat.call_tool("add_stop", {"day": 1, "category": "mall"})
     if "error" in result:
         assert "fits" in result["error"] or "Nothing available" in result["error"]
+
+
+def test_edit_stop_swaps_in_the_exact_place_named_not_just_its_category(client, planned, db):
+    """Naming a specific place must not be silently downgraded to 'best fit for its category'.
+
+    Regression for the reported bug: asked to swap in "UAQ Mangrove Kayak" specifically, the
+    server only ever accepted a category, so it picked whatever adventure place fit best — a
+    different place entirely — and the reply narrated the one the user asked for anyway.
+    """
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    stop = next(d for d in plan["days"] if d["slots"])["slots"][0]
+
+    result = chat.call_tool("edit_stop", {
+        "stop": stop["place"]["name"], "action": "replace",
+        "place": "UAQ Mangrove Kayak", "category": "adventure",
+    })
+
+    assert "error" not in result, result
+    assert result["replaced_with"] == "UAQ Mangrove Kayak", result
+    names = [s["name"] for d in chat.call_tool("get_itinerary", {})["days"] for s in d["stops"]]
+    assert "UAQ Mangrove Kayak" in names
 
 
 def test_replace_without_a_target_is_an_error_not_a_removal(client, planned, db):

@@ -848,6 +848,36 @@ def find_stop(db: Session, itinerary: Itinerary, description: str) -> Slot:
     raise ValueError(f"This plan has no stop like {description!r}. It has: {listing()}.")
 
 
+def find_catalog_place(db: Session, description: str, *, category: str | None = None) -> Place:
+    """Which catalog place the user meant, from the words they used for it.
+
+    Mirrors find_stop's matching, but over the whole catalog rather than one plan's slots — for
+    add_stop/edit_stop callers that named an exact place ("add the UAQ Mangrove Kayak") instead of
+    a category. Without this, naming a specific place is indistinguishable from naming its
+    category, and a category only ever gets the best FIT, never the place actually asked for.
+    """
+    text = " ".join(description.lower().split())
+    if not text:
+        raise ValueError("Say which place — its name, the way find_places or the plan showed it.")
+
+    statement = select(Place)
+    if category:
+        statement = statement.where(Place.category == category)
+    matches = [
+        place for place in db.scalars(statement)
+        if text in place.name.lower() or place.name.lower() in text
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise ValueError(
+            f"{description!r} matches more than one place — "
+            + "; ".join(f"{p.name} ({p.emirate})" for p in matches)
+            + ". Say which one."
+        )
+    raise ValueError(f"No place in the catalog matches {description!r}. Try find_places to look it up.")
+
+
 def gap_window(day: DayPlan, position: int) -> tuple[int, int]:
     """The time window a replacement slot must fit into: between its two neighbours."""
     ordered = sorted(day.slots, key=lambda s: s.start_min)
@@ -1311,7 +1341,13 @@ def patch_slot(
 
 @traced("itinerary.add_stop", run_type="chain")
 def add_stop(
-    db: Session, itinerary: Itinerary, user: User, *, day_index: int, category: str | None = None
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    *,
+    day_index: int,
+    category: str | None = None,
+    place_id: int | None = None,
 ) -> tuple[Plan, PlanContext, dict]:
     """Put one new stop into a day, in whichever gap costs the day least.
 
@@ -1319,6 +1355,12 @@ def add_stop(
     existing stops is tried, plus the ends of the day; the placement that adds the fewest
     kilometres wins. Returns the plan, the context, and what was chosen alongside the runners-up
     so the caller can say what else was available.
+
+    A `place_id` asks for one exact place rather than the best of a category, so it is fetched
+    directly rather than filtered out of `_candidates_for_gap` — that pool is narrowed to the
+    plan's emirates and the profile's usual scoring, which is right for "add an adventure" and
+    wrong for "add the one I named": the user chose it already, the only question left is where
+    in the day it goes.
     """
     context = context_for(db, itinerary, user)
     plan = load_plan(db, itinerary)
@@ -1327,9 +1369,17 @@ def add_stop(
     day = plan.days[day_index]
 
     booked = {s.place.id for d in plan.days for s in d.slots}
-    candidates = _candidates_for_gap(db, context, booked)
-    if category:
-        candidates = [c for c in candidates if c.category == category]
+    if place_id is not None:
+        if place_id in booked:
+            raise ValueError("That place is already in the plan.")
+        place_row = db.get(Place, place_id)
+        if place_row is None:
+            raise ValueError("Unknown place")
+        candidates = [to_candidate(place_row)]
+    else:
+        candidates = _candidates_for_gap(db, context, booked)
+        if category:
+            candidates = [c for c in candidates if c.category == category]
     if not candidates:
         raise ValueError(f"Nothing available in {category!r}." if category else "Nothing available.")
 
@@ -1348,6 +1398,8 @@ def add_stop(
                 f"meal is not a gap in the schedule, it is a third meal — swap one of those "
                 f"instead, or say which one to replace."
             )
+        if place_id is not None:
+            raise ValueError(f"{candidates[0].name} does not fit this day's schedule or budget.")
         raise ValueError("Nothing in that category fits this day's schedule or budget.")
 
     _, position, chosen, fit, cost = min(considered, key=lambda row: row[0])

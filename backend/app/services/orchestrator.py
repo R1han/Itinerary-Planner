@@ -431,10 +431,21 @@ _TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "day": {"type": "integer", "description": "1-based day number."},
+                    "place": {
+                        "type": "string",
+                        "description": (
+                            "When the user named an exact place ('add the UAQ Mangrove Kayak'): "
+                            "add that place, not the best fit of some category. Takes priority "
+                            "over category when both are given."
+                        ),
+                    },
                     "category": {
                         "type": "string",
                         "enum": PLACE_CATEGORIES,
-                        "description": "What kind of place. Omit to take the best of any kind.",
+                        "description": (
+                            "What kind of place, when no exact place was named. Omit to take the "
+                            "best of any kind."
+                        ),
                     },
                 },
                 "required": ["day"],
@@ -482,12 +493,21 @@ _TOOL_DEFINITIONS = [
                         ),
                     },
                     "action": {"type": "string", "enum": ["remove", "adjust", "replace"]},
+                    "place": {
+                        "type": "string",
+                        "description": (
+                            "For action='replace', when the user named an exact place ('add the "
+                            "UAQ Mangrove Kayak'): swap in that place by name, not the best fit "
+                            "of some category. Takes priority over category when both are given."
+                        ),
+                    },
                     "category": {
                         "type": "string",
                         "enum": PLACE_CATEGORIES,
                         "description": (
-                            "For action='replace': the kind of place to swap in. The server "
-                            "picks the best one that fits the slot's window and budget."
+                            "For action='replace' when no exact place was named: the kind of "
+                            "place to swap in. The server picks the best one that fits the "
+                            "slot's window and budget."
                         ),
                     },
                     "start_time": {
@@ -823,15 +843,18 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
         return "Switching transport", "own car" if mode == "own_car" else "taxi"
 
     if name == "add_stop":
-        kind = str(args.get("category") or "").replace("_", " ")
+        named = str(args.get("place") or "").strip()
+        kind = named or str(args.get("category") or "").replace("_", " ")
         return "Adding a stop", f"{kind} · day {int(_arg(args, 'day', 1))}" if kind else None
 
     if name == "edit_stop":
         action = str(_arg(args, "action", ""))
         stop = str(_arg(args, "stop", "")).strip()
         if action == "replace":
+            named = str(args.get("place") or "").strip()
             kind = str(args.get("category") or "").replace("_", " ")
-            detail = " · ".join(x for x in (stop, f"for {kind}" if kind else "") if x)
+            target = named or (f"for {kind}" if kind else "")
+            detail = " · ".join(x for x in (stop, target) if x)
             return "Swapping a stop", detail or None
         if action == "adjust":
             when = args.get("start_time")
@@ -899,7 +922,11 @@ def summarise_tool_result(name: str, result: dict) -> str:
     if name == "add_stop":
         chosen = result.get("added")
         return f"added {chosen}" if chosen else "added"
-    if name in ("add_prayer_breaks", "edit_stop"):
+    if name == "edit_stop":
+        replaced = result.get("replaced_with")
+        cost_line = f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
+        return f"swapped in {replaced} · {cost_line}" if replaced else cost_line
+    if name == "add_prayer_breaks":
         return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "create_event":
         return "added" if result.get("created") else "already on your calendar"
@@ -996,9 +1023,13 @@ class ChatOrchestrator:
             "change. You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
             "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
             "for an existing plan is reschedule_itinerary, never generate_itinerary — it keeps "
-            "every stop and every edit, only the calendar dates move. To swap one stop for a "
-            "different kind of "
-            "place use edit_stop with action='replace' and a category — never remove it and hope; "
+            "every stop and every edit, only the calendar dates move. add_stop and edit_stop both "
+            "take place as well as category: give place whenever the user named an exact place "
+            "('add the UAQ Mangrove Kayak', 'swap it for Warner Bros World') so that place is "
+            "what actually lands, or category when they only said what kind and the server should "
+            "pick the best fit — passing category for a place the user named by name gets "
+            "whatever the server judges best, not the one they asked for. To swap one stop use "
+            "edit_stop with action='replace'; never remove it and hope; "
             "removing leaves the day one stop short. Name the stop the way the user did and edit_stop will "
             "find it; there are no ids to fetch or remember. A replace that comes "
             "back needing confirmation has already found something; what it needs is permission. "
@@ -1693,11 +1724,22 @@ class ChatOrchestrator:
         if error:
             return error
 
+        # A named place beats a category — see _edit_stop for why: "add an adventure" and "add
+        # the UAQ Mangrove Kayak" must not collapse into the same call.
+        place_id = None
+        named_place = str(args.get("place") or "").strip()
+        if named_place:
+            try:
+                place_id = itinerary_service.find_catalog_place(self.db, named_place).id
+            except ValueError as exc:
+                return {"error": str(exc)}
+
         try:
             _, _, outcome = itinerary_service.add_stop(
                 self.db, itinerary, self.user,
                 day_index=int(_arg(args, "day", 1)) - 1,
                 category=args.get("category"),
+                place_id=place_id,
             )
         except ValueError as exc:
             return {"error": str(exc)}
@@ -1722,13 +1764,26 @@ class ChatOrchestrator:
         except ValueError as exc:
             return {"error": str(exc)}
 
+        # A named place beats a category — it is a request for THAT place, not the best fit of
+        # its kind. Without this, "add the UAQ Mangrove Kayak" and "add an adventure" are the same
+        # call, and the server silently substitutes whatever adventure place fits best instead.
+        place_id = None
+        named_place = str(args.get("place") or "").strip()
+        if named_place:
+            try:
+                place_id = itinerary_service.find_catalog_place(self.db, named_place).id
+            except ValueError as exc:
+                return {"error": str(exc)}
+
+        action = str(_arg(args, "action", ""))
         try:
-            itinerary_service.patch_slot(
+            plan, _, day_index = itinerary_service.patch_slot(
                 self.db,
                 itinerary,
                 self.user,
                 slot,
-                action=str(_arg(args, "action", "")),
+                action=action,
+                place_id=place_id,
                 start_time=args.get("start_time"),
                 category=args.get("category"),
                 allow_overrun=bool(_arg(args, "allow_overrun", False)),
@@ -1749,7 +1804,17 @@ class ChatOrchestrator:
             )
         except ValueError as exc:
             return {"error": str(exc)}
-        return self._plan_result(itinerary)
+
+        result = self._plan_result(itinerary)
+        if action == "replace":
+            # Named by what actually landed, not what was asked for — a category swap and a named
+            # swap that missed its target both leave the model something true to say instead of
+            # assuming the request was granted exactly as phrased. See _unapplied for the bug this
+            # mirrors: a plausible place name in the transcript is not evidence it was placed.
+            result["replaced_with"] = next(
+                (s.place.name for s in plan.days[day_index].slots if s.row_id == slot.id), None
+            )
+        return result
 
     def _unapplied(self, itinerary: Itinerary, kind: str, exc: Exception, **proposed) -> dict:
         """A question, shaped so it cannot be read as an answer.
