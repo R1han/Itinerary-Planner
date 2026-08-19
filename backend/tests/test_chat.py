@@ -250,6 +250,10 @@ def test_generate_itinerary_is_refused_until_intake_is_complete(db, orchestrator
             "in the past",
         ),
         ({"days": 3, "budget": 3000, "event_id": 999, "start_date": FUTURE}, "does not exist"),
+        (
+            {"days": 1, "budget": 3000, "budget_per_day": 5000, "start_date": FUTURE},
+            "Pass one budget, not both",
+        ),
     ],
 )
 def test_generate_itinerary_validates_server_side(db, orchestrator, args, fragment):
@@ -261,6 +265,18 @@ def test_generate_itinerary_validates_server_side(db, orchestrator, args, fragme
     result = chat.call_tool("generate_itinerary", args)
     assert "error" in result
     assert fragment in result["error"]
+
+
+def test_a_one_day_budget_may_be_passed_as_both_fields_when_they_agree(db, orchestrator):
+    """budget and budget_per_day land equal for a one-day trip — that is not a conflict to
+    reject, just the same figure said two ways, so it must fall through to other validation
+    instead of the "pass one, not both" error."""
+    result = orchestrator().call_tool(
+        "generate_itinerary",
+        {"days": 1, "budget": 750, "budget_per_day": 750, "start_date": FUTURE},
+    )
+    assert result.get("error") != "Pass one budget, not both: 750 for the whole trip or 750 for each day. Which did the user mean?"
+    assert result["error"] == "intake_incomplete"
 
 
 def test_record_preference_writes_it_for_the_calling_user_only(db, orchestrator):

@@ -1108,8 +1108,10 @@ class ChatOrchestrator:
             "A budget is one figure for the trip or one figure for each day, and which one "
             "decides the whole plan. \"3000 a day\" over five days is a 15,000 trip: pass it as "
             "budget_per_day and let the server multiply. Pass `budget` only when the user gave a "
-            "single number for the trip as a whole. For a one-day plan the two are the same "
-            "number, so never ask which one was meant — just pass it as `budget`.\n\n"
+            "single number for the trip as a whole. The server rejects the call outright if both "
+            "are set, so never pass both. For a one-day plan pass the figure as `budget` and "
+            "leave budget_per_day unset — over one day the two would total the same, so there is "
+            "nothing to ask the user.\n\n"
             "Plan what was asked for and no more. A request for a dinner is generate_itinerary "
             "with focus='dinner_only' — one evening stop — not a day out with a restaurant at the "
             "end of it. Set adults_only when the children are not coming, which an anniversary "
@@ -1463,7 +1465,9 @@ class ChatOrchestrator:
         # where their meaning quietly changes.
         budget = float(_arg(args, "budget", 0))
         per_day = float(_arg(args, "budget_per_day", 0))
-        if budget > 0 and per_day > 0:
+        # Only a real conflict is rejected — both fields land equal for a one-day trip, which is
+        # not ambiguity to interrogate the user over, just the same number said two ways.
+        if budget > 0 and per_day > 0 and abs(per_day * days - budget) > 0.01:
             return {
                 "error": (
                     f"Pass one budget, not both: {budget:.0f} for the whole trip or "
