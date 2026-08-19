@@ -915,10 +915,15 @@ def test_an_explicit_event_id_still_wins_over_the_conversations(client, planned,
     assert db.get(Itinerary, result["itinerary_id"]).event_id == asked_for.id
 
 
-def test_the_system_prompt_forbids_rebuilding_as_a_workaround(db, orchestrator):
+def test_rebuilding_as_a_workaround_is_forbidden_where_it_can_be_enforced(db, orchestrator):
+    """The prompt keeps the judgement the model has to make before calling; the description of
+    what a rebuild destroys moved to the refusal, which is delivered at the moment of the call and
+    now also stops it."""
+    from app.services.policy import REBUILD_IS_NOT_AN_EDIT
+
     prompt = orchestrator().system_prompt()
-    assert "throws the current one away" in prompt
     assert "never a reason to start over" in prompt
+    assert "the current plan, and every edit the user approved, is abandoned" in REBUILD_IS_NOT_AN_EDIT
 
 
 def test_saying_you_have_your_own_car_actually_reprices_the_plan(client, planned, db):
@@ -1885,9 +1890,16 @@ def test_a_fresh_thread_is_not_blocked_by_an_older_plan(client, planned, db):
 
 
 def test_the_prompt_no_longer_offers_start_over_as_a_way_around_a_failed_edit(db, orchestrator):
+    """What stays in the prompt is the distinction the model has to make BEFORE it calls: that
+    agreeing to spend more is agreeing to an edit. How the consent flag works came out — it is
+    enforced in code now, and the refusal explains itself at the point of the wrong call, which
+    is both later and better placed than a paragraph read at the top of every turn."""
+    from app.services.policy import CONSENT_DOES_NOT_GRANT_ITSELF
+
     prompt = orchestrator().system_prompt()
     assert "agreeing to an EDIT" in prompt
-    assert "replace_existing" in prompt
+    assert "replace_existing" not in prompt
+    assert "replace_existing" in CONSENT_DOES_NOT_GRANT_ITSELF
 
 
 # --- a filler itinerary_id must not hide the plan ----------------------------------------------
@@ -2518,8 +2530,13 @@ def test_finalising_a_plan_is_not_a_thing_the_model_has_to_do(db, orchestrator):
     There is nothing to call: the plan is already saved. The prompt now says so, and the refusal
     repeats it, because the refusal is what the model reads when it guesses wrong.
     """
+    from app.services.policy import REBUILD_IS_NOT_AN_EDIT
+
     prompt = orchestrator().system_prompt()
-    assert "there is no " in prompt and "finalising, confirming or committing" in prompt
+    # This moved out of the prompt entirely: the refusal is what the model reads when it guesses
+    # wrong, and it is now also what stops the call, so saying it twice bought nothing.
+    assert "finalising, confirming or committing" not in prompt
+    assert "no finalising, confirming or committing" in REBUILD_IS_NOT_AN_EDIT
     assert "A tool that comes back asking has changed NOTHING" in prompt
 
 
