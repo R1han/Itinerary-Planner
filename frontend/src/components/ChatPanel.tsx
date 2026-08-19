@@ -236,9 +236,7 @@ export function ChatPanel() {
     setStreaming(true)
     setStreamedText(() => '')
 
-    // The backend has no dedicated field for this — it's extracted from the message text by the
-    // chat model's own tool-call reasoning, same as any other place/date detail the user types.
-    const outgoing = emirate ? `[Starting emirate: ${emirate}] ${text}` : text
+    const outgoing = text
 
     let assistant = ''
     let thread = conversationId
