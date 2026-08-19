@@ -85,7 +85,7 @@ def test_the_spec_tools_are_all_exposed():
     # Beyond spec §8: get_itinerary, because without a way to READ a plan the assistant could
     # only describe one from stale context and would contradict the budget bar next to it;
     # find_live_events, spec §1.10's optional secondary path, exposed so the model can reach it
-    # rather than being a library nobody calls; and the three edit tools, without which the model
+    # rather than being a library nobody calls; and the edit tools, without which the model
     # is asked to change plans it has no way to change — and answers by describing edits it never
     # made.
     assert names == spec_tools | {
@@ -96,6 +96,7 @@ def test_the_spec_tools_are_all_exposed():
         "edit_stop",
         "set_transport",
         "add_stop",
+        "reschedule_itinerary",
     }
 
 
@@ -773,6 +774,39 @@ def test_making_a_day_cheaper_reports_what_it_actually_saved(client, planned, db
 
 def test_make_day_cheaper_rejects_a_day_that_does_not_exist(client, planned, db):
     result = _chat_for(db, planned[2]).call_tool("make_day_cheaper", {"day": 99})
+    assert "error" in result
+
+
+def test_reschedule_moves_the_start_date_and_keeps_every_stop(client, planned, db):
+    """The whole point: same trip, different calendar — nothing about it should be rebuilt."""
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    new_start = (date.today() + timedelta(days=45)).isoformat()
+    before_names = sorted(s["place"]["name"] for d in plan["days"] for s in d["slots"])
+
+    result = chat.call_tool("reschedule_itinerary", {"start_date": new_start})
+
+    assert "error" not in result, result
+    assert result["start_date"].isoformat() == new_start
+    assert chat.touched_itinerary is not None
+    after = client.get(f"/itineraries/{plan['id']}", headers=planned[0]).json()
+    assert after["start_date"] == new_start
+    assert sorted(s["place"]["name"] for d in after["days"] for s in d["slots"]) == before_names
+
+
+def test_reschedule_rejects_a_past_date(client, planned, db):
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    result = chat.call_tool("reschedule_itinerary", {"start_date": yesterday})
+
+    assert "error" in result
+    assert chat.touched_itinerary is None
+
+
+def test_rescheduling_needs_a_plan_to_reschedule(db, orchestrator):
+    result = orchestrator().call_tool("reschedule_itinerary", {"start_date": FUTURE})
     assert "error" in result
 
 

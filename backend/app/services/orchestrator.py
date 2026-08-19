@@ -269,6 +269,29 @@ _TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "reschedule_itinerary",
+            "description": (
+                "Move an existing plan to a different start date. Every stop and every edit the "
+                "user has made stays exactly as it is — only when the trip happens changes. A "
+                "stop that turns out to be seasonally closed on the new dates is dropped and "
+                "named in the result. Never use generate_itinerary for this: that discards the "
+                "plan and everyone's edits to build a new one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {
+                        "type": "string",
+                        "description": "ISO date, YYYY-MM-DD — the trip's new first day.",
+                    },
+                },
+                "required": ["start_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "make_day_cheaper",
             "description": (
                 "Re-solve one day of an existing plan against a smaller budget, swapping in "
@@ -636,6 +659,10 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
     if name == "get_itinerary":
         return "Reading the current plan", None
 
+    if name == "reschedule_itinerary":
+        when = args.get("start_date")
+        return "Changing the plan's dates", f"to {when}" if when else None
+
     if name == "make_day_cheaper":
         return "Finding cheaper options", f"day {int(_arg(args, 'day', 1))}"
 
@@ -701,6 +728,10 @@ def summarise_tool_result(name: str, result: dict) -> str:
             return "no plan yet"
         budget = result.get("budget") or {}
         return f"{_count(result.get('days', []), 'day')} · {_money(budget.get('total'))}"
+    if name == "reschedule_itinerary":
+        dropped = result.get("dropped_seasonally") or []
+        note = f", dropped {_count(dropped, 'stop')}" if dropped else ""
+        return f"now starts {result.get('start_date')}{note}"
     if name == "make_day_cheaper":
         saved = result.get("saved") or 0
         return f"saved {_money(saved)}" if saved > 0 else "nothing cheaper available"
@@ -805,7 +836,10 @@ class ChatOrchestrator:
             "wrong, and the real numbers are on screen next to you.\n\n"
             "Never say the plan changed unless a tool you called in THIS turn returned the "
             "change. You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
-            "set_transport, add_stop and edit_stop. To swap one stop for a different kind of "
+            "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
+            "for an existing plan is reschedule_itinerary, never generate_itinerary — it keeps "
+            "every stop and every edit, only the calendar dates move. To swap one stop for a "
+            "different kind of "
             "place use edit_stop with action='replace' and a category — never remove it and hope; "
             "removing leaves the day one stop short. Name the stop the way the user did and edit_stop will "
             "find it; there are no ids to fetch or remember. A replace that comes "
@@ -918,6 +952,7 @@ class ChatOrchestrator:
             "find_live_events": self._find_live_events,
             "generate_itinerary": self._generate_itinerary,
             "get_itinerary": self._get_itinerary,
+            "reschedule_itinerary": self._reschedule_itinerary,
             "make_day_cheaper": self._make_day_cheaper,
             "add_prayer_breaks": self._add_prayer_breaks,
             "set_transport": self._set_transport,
@@ -1286,9 +1321,11 @@ class ChatOrchestrator:
         payload = itinerary_service.itinerary_payload(self.db, itinerary)
         return {
             "itinerary_id": itinerary.id,
+            "start_date": payload["start_date"],
             "days": [
                 {
                     "day": day["day_index"] + 1,
+                    "date": day["date"],
                     "theme": day["theme"],
                     "subtotal": day["subtotal"],
                     "stops": [slot["place"].name for slot in day["slots"]],
@@ -1310,6 +1347,34 @@ class ChatOrchestrator:
         if itinerary is None:
             return None, {"error": "No plan has been generated yet, so there is nothing to edit."}
         return itinerary, None
+
+    def _reschedule_itinerary(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error:
+            return error
+
+        start = args.get("start_date")
+        try:
+            new_start = date.fromisoformat(str(start))
+        except (TypeError, ValueError):
+            return {"error": f"{start!r} is not an ISO date"}
+        if new_start < date.today():
+            return {"error": "That start date is in the past. Please choose a date in the future."}
+
+        before = {
+            slot["place"].name
+            for day in itinerary_service.itinerary_payload(self.db, itinerary)["days"]
+            for slot in day["slots"]
+        }
+        itinerary_service.reschedule(self.db, itinerary, self.user, new_start)
+        result = self._plan_result(itinerary)
+        dropped = sorted(before - {name for day in result["days"] for name in day["stops"]})
+        if dropped:
+            # Named rather than silently missing: a slot can lose its season on a reschedule the
+            # same way it could on generation, and the reply needs to say so, not just show fewer
+            # stops on screen.
+            result["dropped_seasonally"] = dropped
+        return result
 
     def _make_day_cheaper(self, args: dict) -> dict:
         itinerary, error = self._open_plan(args)

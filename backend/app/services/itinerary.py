@@ -1436,6 +1436,29 @@ def cheaper_day(db: Session, itinerary: Itinerary, user: User, day_index: int) -
     return plan
 
 
+@traced("itinerary.reschedule", run_type="chain")
+def reschedule(db: Session, itinerary: Itinerary, user: User, new_start_date: date) -> Plan:
+    """Move an existing plan to a new start date, keeping every stop and edit.
+
+    A day's slots depend on the calendar only through the month (seasonal closures, prayer
+    times), so this is a metadata change plus the same repair pass every edit already runs —
+    never a rebuild. Routing is untouched: the places and their order have not moved, so the
+    persisted travel segments are still correct. A slot that turns out to be seasonally closed in
+    the new month is dropped by repair_plan, same as it would be on generation.
+    """
+    context = context_for(db, itinerary, user)
+    itinerary.start_date = new_start_date
+    plan = load_plan(db, itinerary)
+
+    travel_service = _travel_service(db, itinerary, context)
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+
+    plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
 @traced("itinerary.prayer_breaks", run_type="chain")
 def add_prayer_breaks(db: Session, itinerary: Itinerary, user: User) -> Plan:
     context = context_for(db, itinerary, user)
