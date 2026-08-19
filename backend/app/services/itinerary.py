@@ -795,6 +795,19 @@ def _placements_in_day(
 # that went wrong three times running.
 _CATEGORY_WORDS = {"shopping": "mall", "restaurant": "dining", "food": "dining", "leisure": "park"}
 
+# Which sitting a meal word names, resolved against the clock.
+#
+# Deliberately separate from `PartyProfile.meal_windows`, which is what the generator schedules
+# around: those are narrow, per-party, and know only lunch and dinner. These are wide contiguous
+# buckets whose only job is to tell one day's sittings apart from each other once the user has
+# named one, so they cover the whole day and include breakfast — which the prompt has always told
+# the model to use and which nothing here could resolve.
+MEAL_SITTINGS: dict[str, tuple[int, int]] = {
+    "breakfast": (0, 11 * 60),
+    "lunch": (11 * 60, 16 * 60),
+    "dinner": (16 * 60, 24 * 60),
+}
+
 
 def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int | None = None) -> Slot:
     """Which stop the user meant, from the words they used for it.
@@ -857,12 +870,27 @@ def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int |
             return match[0]
         if match:
             # The same place can sit twice on one day (a lunch and a dinner at the same
-            # restaurant) — a name or category match alone can't tell those apart, but "dinner"
-            # in the user's own words can: it's the later of the two.
-            if "lunch" in text:
-                return min(match, key=lambda s: s.start_time)
-            if "dinner" in text:
-                return max(match, key=lambda s: s.start_time)
+            # restaurant) — a name or category match alone can't tell those apart, but a meal word
+            # in the user's own words can. Matched against the clock rather than by position: with
+            # three sittings "lunch" is the middle one, and taking the earliest handed back
+            # breakfast instead.
+            meal = next((word for word in MEAL_SITTINGS if word in text), None)
+            if meal is not None:
+                opens, closes = MEAL_SITTINGS[meal]
+                sitting = [s for s in match if opens <= to_minutes(s.start_time) < closes]
+                if len(sitting) == 1:
+                    return sitting[0]
+                if not sitting:
+                    raise ValueError(
+                        f"None of these is a {meal} sitting — "
+                        + "; ".join(
+                            f"{s.place.name} at {s.start_time} on day {s.day_index + 1}"
+                            for s in match
+                        )
+                        + ". Say which one by its time, or which day."
+                    )
+                # Narrowed but still ambiguous: report the sittings that survived, not all of them.
+                match = sitting
             raise ValueError(
                 f"{description!r} matches more than one stop — "
                 + "; ".join(

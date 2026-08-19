@@ -2107,6 +2107,55 @@ def test_a_repeated_name_on_one_day_is_told_apart_by_day_and_meal(client, planne
     assert found.id == duplicate.id
 
 
+def test_three_sittings_at_one_place_are_told_apart_by_the_meal_word(client, planned, db):
+    """Three sittings on one day, and the meal word has to land on the right one.
+
+    Resolving by position could not do this: "lunch" was whichever match came earliest, which is
+    breakfast once a day has three. And "breakfast" was not handled at all, though the prompt has
+    always told the model to disambiguate with it — so the one word the user was invited to say
+    dead-ended in the same ambiguity error it was meant to answer, which the prompt then forbade
+    retrying.
+    """
+    from app.models import Itinerary, Slot, TravelSegment
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    day0 = (
+        db.query(Slot)
+        .filter(Slot.itinerary_id == itinerary.id, Slot.day_index == 0)
+        .order_by(Slot.position)
+        .all()
+    )
+    place_id, name = day0[0].place_id, day0[0].place.name
+
+    # Segments hold FKs to slots, so they go first — the same order persist_plan uses.
+    db.query(TravelSegment).filter(TravelSegment.itinerary_id == itinerary.id).delete()
+    db.flush()
+    for row in day0:
+        db.delete(row)
+    db.flush()
+
+    sittings = {}
+    for position, (label, start, end) in enumerate(
+        (("breakfast", "08:15", "09:00"), ("lunch", "12:41", "13:30"), ("dinner", "19:24", "20:30"))
+    ):
+        row = Slot(
+            itinerary_id=itinerary.id, day_index=0, position=position,
+            place_id=place_id, start_time=start, end_time=end,
+        )
+        db.add(row)
+        sittings[label] = row
+    db.commit()
+
+    for label, row in sittings.items():
+        assert find_stop(db, itinerary, f"{name} {label}", day=1).id == row.id, label
+
+    # The bare name is still genuinely ambiguous — three sittings, nothing said about which.
+    with pytest.raises(ValueError, match="more than one stop"):
+        find_stop(db, itinerary, name, day=1)
+
+
 def test_an_empty_description_is_an_omission_not_a_match(client, planned, db):
     """Every stop contains the empty string, so this read as ambiguity instead of a mistake."""
     from app.models import Itinerary
@@ -2155,6 +2204,41 @@ def _abu_dhabi_day(db, planned):
     return chat
 
 
+def _thin_day_to(chat, limit: int) -> None:
+    """Remove stops until day 1 holds at most `limit` of them.
+
+    Every stop is addressed precisely, and a pass that removes nothing fails instead of going
+    round again. Removing `stops[0]` blindly did not terminate: the planner puts the same
+    restaurant on a day twice on purpose, a bare name cannot say which sitting is meant, and
+    `call_tool` reports that as a result rather than raising — so the day never got smaller and
+    the loop asked forever.
+    """
+    from app.services.itinerary import MEAL_SITTINGS
+
+    def handle_for(stop, names) -> str | None:
+        if names.count(stop["name"]) == 1:
+            return stop["name"]
+        start = int(stop["start"][:2]) * 60 + int(stop["start"][3:])
+        for word, (opens, closes) in MEAL_SITTINGS.items():
+            if opens <= start < closes:
+                return f"{stop['name']} {word}"
+        return None
+
+    while True:
+        stops = chat.call_tool("get_itinerary", {})["days"][0]["stops"]
+        if len(stops) <= limit:
+            return
+        names = [s["name"] for s in stops]
+        for stop in stops:
+            handle = handle_for(stop, names)
+            if handle is None:
+                continue
+            if "error" not in chat.call_tool("edit_stop", {"stop": handle, "action": "remove"}):
+                break
+        else:
+            raise AssertionError(f"no stop on this day could be removed: {names}")
+
+
 def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
     """The reported bug: 'replace shopping with an adventure' refused with AED 1,168 unspent.
 
@@ -2165,9 +2249,7 @@ def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
     chat = _abu_dhabi_day(db, planned)
     # A packed day has no room to re-time INTO — the honest answer there is "that would cost the
     # day a stop", tested separately. Thin it out so re-timing is the thing under test.
-    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
-        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
-        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+    _thin_day_to(chat, 2)
 
     plan = chat.call_tool("get_itinerary", {})
     last = plan["days"][0]["stops"][-1]
@@ -2365,9 +2447,7 @@ def test_a_confirmation_carries_the_plan_as_it_really_stands(client, planned, db
     correct all along and the user was told otherwise, which is the worst way to be wrong.
     """
     chat = _abu_dhabi_day(db, planned)
-    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
-        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
-        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+    _thin_day_to(chat, 2)
 
     before = [s["name"] for s in chat.call_tool("get_itinerary", {})["days"][0]["stops"]]
     asked = chat.call_tool(
@@ -2387,9 +2467,7 @@ def test_a_confirmation_does_not_nudge_the_right_pane(client, planned, db):
     """`touched_itinerary` is what makes the stream emit `itinerary_updated`. A question changed
     nothing, so a refresh would only redraw the same plan and imply otherwise."""
     chat = _abu_dhabi_day(db, planned)
-    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
-        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
-        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+    _thin_day_to(chat, 2)
 
     last = chat.call_tool("get_itinerary", {})["days"][0]["stops"][-1]["name"]
     chat.touched_itinerary = None
