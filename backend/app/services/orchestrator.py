@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterator
 from datetime import date, timedelta
 
@@ -52,6 +53,11 @@ log = logging.getLogger(__name__)
 # more forgiving.
 MAX_TOOL_ROUNDS = 6
 HISTORY_LIMIT = 20
+
+# The frontend folds the "starting emirate" dropdown into the message text so the model's own
+# tool-call reasoning can pick it up (see ChatPanel.tsx) — strip it back out before persisting so
+# saved/replayed history reads like what the user actually typed.
+_STARTING_EMIRATE_PREFIX = re.compile(r"^\[Starting emirate: [^\]]*\]\s*")
 
 EVENT_TYPES = ["birthday", "anniversary", "family_visit", "graduation", "eid", "holiday", "other"]
 
@@ -1033,6 +1039,12 @@ class ChatOrchestrator:
             "current figures first — the user edits slots, swaps stops and asks for cheaper days "
             "between messages, so anything you saw earlier in this conversation may already be "
             "wrong, and the real numbers are on screen next to you.\n\n"
+            "find_places only ever returns price_adult, one adult's ticket — never the swap's "
+            "real cost, which is every adult plus every paying child. Never tell the user a place "
+            "'fits' or 'is within budget' from that number: you have not checked, and edit_stop "
+            "is the only place that actually prices the whole party against what's left. State "
+            "the ticket price plainly and let the swap itself confirm affordability; if it comes "
+            "back over budget, just say so — don't repeat a fit you never actually checked.\n\n"
             "Never say the plan changed unless a tool you called in THIS turn returned the "
             "change. You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
             "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
@@ -1910,7 +1922,7 @@ class ChatOrchestrator:
         self._rebind()
         self.rebuild_refused = False
         self.warned_at_turn_start = bool(self.conversation.rebuild_warned)
-        self.record("user", user_message)
+        self.record("user", _STARTING_EMIRATE_PREFIX.sub("", user_message, count=1))
         self.db.commit()
         # A failure here propagates to the router, which turns it into an `error` frame. The
         # assistant is a hard dependency, so a failure is reported rather than worked around.
