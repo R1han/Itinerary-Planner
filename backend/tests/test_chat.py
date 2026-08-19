@@ -11,6 +11,7 @@ import json
 from datetime import date, timedelta
 
 import pytest
+from sqlalchemy import select
 
 from app.models import Conversation, Event, FamilyMember, Preference, User
 from app.services.budget import Attendee
@@ -87,10 +88,12 @@ def test_the_spec_tools_are_all_exposed():
     # find_live_events, spec §1.10's optional secondary path, exposed so the model can reach it
     # rather than being a library nobody calls; and the edit tools, without which the model
     # is asked to change plans it has no way to change — and answers by describing edits it never
-    # made.
+    # made; and find_places, without which the catalog is unreachable and "what is there to see
+    # in the UAE" is answered from the model's own knowledge — places the planner cannot book.
     assert names == spec_tools | {
         "get_itinerary",
         "find_live_events",
+        "find_places",
         "make_day_cheaper",
         "add_prayer_breaks",
         "edit_stop",
@@ -2350,3 +2353,226 @@ def test_the_calendar_answers_which_events_have_no_plan(client, planned, db, orc
     assert "planned" not in by_title["Has none"]
     # And the question is answered rather than left to be derived.
     assert result["without_a_plan"] == ["Has none"]
+
+
+# --- browsing the places catalog ---------------------------------------------------------------
+
+
+@pytest.fixture
+def catalog(db):
+    """The real seeded catalog, descriptions included.
+
+    Deliberately the shipped places.json rather than a handful of fakes: what is under test here
+    is paging and capping over a catalog far larger than one reply, and 146 Dubai rows is the
+    thing that makes page 2 mean something.
+    """
+    from pathlib import Path
+
+    from app.models import Place
+    from app.seed import default_price_bands
+
+    rows = json.loads(
+        (Path(__file__).resolve().parent.parent / "app" / "data" / "places.json").read_text()
+    )
+    for row in rows:
+        db.add(
+            Place(
+                name=row["name"], emirate=row["emirate"], lat=row["lat"], lng=row["lng"],
+                category=row["category"], price_adult=row.get("price_adult", 0),
+                price_child=row.get("price_child", 0),
+                price_bands=row.get("price_bands") or default_price_bands(row),
+                min_age=row.get("min_age", 0), open_time=row.get("open_time", "09:00"),
+                close_time=row.get("close_time", "22:00"),
+                avg_duration_min=row.get("avg_duration_min", 90), tags=row.get("tags", []),
+                kid_score=row.get("kid_score", 0.5), teen_score=row.get("teen_score", 0.5),
+                romance_score=row.get("romance_score", 0.5),
+                description=row.get("description", ""),
+            )
+        )
+    db.commit()
+    return rows
+
+
+def test_find_places_is_exposed_as_a_tool():
+    assert "find_places" in {tool["function"]["name"] for tool in TOOLS}
+
+
+def test_a_whole_emirate_comes_back_a_page_at_a_time(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"emirate": "Dubai"})
+
+    assert len(result["places"]) == 20
+    assert result["total_matching"] == sum(1 for row in catalog if row["emirate"] == "Dubai")
+    assert result["has_more"] is True
+    assert {place["emirate"] for place in result["places"]} == {"Dubai"}
+
+
+def test_full_details_come_back_ten_at_a_time(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"emirate": "Dubai", "detail": "full"})
+
+    assert len(result["places"]) == 10
+    assert all(place["description"] for place in result["places"])
+
+
+def test_a_brief_listing_carries_no_descriptions(catalog, orchestrator):
+    """The point of two detail levels is that the brief one is actually brief."""
+    result = orchestrator().call_tool("find_places", {"emirate": "Dubai"})
+
+    assert "description" not in result["places"][0]
+
+
+def test_page_two_continues_rather_than_repeating(catalog, orchestrator):
+    tool = orchestrator()
+    first = tool.call_tool("find_places", {"emirate": "Dubai"})
+    second = tool.call_tool("find_places", {"emirate": "Dubai", "page": 2})
+
+    names = {place["name"] for place in first["places"]}
+    assert not names & {place["name"] for place in second["places"]}
+    assert second["page"] == 2
+
+
+def test_the_last_page_says_there_is_no_more(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"emirate": "Umm Al Quwain"})
+
+    assert result["has_more"] is False
+    assert len(result["places"]) == result["total_matching"]
+
+
+def test_places_can_be_narrowed_to_one_kind(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"emirate": "Dubai", "category": "beach"})
+
+    assert result["places"]
+    assert {place["category"] for place in result["places"]} == {"beach"}
+
+
+def test_a_budget_ceiling_excludes_the_pricier_places(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"max_price_adult": 0})
+
+    assert result["places"]
+    assert all(place["price_adult"] == 0 for place in result["places"])
+    assert result["total_matching"] == sum(
+        1 for row in catalog if row.get("price_adult", 0) == 0
+    )
+
+
+def test_naming_one_place_returns_it_in_full(catalog, orchestrator):
+    """A named place is a request for detail, whatever the detail argument says."""
+    result = orchestrator().call_tool("find_places", {"name": "Ski Dubai"})
+
+    assert result["total_matching"] == 1
+    assert result["places"][0]["name"] == "Ski Dubai"
+    assert result["places"][0]["description"]
+
+
+def test_an_ambiguous_name_offers_the_candidates_rather_than_picking(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"name": "beach"})
+
+    assert result["total_matching"] > 1
+    assert len(result["places"]) > 1
+    # Brief, because the model's next move is to ask which one — not to describe all of them.
+    assert "description" not in result["places"][0]
+
+
+def test_a_name_that_matches_nothing_says_so(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"name": "Eiffel Tower"})
+
+    assert result["places"] == []
+    assert result["no_match"] == "Eiffel Tower"
+
+
+def test_an_unknown_emirate_is_refused_by_name(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"emirate": "Al Ain"})
+
+    assert "Abu Dhabi" in result["error"]
+    assert "places" not in result
+
+
+# --- searching the catalog by meaning ----------------------------------------------------------
+
+
+def test_a_query_ranks_by_meaning_and_says_so(catalog, orchestrator, monkeypatch, db):
+    """With embeddings available, order comes from Chroma rather than the alphabet."""
+    from app.models import Place
+    from app.services import orchestrator as module
+
+    far = db.scalars(select(Place).where(Place.name == "Aquaventure Waterpark")).one()
+    near = db.scalars(select(Place).where(Place.name == "Yas Waterworld")).one()
+    monkeypatch.setattr(
+        module, "semantic_similarities", lambda query, **kw: {near.id: 0.9, far.id: 0.4}
+    )
+
+    result = orchestrator().call_tool("find_places", {"query": "water rides"})
+
+    assert [place["name"] for place in result["places"]] == [near.name, far.name]
+    assert result["matched_by"] == "meaning"
+
+
+def test_a_query_falls_back_to_keywords_without_embeddings(catalog, orchestrator):
+    """The suite runs with embeddings disabled — the same path as a missing API key."""
+    result = orchestrator().call_tool("find_places", {"query": "water rides"})
+
+    assert result["matched_by"] == "keywords"
+    assert result["places"]
+
+
+def test_a_query_is_narrowed_by_the_other_filters(catalog, orchestrator):
+    result = orchestrator().call_tool(
+        "find_places", {"query": "water rides", "emirate": "Abu Dhabi"}
+    )
+
+    assert result["places"]
+    assert {place["emirate"] for place in result["places"]} == {"Abu Dhabi"}
+
+
+def test_a_narrow_filter_the_vector_pool_missed_still_answers(catalog, orchestrator, monkeypatch):
+    """Chroma scores only the top slice of the whole catalog.
+
+    A small emirate can have none of its places in that slice, and coming back empty would read
+    as "there is nothing there" when the truth is "nothing there ranked in the global top 200".
+    """
+    from app.services import orchestrator as module
+
+    monkeypatch.setattr(module, "semantic_similarities", lambda query, **kw: {-1: 0.9})
+
+    result = orchestrator().call_tool(
+        "find_places", {"query": "beach", "emirate": "Umm Al Quwain"}
+    )
+
+    assert result["places"]
+    assert result["matched_by"] == "keywords"
+
+
+def test_a_query_matching_nothing_says_so_rather_than_listing_everything(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"query": "skiing in the alps"})
+
+    assert result["places"] == []
+    assert result["no_match"] == "skiing in the alps"
+
+
+def test_an_age_excludes_places_that_child_cannot_enter(catalog, orchestrator):
+    result = orchestrator().call_tool("find_places", {"suitable_for_age": 8, "detail": "full"})
+
+    assert result["places"]
+    assert all(place["min_age"] <= 8 for place in result["places"])
+    assert result["total_matching"] == sum(1 for row in catalog if row.get("min_age", 0) <= 8)
+    assert result["total_matching"] < len(catalog)
+
+
+def test_the_whole_question_answers_in_one_call(catalog, orchestrator):
+    """'What places can my child who enjoys water rides visit in Abu Dhabi?'"""
+    result = orchestrator().call_tool(
+        "find_places",
+        {"query": "child who enjoys water rides", "emirate": "Abu Dhabi", "suitable_for_age": 7},
+    )
+
+    names = [place["name"] for place in result["places"]]
+    assert names, "the catalog has Abu Dhabi water attractions a 7-year-old can enter"
+    assert "Yas Waterworld" in names
+
+
+def test_a_listing_without_a_query_stays_alphabetical(catalog, orchestrator):
+    """The meaning path is opt-in; plain browsing must not start ranking."""
+    result = orchestrator().call_tool("find_places", {"emirate": "Dubai"})
+
+    names = [place["name"] for place in result["places"]]
+    assert names == sorted(names)
+    assert "matched_by" not in result

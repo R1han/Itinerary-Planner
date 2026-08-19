@@ -31,6 +31,7 @@ from ..models import (
     FamilyMember,
     Itinerary,
     Message,
+    Place,
     Preference,
     Slot,
     User,
@@ -38,7 +39,7 @@ from ..models import (
 )
 from . import itinerary as itinerary_service
 from .budget import Attendee
-from .retrieval import EMIRATES
+from .retrieval import EMIRATES, keyword_similarities, semantic_similarities
 from .memory import MemoryService
 from .websearch import find_live_events
 from .tracing import traced, wrap_openai
@@ -53,6 +54,19 @@ MAX_TOOL_ROUNDS = 6
 HISTORY_LIMIT = 20
 
 EVENT_TYPES = ["birthday", "anniversary", "family_visit", "graduation", "eid", "holiday", "other"]
+
+# The catalog's twelve kinds of place. One list rather than the copy per tool it used to be —
+# three inlined copies is where an enum starts drifting from the column it is meant to match.
+PLACE_CATEGORIES = [
+    "adventure", "aquarium", "beach", "casual_dining", "cruise", "fine_dining",
+    "mall", "museum", "park", "show", "theme_park", "waterpark",
+]
+
+# Page sizes belong to the server, not to the model. Asked to pick a limit it picks the catalog:
+# a brief page is a list you can skim, a detailed page is ten write-ups, and both are a reply
+# rather than a wall. `has_more` is what turns the rest into an offer instead of a truncation.
+BRIEF_PAGE = 20
+FULL_PAGE = 10
 
 # Note the absence of any user_id parameter — deliberate, and load-bearing.
 #
@@ -143,6 +157,92 @@ _TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_places",
+            "description": (
+                "Look up what there is to visit. This catalog is the ONLY source for places — "
+                "never list attractions, restaurants, beaches or malls from your own knowledge, "
+                "because a place that is not in here cannot be planned, and naming one sends the "
+                "user somewhere the itinerary will never take them. READ-ONLY: it saves nothing "
+                "and changes no plan. Filters combine, so an emirate and a kind and a price "
+                "ceiling can be asked for at once. One page comes back at a time; `has_more` "
+                "means there are more to offer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emirate": {
+                        "type": "string",
+                        "enum": list(EMIRATES),
+                        "description": (
+                            "Only the seven emirates. Map a city to the one containing it — "
+                            "Al Ain and Liwa are Abu Dhabi, Khor Fakkan is Sharjah. Null "
+                            "searches the whole country."
+                        ),
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": PLACE_CATEGORIES,
+                        "description": "What kind of place. Null means any kind.",
+                    },
+                    "max_price_adult": {
+                        "type": "number",
+                        "description": (
+                            "Most an adult ticket may cost, in AED. Use it whenever the user "
+                            "mentions a budget or asks for something cheap; 0 finds the free "
+                            "ones. Null means no ceiling."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Ask about one specific place by name. A single match comes back in "
+                            "full whatever `detail` says; several come back as a short list to "
+                            "put to the user. Null lists rather than looks up."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "What the user is actually after, in their own words — 'somewhere "
+                            "quiet for grandparents', 'loves water rides', 'rainy day with a "
+                            "toddler'. Matched on meaning, so it finds places no keyword would: "
+                            "use it whenever the ask is about a taste or an interest rather "
+                            "than a kind of place. `category` is for when they named a kind. "
+                            "Null lists rather than searches."
+                        ),
+                    },
+                    "suitable_for_age": {
+                        "type": "integer",
+                        "description": (
+                            "Drop places this child is too young to enter. Pass the age when "
+                            "the user asks what one of their children can do — a third of the "
+                            "catalog has a minimum age, so without it the list includes places "
+                            "they would be turned away from. Null applies no age limit."
+                        ),
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["brief", "full"],
+                        "description": (
+                            "'brief' is a name, kind and price — the right answer to 'what is "
+                            "there in Dubai'. 'full' adds the description, hours and tags, and "
+                            "returns fewer per page. Null means brief."
+                        ),
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": (
+                            "1-based. Null means the first page. Send the next one only when "
+                            "the user asks for more."
+                        ),
+                    },
+                },
             },
         },
     },
@@ -333,7 +433,7 @@ _TOOL_DEFINITIONS = [
                     "day": {"type": "integer", "description": "1-based day number."},
                     "category": {
                         "type": "string",
-                        "enum": ["adventure", "aquarium", "beach", "casual_dining", "cruise", "fine_dining", "mall", "museum", "park", "show", "theme_park", "waterpark"],
+                        "enum": PLACE_CATEGORIES,
                         "description": "What kind of place. Omit to take the best of any kind.",
                     },
                 },
@@ -384,7 +484,7 @@ _TOOL_DEFINITIONS = [
                     "action": {"type": "string", "enum": ["remove", "adjust", "replace"]},
                     "category": {
                         "type": "string",
-                        "enum": ["adventure", "aquarium", "beach", "casual_dining", "cruise", "fine_dining", "mall", "museum", "park", "show", "theme_park", "waterpark"],
+                        "enum": PLACE_CATEGORIES,
                         "description": (
                             "For action='replace': the kind of place to swap in. The server "
                             "picks the best one that fits the slot's window and budget."
@@ -584,6 +684,34 @@ def _fit_party(household: int, total: int, guests: list[Attendee]) -> list[Atten
     return (guests + [Attendee(role="adult", age=DEFAULT_GUEST_AGE)] * extra)[:extra]
 
 
+def _place_summary(place: Place) -> dict:
+    """Enough to list a place: what it is, where, and what it costs to walk in."""
+    return {
+        "name": place.name,
+        "emirate": place.emirate,
+        "category": place.category,
+        "price_adult": place.price_adult,
+    }
+
+
+def _place_detail(place: Place) -> dict:
+    """Everything worth saying about one place. Deliberately not the whole row — lat/lng and the
+    scoring columns are the planner's business and only give the model figures to misquote."""
+    return {
+        **_place_summary(place),
+        "price_child": place.price_child,
+        "min_age": place.min_age,
+        "opens": place.open_time,
+        "closes": place.close_time,
+        "typical_visit_min": place.avg_duration_min,
+        "indoor": place.indoor,
+        "booking_required": place.booking_required,
+        "closed_months": list(place.closed_months or ()),
+        "tags": list(place.tags or ()),
+        "description": place.description,
+    }
+
+
 def sse(event_type: str, data) -> str:
     """One Server-Sent Event frame."""
     return f"data: {json.dumps({'type': event_type, 'data': data}, default=str)}\n\n"
@@ -632,6 +760,27 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
     if name == "find_live_events":
         query = str(_arg(args, "query", "")).strip()
         return "Searching for live events", query or None
+
+    if name == "find_places":
+        looked_up = str(_arg(args, "name", "")).strip()
+        if looked_up:
+            return "Looking up a place", looked_up
+        bits = [
+            str(_arg(args, "query", "")).strip(),
+            str(args.get("emirate") or ""),
+            str(args.get("category") or "").replace("_", " "),
+        ]
+        age = args.get("suitable_for_age")
+        if age is not None:
+            bits.append(f"age {int(age)}+")
+        ceiling = args.get("max_price_adult")
+        if ceiling is not None:
+            bits.append("free" if not float(ceiling) else f"under {_money(ceiling)}")
+        page = int(_arg(args, "page", 1))
+        if page > 1:
+            bits.append(f"page {page}")
+        label = "Searching places" if str(_arg(args, "query", "")).strip() else "Browsing places"
+        return label, " · ".join(bit for bit in bits if bit) or "anywhere"
 
     if name == "generate_itinerary":
         bits = []
@@ -721,6 +870,15 @@ def summarise_tool_result(name: str, result: dict) -> str:
         if not result.get("found"):
             return "nothing found"
         return _count(result.get("events", []), "event") + " found"
+    if name == "find_places":
+        if result.get("no_match"):
+            return "not in the catalog"
+        total = result.get("total_matching") or 0
+        shown = len(result.get("places") or [])
+        return f"{shown} of {_count([None] * total, 'place')}" if shown < total else _count(
+            [None] * total, "place"
+        )
+
     if name == "generate_itinerary":
         return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "get_itinerary":
@@ -866,6 +1024,24 @@ class ChatOrchestrator:
             f"Dislikes: {', '.join(dislikes)}\n"
             f"Remembered from earlier sessions:\n{memory_text}\n"
             f"On their calendar:\n{calendar_text}\n\n"
+            "What there is to visit comes from find_places and nowhere else. Asked what is in "
+            "Dubai, what museums there are, what is free or what is under 100 dirhams, call it — "
+            "do not answer from your own knowledge of the UAE. A place you name that the catalog "
+            "does not have is a place the planner cannot book, so the user is being sent "
+            "somewhere the itinerary will never go. Give a plain list of what comes back; when "
+            "`has_more` is true, say roughly how many are left and offer the next page rather "
+            "than dumping it. Full write-ups are ten at a time — if they want detail on "
+            "everything, say the list is long and ask which ones, or work through it a page at "
+            "a time. When they want detail and have not said about what, ask which place they "
+            "mean rather than describing all of them, and pass that name through `name`. "
+            "A name matching several places comes back as a short list: put it to them and let "
+            "them choose. When the ask is about a taste rather than a kind of place — 'my "
+            "daughter loves water rides', 'somewhere quiet', 'what can we do in the rain' — put "
+            "their own words in `query` and let it match on meaning; `category` is only for when "
+            "they named a kind. Add `suitable_for_age` whenever they ask what one of their "
+            "children can do, or the list will include places that child is turned away from. "
+            "`matched_by: \"keywords\"` means the meaning search was unavailable and the match "
+            "is a plainer one, so offer the list without promising it understood them.\n\n"
             "Where the trip happens is yours to set. When the user names a place — an emirate, "
             "a city, 'around Abu Dhabi or Al Ain' — pass `emirates` on generate_itinerary. Only "
             "the seven emirates are valid, so map a city to the emirate containing it: Al Ain "
@@ -950,6 +1126,7 @@ class ChatOrchestrator:
             "create_event": self._create_event,
             "get_upcoming_events": self._get_upcoming_events,
             "find_live_events": self._find_live_events,
+            "find_places": self._find_places,
             "generate_itinerary": self._generate_itinerary,
             "get_itinerary": self._get_itinerary,
             "reschedule_itinerary": self._reschedule_itinerary,
@@ -1080,6 +1257,102 @@ class ChatOrchestrator:
                 for row in rows
             ],
         }
+
+    def _find_places(self, args: dict) -> dict:
+        """Browse the shared catalog. **Reads only, and reads no user-owned table.**
+
+        `places` has no user_id by design (spec §4), so unlike every other tool here there is
+        nothing to scope — which is also why it does not go through repo.py.
+
+        Ordered by name rather than by any score: paging is only safe over a stable order, and
+        the catalog has no popularity column to rank by. A kid_score sort would have quietly
+        turned every list, including a couple's, into a list of things for children.
+        """
+        emirate = str(_arg(args, "emirate", "")).strip()
+        if emirate and emirate not in EMIRATES:
+            # Named, not just rejected: the model can retry in the same turn with a real one,
+            # and the commonest miss is a city — Al Ain, Khor Fakkan — not an invention.
+            return {
+                "error": (
+                    f"'{emirate}' is not one of the seven emirates. Use one of: "
+                    f"{', '.join(EMIRATES)}. A city belongs to the emirate containing it."
+                )
+            }
+
+        name = str(_arg(args, "name", "")).strip()
+        category = str(_arg(args, "category", "")).strip()
+        query = str(_arg(args, "query", "")).strip()
+        ceiling = args.get("max_price_adult")
+        age = args.get("suitable_for_age")
+
+        statement = select(Place)
+        if emirate:
+            statement = statement.where(Place.emirate == emirate)
+        if category:
+            statement = statement.where(Place.category == category)
+        if ceiling is not None:
+            statement = statement.where(Place.price_adult <= float(ceiling))
+        if age is not None:
+            statement = statement.where(Place.min_age <= int(age))
+        if name:
+            statement = statement.where(Place.name.ilike(f"%{name}%"))
+
+        # Hard filters first, meaning second. An age limit or a price ceiling is a fact about
+        # whether the family can go at all; similarity is only an opinion about what they'd like,
+        # and ranking before filtering spends the page on places they cannot enter.
+        matches = list(self.db.scalars(statement.order_by(Place.name)))
+        matched_by = None
+        if query and matches:
+            matches, matched_by = self._rank_by_meaning(query, matches)
+
+        if (name or query) and not matches:
+            # Said outright rather than left as an empty list, because an empty list is the one
+            # result a model will happily fill in from its own knowledge.
+            return {"places": [], "total_matching": 0, "no_match": name or query}
+
+        # One named place is a request to describe it, so detail is implied. Several is a request
+        # to disambiguate, and a page of write-ups is the wrong answer to "which one did you mean".
+        full = str(_arg(args, "detail", "brief")) == "full" or (bool(name) and len(matches) == 1)
+        size = FULL_PAGE if full else BRIEF_PAGE
+        page = max(1, int(_arg(args, "page", 1)))
+        start = (page - 1) * size
+        window = matches[start : start + size]
+        shape = _place_detail if full else _place_summary
+
+        result = {
+            "places": [shape(place) for place in window],
+            "page": page,
+            "total_matching": len(matches),
+            "has_more": start + len(window) < len(matches),
+        }
+        if matched_by:
+            # So the reply can be honest about which search actually ran. Without embeddings this
+            # degrades silently, and "matched on meaning" is a much bigger claim than the keyword
+            # scoring that was really used.
+            result["matched_by"] = matched_by
+        return result
+
+    def _rank_by_meaning(self, query: str, places: list[Place]) -> tuple[list[Place], str]:
+        """Order `places` by relevance to `query`, dropping the ones that do not match at all.
+
+        Two passes, because Chroma is asked for the best SEMANTIC_POOL of the WHOLE catalog and
+        knows nothing of the filters already applied: a small emirate can have none of its places
+        in that slice, and returning empty would say "there is nothing there" when the truth is
+        "nothing there placed in the global top 200". The keyword pass scores the filtered set
+        itself, so it cannot miss for that reason. It doubles as the no-embeddings path, where
+        the semantic call returns {} and the first pass is empty anyway.
+        """
+        similarities = semantic_similarities(query)
+        hits = [place for place in places if similarities.get(place.id, 0.0) > 0]
+        matched_by = "meaning"
+        if not hits:
+            similarities = keyword_similarities(query, places)
+            hits = [place for place in places if similarities.get(place.id, 0.0) > 0]
+            matched_by = "keywords"
+
+        # Name breaks ties so the order is total, and therefore stable enough to page through.
+        hits.sort(key=lambda place: (-similarities[place.id], place.name))
+        return hits, matched_by
 
     def _generate_itinerary(self, args: dict) -> dict:
         event_id = args.get("event_id")
