@@ -21,7 +21,7 @@ import logging
 from collections.abc import Iterator
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -1526,6 +1526,17 @@ class ChatOrchestrator:
         if not emirates and current is not None:
             emirates = current.emirates_json or []
 
+        # home_base is the user's real-life address, not where this trip happens — a Dubai
+        # resident who says "starting in Abu Dhabi" needs the origin (and the map's start point)
+        # to move with the trip, not stay pinned to where they live.
+        start_lat, start_lng = self.user.home_base_lat, self.user.home_base_lng
+        if emirates:
+            centroid = self.db.execute(
+                select(func.avg(Place.lat), func.avg(Place.lng)).where(Place.emirate.in_(emirates))
+            ).one()
+            if centroid[0] is not None:
+                start_lat, start_lng = centroid[0], centroid[1]
+
         guests = _guests(args)
         if not guests and current is not None:
             # Same failure the transport mode has: the user says "seven of us", something
@@ -1543,8 +1554,8 @@ class ChatOrchestrator:
                 start_date=start_date,
                 num_days=days,
                 total_budget=budget,
-                start_lat=self.user.home_base_lat,
-                start_lng=self.user.home_base_lng,
+                start_lat=start_lat,
+                start_lng=start_lng,
                 event_id=event.id if event else None,
                 title=event.title if event else None,
                 currency=self.user.default_currency,
