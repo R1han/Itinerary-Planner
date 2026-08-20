@@ -1753,7 +1753,11 @@ class DayBudgetRequired(ValueError):
 
 @traced("itinerary.add_day", run_type="chain")
 def add_day(
-    db: Session, itinerary: Itinerary, user: User, extra_budget: float | None = None
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    extra_budget: float | None = None,
+    emirates: Sequence[str] | None = None,
 ) -> Plan:
     """Append one more day to the end of a plan, leaving every existing day untouched.
 
@@ -1770,8 +1774,11 @@ def add_day(
     to strip stops from the days the user already has. The cap is a ceiling they set, so only they
     can raise it — which is why the tool takes the figure instead of inventing one.
     """
+    # Zero is not a budget, it is the absence of one — and it is what arrives, because strict mode
+    # gives the model a slot it must fill and "leave it out" is advice. Rejecting it asked the user
+    # to fund a day their own remaining 2,859 already covered.
     if extra_budget is not None and extra_budget <= 0:
-        raise ValueError("A budget for the new day has to be above zero.")
+        extra_budget = None
     if itinerary.num_days >= MAX_DAYS:
         raise ValueError(f"A trip runs at most {MAX_DAYS} days, and this one already does.")
 
@@ -1788,12 +1795,19 @@ def add_day(
     new_index = itinerary.num_days
     new_date = itinerary.start_date + timedelta(days=new_index)
 
+    # A day of its own can go somewhere of its own. Narrowing only the retrieval leaves the trip's
+    # own `emirates_json` alone, which is the point: this is where ONE day happens, not a decision
+    # that the whole trip has moved.
+    #
+    # ponytail: the day still sets off from the trip's origin, so an Abu Dhabi day on a Dubai trip
+    # is priced with the drive there — which is the truth. Move the origin per day if that ever
+    # needs to model an overnight instead.
     candidates = retrieve_candidates(
         db,
         context.profile,
         query_for(context.profile, event.title if event else "", event.notes if event else ""),
         origin=context.origin,
-        emirates=context.emirates,
+        emirates=list(emirates) if emirates else context.emirates,
     )
     travel_service = _travel_service(db, itinerary, context)
 
@@ -1819,6 +1833,12 @@ def add_day(
         currency=plan.currency,
     )
     if not solved.days or not solved.days[0].slots:
+        if emirates:
+            raise ValueError(
+                f"Nothing fits a day in {', '.join(emirates)} at "
+                f"{budget_for_day:,.0f} {plan.currency}. Say so, and ask whether to spend more or "
+                f"look somewhere else."
+            )
         if extra_budget is None:
             raise DayBudgetRequired(remaining, plan.currency)
         raise ValueError(

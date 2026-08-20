@@ -2951,6 +2951,42 @@ def test_a_day_the_trip_can_already_afford_costs_the_user_nothing_extra(client, 
     assert added["total"] <= cap_before
 
 
+def test_a_budget_of_zero_is_no_budget_rather_than_a_bad_one(client, planned, db):
+    """What the model actually sent. Told to leave the figure out it passed 0 — strict mode gives
+    it a slot it must fill — and the day was refused while 2,859 of the trip's own budget sat
+    unspent. Zero is the absence of a figure, and absence is what spends the remainder."""
+    chat = _dubai_day(db, planned, days=1)
+    cap_before = chat.call_tool("get_itinerary", {})["budget"]["cap"]
+
+    added = chat.call_tool("add_day", {"extra_budget": 0})
+
+    assert "error" not in added, added
+    assert added["added_day"] == 2 and added["days"][1]["stops"]
+    assert added["budget_now"] == cap_before, "zero was treated as a top-up"
+
+
+def test_a_new_day_can_be_confined_to_its_own_emirate(client, planned, db):
+    """"Make it an Abu Dhabi day" is about one day, not about the trip. The stops come from
+    there; nothing already planned moves, and the trip's own region is untouched."""
+    from app.models import Itinerary
+
+    chat = _dubai_day(db, planned, days=1)
+    before = [name for day in chat.call_tool("get_itinerary", {})["days"]
+              for name in [stop["name"] for stop in day["stops"]]]
+
+    added = chat.call_tool("add_day", {"emirates": ["Abu Dhabi"]})
+
+    assert "error" not in added, added
+    assert added["added_day_emirates"] == ["Abu Dhabi"]
+    assert [name for name in added["days"][0]["stops"]] == before, "day one moved"
+
+    itinerary = db.query(Itinerary).order_by(Itinerary.id.desc()).first()
+    new_day = [slot for slot in itinerary.slots if slot.day_index == 1]
+    assert new_day and all(slot.place.emirate == "Abu Dhabi" for slot in new_day)
+    # The trip is still a Dubai trip: one day went visiting, the plan did not relocate.
+    assert itinerary.emirates_json == ["Dubai"]
+
+
 def test_a_remainder_too_small_for_a_day_asks_instead_of_shrinking_one(client, planned, db):
     """The other half of the same rule. "Enough for a day" is not a number anyone can name up
     front, so it is settled by trying — and a shortfall is a question, not a failure."""

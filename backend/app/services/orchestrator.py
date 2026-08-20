@@ -494,6 +494,17 @@ _TOOL_DEFINITIONS = [
                             "trip's cap rather than shared with the days already planned."
                         ),
                     },
+                    "emirates": {
+                        "type": "array",
+                        "description": (
+                            "Confine the NEW day to these emirates — 'make it an Abu Dhabi day'. "
+                            "Only this day is affected; the rest of the trip stays where it is, "
+                            "and the trip's own region is not changed. Leave empty to draw from "
+                            "wherever the trip already draws from. A city belongs to an emirate: "
+                            "'Al Ain' is ['Abu Dhabi'], 'Khor Fakkan' is ['Sharjah']."
+                        ),
+                        "items": {"type": "string", "enum": list(EMIRATES)},
+                    },
                 },
                 "required": [],
             },
@@ -1072,7 +1083,9 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
 
     if name == "add_day":
         extra = _arg(args, "extra_budget", None)
-        return "Adding a day", f"{_money(extra)} for it" if extra else "from what is left"
+        where = " / ".join(str(e) for e in (_arg(args, "emirates", []) or []))
+        spend = f"{_money(extra)} for it" if extra else "from what is left"
+        return "Adding a day", f"{where} · {spend}" if where else spend
 
     if name == "replace_plan":
         # Labelled by where it lands, because that is the part the user asked for; that every stop
@@ -1309,7 +1322,9 @@ class ChatOrchestrator:
             "add_day, which appends one and keeps every existing day as it is. Call it with "
             "nothing set: what the trip has not spent pays for the day, and only if that will not "
             "stretch to one does it come back asking for a figure — which is when you ask the "
-            "user, not before. A longer trip is never a reason to call generate_itinerary.\n\n"
+            "user, not before. The new day can be confined to its own emirate — 'add an Abu Dhabi "
+            "day' — with add_day's `emirates`, which moves nothing but that day. A longer trip is "
+            "never a reason to call generate_itinerary.\n\n"
             "You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
             "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
             "for an existing plan is reschedule_itinerary, never generate_itinerary — it keeps "
@@ -2086,8 +2101,9 @@ class ChatOrchestrator:
         except (TypeError, ValueError):
             return {"error": f"{args.get('extra_budget')!r} is not a budget."}
 
+        emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
         try:
-            itinerary_service.add_day(self.db, itinerary, self.user, extra)
+            itinerary_service.add_day(self.db, itinerary, self.user, extra, emirates=emirates)
         except itinerary_service.DayBudgetRequired as exc:
             # A shortfall is a question, not a failure: the plan is intact, nothing was added, and
             # the figure that would fix it is the user's to give.
@@ -2100,6 +2116,8 @@ class ChatOrchestrator:
         # drop_day states them: the reply has to get the trip's new length and cap right.
         result["added_day"] = itinerary.num_days
         result["budget_now"] = round(itinerary.total_budget, 2)
+        if emirates:
+            result["added_day_emirates"] = emirates
         return result
 
     def _replace_plan(self, args: dict) -> dict:
