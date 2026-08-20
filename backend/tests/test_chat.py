@@ -571,7 +571,7 @@ def test_a_blocked_intake_is_surfaced_to_the_client(client, make_user, monkeypat
     monkeypatch.setattr(ChatOrchestrator, "_llm", fake_llm)
 
     headers, _ = make_user("intake@rihla.app")  # registered, but no family recorded
-    events = frames(client.post("/chat", headers=headers, json={"message": "plan my trip"}))
+    events = frames(client.post("/chat", headers=headers, json={"message": "plan my trip, 3000 budget"}))
 
     checklist = next(e for e in events if e["type"] == "intake_required")
     assert "adults" in checklist["data"]["missing_fields"]
@@ -1439,7 +1439,7 @@ def test_the_plan_still_links_to_its_thread_after_the_session_is_closed(client, 
 
     conversation_id = conversation.id
     db.close()  # exactly what the dependency's `finally` does, before the body streams
-    list(chat.stream("plan it"))
+    list(chat.stream("plan it, 4500 budget"))
 
     db.expire_all()
     linked = db.get(Conversation, conversation_id)
@@ -3015,10 +3015,10 @@ def test_consent_still_takes_two_turns_after_the_move(client, planned, db):
     assert policy.intercept(chat, "generate_itinerary", {"days": 1, "replace_existing": True}) is None
 
 
-def test_a_party_named_but_not_counted_is_asked_about_rather_than_guessed(client, planned, db):
-    """Live validation, twice over. "He has a bunch of friends" was priced first as party_size 11
-    — a number nobody said — and then, once the prompt asked for the question, as the household
-    exactly, with the friends dropped. The prompt asks; only the refusal actually produces it."""
+def test_a_figure_the_user_never_gave_is_asked_for_rather_than_invented(client, planned, db):
+    """Live validation, three runs. "He has a bunch of friends" was priced as party_size 11, then
+    as the household with the friends dropped, then as party_size 6 with four invented guests and
+    a budget of 3000 nobody had been asked for. Absence was never the failure — invention was."""
     from app.models import Conversation, User
     from app.services import policy
     from app.services.itinerary import family_attendees
@@ -3033,32 +3033,55 @@ def test_a_party_named_but_not_counted_is_asked_about_rather_than_guessed(client
     chat.record("user", "my brother turns 20 and he has a bunch of friends — give him a day out")
     db.commit()
     refused = policy.intercept(
-        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household}
+        chat, "generate_itinerary",
+        {"days": 1, "budget": 3000, "party_size": household + 2, "start_date": FUTURE},
     )
-    assert refused is not None, "the household count is what arrives when the friends go missing"
-    assert refused["needs_confirmation"] == "party_size" and refused["applied"] is False
+    assert refused is not None and refused["applied"] is False
+    assert refused["needs_confirmation"] == "stated_figures"
+    # Both are named, because asking for one and inventing the other is how run three went.
+    assert "budget 3,000" in refused["question_for_the_user"]
+    assert f"party size {household + 2}" in refused["question_for_the_user"]
 
-    # A real total is an answer, not a fallback, so it goes straight through.
-    assert policy.intercept(
-        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household + 7}
-    ) is None
+    # Guests invented one by one are a headcount by another route, and are caught the same way.
+    assert policy.intercept(chat, "generate_itinerary", {
+        "days": 1, "budget": 3000, "party_size": None,
+        "guests": [{"role": "adult", "age": 20, "name": f"Friend {n}"} for n in range(4)],
+    }) is not None
 
-    # And silence about the party still means the household — the documented default, and not
-    # something to interrogate a family about when their members are already on file.
-    chat.record("user", "plan us a beach day")
+    # A figure the user actually typed is theirs, and the refusal narrows to what is still made up.
+    chat.record("user", "7500")
+    db.commit()
+    narrowed = policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household + 2}
+    )
+    assert narrowed is not None
+    named = narrowed["question_for_the_user"].split("user's: ")[1].split(". Nobody")[0]
+    assert named == f"party size {household + 2}", named
+
+    # An increment is theirs too: "10 friends" is a party of household + 10, which the prompt asks
+    # for as a sum — so the sum must not read as invented.
+    chat.record("user", "10 friends are coming")
     db.commit()
     assert policy.intercept(
-        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": None}
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household + 10}
     ) is None
 
-    # Asked once is enough: the question is on the record, so the next attempt is not refused
-    # again into a loop the user can never answer their way out of.
-    chat.record("assistant", "how many?", {"calls": [{"name": "generate_itinerary",
-                                                      "result": refused}]})
-    chat.record("user", "a bunch of friends, like I said")
+    # Silence about the party still means the household: the documented default, and not something
+    # to interrogate a family about when their members are already on file.
+    chat.record("user", "plan us a beach day, 7500 again")
     db.commit()
     assert policy.intercept(
         chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household}
+    ) is None
+
+    # Asked once is enough. If they answer with a number it is theirs from then on; if they would
+    # rather leave it to us, the next attempt goes through instead of looping.
+    chat.record("assistant", "how many, and what budget?",
+                {"calls": [{"name": "generate_itinerary", "result": refused}]})
+    chat.record("user", "you decide")
+    db.commit()
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 4321, "party_size": household + 3}
     ) is None
 
 

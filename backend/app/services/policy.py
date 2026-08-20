@@ -154,30 +154,142 @@ REPLACING_LOSES_THE_STOPS = (
     "the whole plan."
 )
 
-
-# Company the user has named but not counted. Deliberately only the unquantified words: the
-# number itself is what the gate wants, so "10 friends" must sail through while "a bunch of
-# friends" does not.
+# Company the user has named but not counted. Only the unquantified words: the number itself is
+# what the gate wants, so "10 friends" must sail through while "a bunch of friends" does not.
 #
-# ponytail: a word list, so "the whole crew" and "ten friends" both slip past — the first fires
-# nothing, the second is already a count. Ask the model to classify instead if the misses matter.
+# ponytail: a word list, so "the whole crew" slips past. Ask the model to classify if that matters.
 _VAGUE_COMPANY = re.compile(
     r"(?<!\d )\b(?:friends?|mates|buddies|classmates|colleagues|cousins|a bunch|a group|"
     r"a crew|the guys|the girls|some people|a few people)\b",
     re.IGNORECASE,
 )
 
+# Numbers as the user typed them. Digits with optional separators, plus "7.5k" for money, plus the
+# small words a headcount actually gets said in.
+#
+# ponytail: ten to twenty is where counting out loud stops. "Three thousand dirhams" is not read,
+# and neither are dates written in words — both come back as a refusal asking for the figure,
+# which is a worse answer than understanding it but a much better one than inventing it.
+_DIGITS = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)\s*(k\b)?", re.IGNORECASE)
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+}
 
-HEADCOUNT_IS_NOT_OURS_TO_GUESS = (
-    "The user named people coming along without saying how many, so the size of this party is "
-    "not known — and it decides the vehicle, the fares and every ticket, so a guess is priced as "
-    "fact and shown to them as a settled figure. The household on file is not the answer here: "
-    "they have already said someone else is coming. Stop calling tools and ask how many people "
-    "in total. Their answer is what unlocks this."
+
+FIGURES_THE_USER_NEVER_GAVE = (
+    "These figures are not the user's: {fields}. Nobody said them — they were filled in because "
+    "the argument was there to fill, and a plan priced on them is shown to the user as settled "
+    "fact. A budget and a headcount are theirs to state and nobody else's: the headcount decides "
+    "the vehicle, the fares and every ticket, and the budget decides the whole plan. Stop calling "
+    "tools and ask for {ask}. Their answer is what unlocks this."
 )
 
 
-def _this_turns_message(orchestrator: Any) -> str:
+def _stated_numbers(orchestrator: Any) -> set[float]:
+    """Every number the user has typed in this conversation.
+
+    Read from the persisted messages rather than taken on the model's word — the same reason
+    `asked_before` reads the trace. Dates and ages land in here too ("December 10", "turning 20"),
+    which loosens the check by exactly those values and is the price of not writing a parser.
+    """
+    from ..models import Message
+
+    rows = orchestrator.db.query(Message).filter(
+        Message.conversation_id == orchestrator.conversation.id,
+        Message.role == "user",
+    )
+    found: set[float] = set()
+    for row in rows:
+        text = row.content or ""
+        for raw, thousands in _DIGITS.findall(text):
+            try:
+                value = float(raw.replace(",", ""))
+            except ValueError:  # pragma: no cover — the regex cannot produce this
+                continue
+            found.add(value * 1000 if thousands else value)
+        for word, value in _NUMBER_WORDS.items():
+            if re.search(rf"\b{word}\b", text, re.IGNORECASE):
+                found.add(float(value))
+    return found
+
+
+def _figures_the_user_never_gave(orchestrator: Any, args: dict) -> dict | None:
+    """Refuse a plan priced on numbers nobody said.
+
+    Live validation, three runs. "He has a bunch of friends" was priced as party_size 11, then as
+    the household exactly with the friends dropped, then as party_size 6 with four invented guests
+    — "Brother's Friend 1" through 4 — and a budget of 3000 the user was never asked for.
+
+    The earlier gates here checked for ABSENCE: budget rejected `<= 0`, party size rejected the
+    household count. This model rarely produces absence. It produces a confident, plausible,
+    invented value, and it will build a supporting cast to make the value look derived. So the
+    test is provenance instead: a figure only the user can know has to have come from the user.
+
+    Allowed without them saying it: the household, which is the documented default for a party,
+    but only while they have not named company they left uncounted; and whatever the current plan
+    was already solved for, so a re-price is not an interrogation.
+
+    Asked once, then allowed. Not a loop the user cannot escape: if they answer with a number it
+    is theirs from then on, and if they would rather leave it to us ("surprise me", "you decide")
+    the second attempt goes through. The trade is that a figure invented AFTER the question still
+    lands — visible in the progress line, where they can see it and say so.
+    """
+    if asked_before(orchestrator, "stated_figures"):
+        return None
+
+    from ..models import Message
+    from .itinerary import family_attendees
+
+    said = orchestrator.db.query(Message).filter(
+        Message.conversation_id == orchestrator.conversation.id,
+        Message.role == "user",
+    ).count()
+    # Nothing to judge provenance against. A conversation with no user turn in it is a tool called
+    # directly — the test suite, and the UI's own server-side calls — not a model filling a blank.
+    if not said:
+        return None
+
+    stated = _stated_numbers(orchestrator)
+    current = orchestrator._resolve_itinerary()
+    household = len(family_attendees(orchestrator.db, orchestrator.user.id))
+    unnamed: list[str] = []
+
+    budget = float(args.get("budget") or 0) or float(args.get("budget_per_day") or 0)
+    on_file = {float(current.total_budget)} if current else set()
+    if budget > 0 and budget not in stated | on_file:
+        unnamed.append(f"budget {budget:,.0f}")
+
+    # Guests without a stated total are a headcount too: four friends invented one by one price
+    # the trip for four extra people just as surely as passing the number would.
+    guests = args.get("guests") or []
+    total = int(args.get("party_size") or 0) or (household + len(guests) if guests else 0)
+    # "10 friends are joining" is an increment, and the prompt asks for the sum — so the household
+    # added to something they said is theirs as much as the figure itself.
+    theirs = stated | {n + household for n in stated}
+    if current is not None:
+        theirs.add(float(current.party_size or household))
+    if total and total not in theirs:
+        # Silence about the party still means the household. Naming company and then landing on
+        # the household is not silence — it is the friends going missing, which is run two.
+        if total != household or _VAGUE_COMPANY.search(_last_user_message(orchestrator)):
+            unnamed.append(f"party size {total}")
+
+    if not unnamed:
+        return None
+    asks = [field.split()[0] for field in unnamed]
+    # Shaped like `_unapplied` minus the plan, since there may not be one yet: `applied: false`
+    # and a question, so no reply can narrate this as a trip that got built.
+    return {
+        "applied": False,
+        "needs_confirmation": "stated_figures",
+        "question_for_the_user": FIGURES_THE_USER_NEVER_GAVE.format(
+            fields=", ".join(unnamed), ask=" and ".join(asks)
+        ),
+    }
+
+
+def _last_user_message(orchestrator: Any) -> str:
     """What the user just said. Committed before the model runs, so it is already on the row."""
     from ..models import Message
 
@@ -193,42 +305,6 @@ def _this_turns_message(orchestrator: Any) -> str:
     return row.content if row else ""
 
 
-def _headcount_is_not_ours_to_guess(orchestrator: Any, args: dict) -> dict | None:
-    """Make the model ask for a headcount it was never told, instead of inventing one.
-
-    Live validation, twice. "He has a bunch of friends" was first priced as party_size 11 — a
-    number nobody said — and then, once the prompt told the model to ask, as party_size 4: the
-    household, exactly, with the friends silently dropped. Prompt text asks for the question; only
-    a refusal actually produces it, which is the difference between this field and `budget`, whose
-    handler has rejected an unset figure all along.
-
-    Deliberately narrow. Silence about the party still means the household, because that is the
-    documented default and asking every time would interrogate a family whose members are on file.
-    This fires only when the user has SAID others are coming and left them uncounted.
-    """
-    if asked_before(orchestrator, "party_size"):
-        return None
-
-    from .itinerary import family_attendees
-
-    household = len(family_attendees(orchestrator.db, orchestrator.user.id))
-    stated = args.get("party_size") or 0
-    # The household count is not evidence of a decision: it is what the model falls back to when
-    # it has nothing, and it is what arrived when the friends went missing.
-    if stated and stated != household:
-        return None
-    if not _VAGUE_COMPANY.search(_this_turns_message(orchestrator)):
-        return None
-
-    # Shaped like `_unapplied`, minus the plan — there may not be one yet. `applied: false` and a
-    # question rather than a proposal, so a reply cannot narrate this as a trip that got built.
-    return {
-        "applied": False,
-        "needs_confirmation": "party_size",
-        "question_for_the_user": HEADCOUNT_IS_NOT_OURS_TO_GUESS,
-    }
-
-
 def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
     """Refuse a call that must not happen, or None to let it through.
 
@@ -238,7 +314,7 @@ def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
     if name == "generate_itinerary":
         return (
             _rebuild_is_not_an_edit(orchestrator, args)
-            or _headcount_is_not_ours_to_guess(orchestrator, args)
+            or _figures_the_user_never_gave(orchestrator, args)
         )
     if name == "replace_plan":
         return _replacing_needs_the_users_word(orchestrator, args)
