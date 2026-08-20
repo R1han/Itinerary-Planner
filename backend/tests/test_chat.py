@@ -3176,3 +3176,71 @@ def test_a_confirmation_that_also_lies_is_still_caught(client, planned, db, monk
     _check("drop day 2", trace, "I have removed day 2 for you.")
 
     assert consulted, "a claim with nothing applied must still reach the reviewer"
+
+
+# --- what ships must still be readable ---------------------------------------------------------
+
+MARKDOWN_REPLY = """Here's the updated plan for your brother's 20th birthday:
+
+### Day 1: December 10 - Culture & Cruise
+
+- **Sheikh Zayed Grand Mosque**
+- **Louvre Abu Dhabi**
+- **Shawarma Time** (Dinner)
+
+**Subtotal**: 1,196.14 AED
+
+I invented a whole extra day here.
+
+### Overview
+
+- **Budget**: 6,000 AED
+- **Transport Mode**: Taxi
+"""
+
+
+def test_stripping_a_sentence_does_not_flatten_the_reply():
+    """Reported from the browser: the reply arrived as one wall of literal ### and -.
+
+    `" ".join(text.split())` reads like whitespace tidying and is not — split() with no argument
+    splits on newlines too. The client renders markdown, where a heading or a bullet means nothing
+    without a line break, so a reply that had merely lost a sentence became unreadable. It only
+    ever fired when the reviewer objected, which is why most replies looked fine.
+    """
+    from app.services.reviewer import REWRITE, Verdict
+    from app.services.turn import _settle
+
+    verdict = Verdict(verdict=REWRITE, unsupported_claims=["I invented a whole extra day here."])
+    settled = _settle(MARKDOWN_REPLY, verdict, [])
+
+    assert "I invented a whole extra day here." not in settled, "the claim survived"
+    assert "\n### Day 1" in settled, "the heading lost its line break"
+    assert "\n- **Louvre Abu Dhabi**" in settled, "the bullets lost their line breaks"
+    assert "### Overview" in settled
+    assert settled.count("\n") > 8, f"the reply was flattened: {settled!r}"
+    # No run of blank lines where the sentence used to be.
+    assert "\n\n\n" not in settled
+
+
+def test_an_approved_reply_is_shipped_byte_for_byte():
+    from app.services.reviewer import Verdict
+    from app.services.turn import _settle
+
+    assert _settle(MARKDOWN_REPLY, Verdict(), []) == MARKDOWN_REPLY
+
+
+def test_the_chunking_that_streams_it_keeps_the_newlines(client, planned, db, monkeypatch):
+    """The reply is replayed in fixed-size slices; a slice boundary must not eat a newline."""
+    from app.services import orchestrator as orch
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    fake = _FakeStream([[_chunk(content=MARKDOWN_REPLY)]])
+    monkeypatch.setattr(orch, "wrap_openai", lambda c: c)
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai", type("M", (), {"OpenAI": lambda **_: fake})
+    )
+
+    frames = "".join(chat.stream("what does the plan look like?"))
+
+    assert _spoken(frames) == MARKDOWN_REPLY

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -259,7 +260,16 @@ def _settle(draft: str, verdict: reviewer.Verdict, trace: list[dict]) -> str:
     settled = draft
     for claim in verdict.unsupported_claims:
         settled = settled.replace(claim, " ")
-    settled = " ".join(settled.split())
+
+    # Tidy horizontally only. `" ".join(text.split())` reads like whitespace cleanup and is not:
+    # split() with no argument splits on newlines too, so it flattened the whole reply onto one
+    # line. The client renders markdown, where `###` and `-` mean nothing without a line break —
+    # so a reply that had merely lost a sentence arrived as a wall of literal `###` and `-`.
+    # Order matters: the removed sentence leaves its line holding a space, and a blank run only
+    # collapses once that space is gone.
+    settled = re.sub(r"[^\S\n]+", " ", settled)
+    settled = "\n".join(line.rstrip() for line in settled.split("\n"))
+    settled = re.sub(r"\n{3,}", "\n\n", settled).strip()
     if settled:
         return settled
 
