@@ -111,14 +111,31 @@ def guest_attendees(db: Session, itinerary_id: int) -> list[Attendee]:
     return [Attendee(role=g.role, age=g.age, name=g.name) for g in rows]
 
 
+def cap_party(attendees: list[Attendee], party_size: int | None) -> list[Attendee]:
+    """Trim the party to a stated total that is smaller than the household.
+
+    `guests` handles a party BIGGER than the household; this is the other direction, which had no
+    representation at all — the household was a floor, so "just the two of us" in a house of four
+    was priced for four.
+
+    ponytail: whoever comes first in the household is kept, which is insertion order. Fine while
+    the trim is a headcount for pricing — four adults cost the same in any order. If it ever has
+    to name WHICH two, persist the resolved roster instead of a number.
+    """
+    if not party_size or party_size >= len(attendees):
+        return attendees
+    return attendees[:party_size]
+
+
 def trip_party(db: Session, itinerary: Itinerary) -> list[Attendee]:
-    """Everyone this itinerary is priced for: the household plus its guests.
+    """Everyone this itinerary is priced for: the household, plus its guests, minus any trim.
 
     The single source of truth for party size. Every consumer — the vehicle tier, taxi fares,
     per-head admission — must go through here, or a plan ends up costed for the wrong number of
     people while still looking plausible.
     """
-    return family_attendees(db, itinerary.user_id) + guest_attendees(db, itinerary.id)
+    everyone = family_attendees(db, itinerary.user_id) + guest_attendees(db, itinerary.id)
+    return cap_party(everyone, itinerary.party_size)
 
 
 def preference_signals(db: Session, user_id: int) -> list[PreferenceSignal]:
@@ -148,6 +165,7 @@ def build_context(
     adults_only: bool = False, focus: str = FULL_DAY,
     guests: Sequence[Attendee] = (),
     emirates: Sequence[str] | None = None,
+    party_size: int | None = None,
 ) -> PlanContext:
     # Guests join before the adults_only filter, so "just the grown-ups" drops a guest child too.
     attendees = family_attendees(db, user.id) + list(guests)
@@ -156,6 +174,9 @@ def build_context(
         # it. Leaving them in the party means `romantic` never fires, and the whole evening gets
         # scored for a seven-year-old.
         attendees = [a for a in attendees if a.role == "adult"] or attendees
+    # Last, so a stated total counts the people who are actually coming — trimming before the
+    # adults_only filter would spend the headcount on children about to be dropped.
+    attendees = cap_party(attendees, party_size)
     event_type = event.event_type if event else "other"
 
     profile = build_profile(attendees, event_type)
@@ -193,6 +214,7 @@ def generate(
     focus: str = FULL_DAY,
     guests: Sequence[Attendee] = (),
     emirates: Sequence[str] | None = None,
+    party_size: int | None = None,
     into: Itinerary | None = None,
 ) -> Itinerary:
     """Plan a trip and persist it. Raises IntakeIncomplete before doing any work.
@@ -221,6 +243,7 @@ def generate(
     context = build_context(
         db, user, event, start_lat=start_lat, start_lng=start_lng,
         adults_only=adults_only, focus=focus, guests=guests, emirates=emirates,
+        party_size=party_size,
     )
     candidates = retrieve_candidates(
         db,
@@ -286,6 +309,11 @@ def generate(
     itinerary.start_lng = start_lng
     itinerary.transport_mode = transport_mode
     itinerary.emirates_json = list(context.emirates) if context.emirates else None
+    # Only a trim is worth storing. Recording the full headcount would freeze the plan against
+    # the household it was solved for, so adding a child would stop repricing the trip.
+    itinerary.party_size = party_size if party_size and party_size < len(
+        family_attendees(db, user.id) + list(guests)
+    ) else None
     db.flush()
 
     # Stored so that everything reached later — a transport switch, a cheaper day, the payload's
@@ -523,6 +551,7 @@ def context_for(db: Session, itinerary: Itinerary, user: User) -> PlanContext:
         db, user, event, start_lat=itinerary.start_lat, start_lng=itinerary.start_lng,
         guests=guest_attendees(db, itinerary.id),
         emirates=itinerary.emirates_json,
+        party_size=itinerary.party_size,
     )
 
 

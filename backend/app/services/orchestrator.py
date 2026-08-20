@@ -1804,7 +1804,9 @@ class ChatOrchestrator:
             # rebuilds the plan, and the extra four silently stop being charged for.
             guests = itinerary_service.guest_attendees(self.db, current.id)
 
-        total = int(_arg(args, "party_size", 0) or 0)
+        # Carried the same way the guests are: a rebuild that says nothing about the party must
+        # not silently put back the people the user excluded on the call before.
+        total = int(_arg(args, "party_size", 0) or 0) or (current.party_size if current else 0) or 0
         if total > 0:
             household = len(itinerary_service.family_attendees(self.db, self.user.id))
             guests = _fit_party(household, total, guests)
@@ -1826,6 +1828,7 @@ class ChatOrchestrator:
                 focus=focus,
                 guests=guests,
                 emirates=emirates or None,
+                party_size=total or None,
             )
         except itinerary_service.IntakeIncomplete as exc:
             return {"error": "intake_incomplete", "missing_fields": exc.missing}
@@ -2066,7 +2069,7 @@ class ChatOrchestrator:
             start_lat, start_lng = centroid
 
         guests = _guests(args) or itinerary_service.guest_attendees(self.db, itinerary.id)
-        total = int(_arg(args, "party_size", 0) or 0)
+        total = int(_arg(args, "party_size", 0) or 0) or (itinerary.party_size or 0)
         if total > 0:
             household = len(itinerary_service.family_attendees(self.db, self.user.id))
             guests = _fit_party(household, total, guests)
@@ -2093,6 +2096,7 @@ class ChatOrchestrator:
                 focus=focus,
                 guests=guests,
                 emirates=emirates or None,
+                party_size=total or None,
                 into=itinerary,
             )
         except itinerary_service.IntakeIncomplete as exc:

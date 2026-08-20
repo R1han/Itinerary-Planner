@@ -13,7 +13,8 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import select
 
-from app.models import Conversation, Event, FamilyMember, Preference, User
+from app.models import Conversation, Event, FamilyMember, Itinerary, Preference, User
+from app.services import itinerary as itinerary_service
 from app.services.budget import Attendee
 from app.services.orchestrator import TOOLS, ChatOrchestrator
 
@@ -3244,3 +3245,52 @@ def test_the_chunking_that_streams_it_keeps_the_newlines(client, planned, db, mo
     frames = "".join(chat.stream("what does the plan look like?"))
 
     assert _spoken(frames) == MARKDOWN_REPLY
+
+
+def test_a_stated_total_below_the_household_trims_the_party(client, planned, db):
+    """The reported bug: "dinner for me and my wife" in a household of four priced four seats.
+
+    `party_size` could only ever ADD guests — `_fit_party` computes `max(0, total - household)` —
+    so the household was a floor no request could get under. A couple living with their parents
+    had no way to say "just the two of us": `adults_only` only removes children, and there were
+    none to remove.
+    """
+    _, _, plan = planned
+    chat = _warned_last_turn(_chat_for(db, plan))
+    chat.call_tool("save_family_details", {"adults": 4, "children_ages": []})
+
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, "days": 1, "budget": 700, "start_date": FUTURE,
+         "focus": "dinner_only", "adults_only": True, "party_size": 2},
+    )
+    assert result["party_size"] == 2, result
+
+    payload = itinerary_service.itinerary_payload(db, db.get(Itinerary, result["itinerary_id"]))
+    priced = 0
+    for day in payload["days"]:
+        for slot in day["slots"]:
+            cost = slot["cost_breakdown"]
+            heads = len(cost["adults"]) + len(cost["children"]) + cost["free_children"]
+            assert heads == 2, f"{slot['place'].name} charged {heads} people, not 2"
+            priced += 1
+    assert priced, "the plan had no slots to check"
+
+
+def test_a_trimmed_party_survives_a_re_price(client, planned, db):
+    """Same hole the guests had: the trim lived only in the call that made the plan.
+
+    Everything reached later — a transport switch, the payload's vehicle tier — re-derives the
+    party from the household, so a plan solved for two went back to being charged for four.
+    """
+    _, _, plan = planned
+    chat = _warned_last_turn(_chat_for(db, plan))
+    chat.call_tool("save_family_details", {"adults": 4, "children_ages": []})
+    chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, "days": 1, "budget": 700, "start_date": FUTURE,
+         "focus": "dinner_only", "party_size": 2},
+    )
+
+    back = chat.call_tool("set_transport", {"mode": "own_car"})
+    assert back["party_size"] == 2, "the re-price fell back to the household"
