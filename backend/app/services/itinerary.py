@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -46,6 +46,7 @@ from .planner import (
     DINING_CATEGORIES,
     DINNER_ONLY,
     FULL_DAY,
+    MAX_DAYS,
     MAX_HOP_KM,
     PLAN_FOCUS,
     build_profile,
@@ -110,14 +111,31 @@ def guest_attendees(db: Session, itinerary_id: int) -> list[Attendee]:
     return [Attendee(role=g.role, age=g.age, name=g.name) for g in rows]
 
 
+def cap_party(attendees: list[Attendee], party_size: int | None) -> list[Attendee]:
+    """Trim the party to a stated total that is smaller than the household.
+
+    `guests` handles a party BIGGER than the household; this is the other direction, which had no
+    representation at all — the household was a floor, so "just the two of us" in a house of four
+    was priced for four.
+
+    ponytail: whoever comes first in the household is kept, which is insertion order. Fine while
+    the trim is a headcount for pricing — four adults cost the same in any order. If it ever has
+    to name WHICH two, persist the resolved roster instead of a number.
+    """
+    if not party_size or party_size >= len(attendees):
+        return attendees
+    return attendees[:party_size]
+
+
 def trip_party(db: Session, itinerary: Itinerary) -> list[Attendee]:
-    """Everyone this itinerary is priced for: the household plus its guests.
+    """Everyone this itinerary is priced for: the household, plus its guests, minus any trim.
 
     The single source of truth for party size. Every consumer — the vehicle tier, taxi fares,
     per-head admission — must go through here, or a plan ends up costed for the wrong number of
     people while still looking plausible.
     """
-    return family_attendees(db, itinerary.user_id) + guest_attendees(db, itinerary.id)
+    everyone = family_attendees(db, itinerary.user_id) + guest_attendees(db, itinerary.id)
+    return cap_party(everyone, itinerary.party_size)
 
 
 def preference_signals(db: Session, user_id: int) -> list[PreferenceSignal]:
@@ -147,6 +165,7 @@ def build_context(
     adults_only: bool = False, focus: str = FULL_DAY,
     guests: Sequence[Attendee] = (),
     emirates: Sequence[str] | None = None,
+    party_size: int | None = None,
 ) -> PlanContext:
     # Guests join before the adults_only filter, so "just the grown-ups" drops a guest child too.
     attendees = family_attendees(db, user.id) + list(guests)
@@ -155,6 +174,9 @@ def build_context(
         # it. Leaving them in the party means `romantic` never fires, and the whole evening gets
         # scored for a seven-year-old.
         attendees = [a for a in attendees if a.role == "adult"] or attendees
+    # Last, so a stated total counts the people who are actually coming — trimming before the
+    # adults_only filter would spend the headcount on children about to be dropped.
+    attendees = cap_party(attendees, party_size)
     event_type = event.event_type if event else "other"
 
     profile = build_profile(attendees, event_type)
@@ -192,8 +214,16 @@ def generate(
     focus: str = FULL_DAY,
     guests: Sequence[Attendee] = (),
     emirates: Sequence[str] | None = None,
+    party_size: int | None = None,
+    into: Itinerary | None = None,
 ) -> Itinerary:
-    """Plan a trip and persist it. Raises IntakeIncomplete before doing any work."""
+    """Plan a trip and persist it. Raises IntakeIncomplete before doing any work.
+
+    `into` re-solves onto an existing itinerary row instead of creating one. The stops are
+    replaced — that is what the caller asked for — but the row's identity survives, so the
+    conversation pointing at it and the event it was planned for stay attached. Building a fresh
+    row and abandoning the old one is what left a rebuilt plan belonging to no thread.
+    """
     missing = missing_intake_fields(db, user)
     if missing:
         raise IntakeIncomplete(missing)
@@ -213,6 +243,7 @@ def generate(
     context = build_context(
         db, user, event, start_lat=start_lat, start_lng=start_lng,
         adults_only=adults_only, focus=focus, guests=guests, emirates=emirates,
+        party_size=party_size,
     )
     candidates = retrieve_candidates(
         db,
@@ -248,21 +279,41 @@ def generate(
             insert_prayer_breaks(day, travel_fn, context.origin)
         plan = repair_plan(plan, context.profile, travel_fn, context.origin)
 
-    itinerary = Itinerary(
-        user_id=user.id,
-        event_id=event.id if event else None,
-        title=title or (event.title if event else "UAE trip"),
-        start_date=start_date,
-        num_days=num_days,
-        total_budget=total_budget,
-        currency=currency,
-        status="ready",
-        start_lat=start_lat,
-        start_lng=start_lng,
-        transport_mode=transport_mode,
-        emirates_json=list(context.emirates) if context.emirates else None,
-    )
-    db.add(itinerary)
+    if into is None:
+        itinerary = Itinerary(
+            user_id=user.id,
+            event_id=event.id if event else None,
+            title=title or (event.title if event else "UAE trip"),
+        )
+        db.add(itinerary)
+    else:
+        itinerary = into
+        # Silence keeps what the row already has: re-solving a plan into Abu Dhabi says nothing
+        # about which event it is for or what it is called, and inventing "UAE trip" over the
+        # user's own title would lose more than the stops did.
+        if event is not None:
+            itinerary.event_id = event.id
+        if title:
+            itinerary.title = title
+        elif event is not None:
+            itinerary.title = event.title
+        # The party is restated on every solve, so leaving the old rows would double it.
+        db.query(Guest).filter(Guest.itinerary_id == itinerary.id).delete()
+
+    itinerary.start_date = start_date
+    itinerary.num_days = num_days
+    itinerary.total_budget = total_budget
+    itinerary.currency = currency
+    itinerary.status = "ready"
+    itinerary.start_lat = start_lat
+    itinerary.start_lng = start_lng
+    itinerary.transport_mode = transport_mode
+    itinerary.emirates_json = list(context.emirates) if context.emirates else None
+    # Only a trim is worth storing. Recording the full headcount would freeze the plan against
+    # the household it was solved for, so adding a child would stop repricing the trip.
+    itinerary.party_size = party_size if party_size and party_size < len(
+        family_attendees(db, user.id) + list(guests)
+    ) else None
     db.flush()
 
     # Stored so that everything reached later — a transport switch, a cheaper day, the payload's
@@ -500,6 +551,7 @@ def context_for(db: Session, itinerary: Itinerary, user: User) -> PlanContext:
         db, user, event, start_lat=itinerary.start_lat, start_lng=itinerary.start_lng,
         guests=guest_attendees(db, itinerary.id),
         emirates=itinerary.emirates_json,
+        party_size=itinerary.party_size,
     )
 
 
@@ -795,6 +847,19 @@ def _placements_in_day(
 # that went wrong three times running.
 _CATEGORY_WORDS = {"shopping": "mall", "restaurant": "dining", "food": "dining", "leisure": "park"}
 
+# Which sitting a meal word names, resolved against the clock.
+#
+# Deliberately separate from `PartyProfile.meal_windows`, which is what the generator schedules
+# around: those are narrow, per-party, and know only lunch and dinner. These are wide contiguous
+# buckets whose only job is to tell one day's sittings apart from each other once the user has
+# named one, so they cover the whole day and include breakfast — which the prompt has always told
+# the model to use and which nothing here could resolve.
+MEAL_SITTINGS: dict[str, tuple[int, int]] = {
+    "breakfast": (0, 11 * 60),
+    "lunch": (11 * 60, 16 * 60),
+    "dinner": (16 * 60, 24 * 60),
+}
+
 
 def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int | None = None) -> Slot:
     """Which stop the user meant, from the words they used for it.
@@ -857,12 +922,27 @@ def find_stop(db: Session, itinerary: Itinerary, description: str, *, day: int |
             return match[0]
         if match:
             # The same place can sit twice on one day (a lunch and a dinner at the same
-            # restaurant) — a name or category match alone can't tell those apart, but "dinner"
-            # in the user's own words can: it's the later of the two.
-            if "lunch" in text:
-                return min(match, key=lambda s: s.start_time)
-            if "dinner" in text:
-                return max(match, key=lambda s: s.start_time)
+            # restaurant) — a name or category match alone can't tell those apart, but a meal word
+            # in the user's own words can. Matched against the clock rather than by position: with
+            # three sittings "lunch" is the middle one, and taking the earliest handed back
+            # breakfast instead.
+            meal = next((word for word in MEAL_SITTINGS if word in text), None)
+            if meal is not None:
+                opens, closes = MEAL_SITTINGS[meal]
+                sitting = [s for s in match if opens <= to_minutes(s.start_time) < closes]
+                if len(sitting) == 1:
+                    return sitting[0]
+                if not sitting:
+                    raise ValueError(
+                        f"None of these is a {meal} sitting — "
+                        + "; ".join(
+                            f"{s.place.name} at {s.start_time} on day {s.day_index + 1}"
+                            for s in match
+                        )
+                        + ". Say which one by its time, or which day."
+                    )
+                # Narrowed but still ambiguous: report the sittings that survived, not all of them.
+                match = sitting
             raise ValueError(
                 f"{description!r} matches more than one stop — "
                 + "; ".join(
@@ -1545,6 +1625,243 @@ def reschedule(db: Session, itinerary: Itinerary, user: User, new_start_date: da
     travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
 
     plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
+def emirate_centroid(db: Session, emirates: Sequence[str]) -> tuple[float, float] | None:
+    """The middle of the catalog across these emirates, or None if it holds nothing there."""
+    if not emirates:
+        return None
+    lat, lng = db.execute(
+        select(func.avg(Place.lat), func.avg(Place.lng)).where(Place.emirate.in_(list(emirates)))
+    ).one()
+    return (lat, lng) if lat is not None else None
+
+
+@traced("itinerary.set_origin", run_type="chain")
+def set_origin(db: Session, itinerary: Itinerary, user: User, lat: float, lng: float) -> Plan:
+    """Move where the trip sets off from, keeping every stop.
+
+    Deliberately not a relocation: "we live in Abu Dhabi" says where the car starts, not what the
+    trip is. The places and their order are untouched — only the leg from the origin into each
+    day's first stop moves. That is why the segments are rebuilt rather than re-priced:
+    `recost_travel` recomputes the fare from the distance already on the row, and here the
+    distance is the thing that changed.
+    """
+    itinerary.start_lat, itinerary.start_lng = lat, lng
+    # Read the context after the move, so `context.origin` is the new one.
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+
+    travel_service = _travel_service(db, itinerary, context)
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+
+    for day in plan.days:
+        rebuild_segments(day, travel_fn, context.origin)
+
+    plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
+class DayShiftChoiceRequired(ValueError):
+    """Dropping a day that is not the last one leaves a choice only the user can make.
+
+    The days after it can slide up — the trip ends a day sooner — or hold their dates and leave
+    the dropped day free. An event anchored to one of those later dates is what makes the
+    difference matter, and neither answer is safe to assume, so this asks instead of picking.
+    """
+
+    def __init__(self, day: int, num_days: int) -> None:
+        super().__init__(
+            f"Day {day} is not the last of {num_days}. Ask the user whether the days after it "
+            f"should shift earlier, ending the trip a day sooner, or keep their dates and leave "
+            f"day {day} free — then retry with shift_later_days set."
+        )
+        self.day = day
+        self.num_days = num_days
+
+
+@traced("itinerary.drop_day", run_type="chain")
+def drop_day(
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    day: int,
+    *,
+    shift_later_days: bool | None = None,
+) -> Plan:
+    """Remove one whole day. `day` is 1-based, the way the plan is numbered to the user.
+
+    The budget cap is left alone. It is a ceiling the user set for the trip, not a per-day
+    allowance to hand back, and lowering it here would quietly push `repair_plan` into dropping
+    stops from the days they kept.
+    """
+    index = day - 1
+    if itinerary.num_days <= 1:
+        raise ValueError("This plan is a single day — dropping it would leave nothing.")
+    if not 0 <= index < itinerary.num_days:
+        raise ValueError(f"This plan runs {itinerary.num_days} days, so there is no day {day}.")
+
+    is_last = index == itinerary.num_days - 1
+    if not is_last and shift_later_days is None:
+        raise DayShiftChoiceRequired(day, itinerary.num_days)
+
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+    plan.days = [d for d in plan.days if d.day_index != index]
+
+    if is_last or shift_later_days:
+        for later in plan.days:
+            if later.day_index > index:
+                later.day_index -= 1
+                later.day_date -= timedelta(days=1)
+                for slot in later.slots:
+                    slot.day_index = later.day_index
+        itinerary.num_days -= 1
+    # Otherwise the day keeps its place in the calendar with nothing in it, which is what leaving
+    # it free means: every date after it stays where the user already has it.
+
+    travel_service = _travel_service(db, itinerary, context)
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+
+    plan = repair_plan(plan, context.profile, travel_fn, context.origin)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
+class DayBudgetRequired(ValueError):
+    """What is left of the trip's cap will not fill another day, so the user has to top it up.
+
+    Raised only after trying: "enough for a day" is not a number anyone can name in advance — it
+    depends on the party, the emirate and what is still open — so the remainder is handed to the
+    planner and this fires when the planner comes back with nothing.
+    """
+
+    def __init__(self, remaining: float, currency: str) -> None:
+        super().__init__(
+            f"Only {remaining:,.0f} {currency} is left of this trip's budget, and nothing fits a "
+            f"day into it. Ask the user what they want to spend on the extra day, then retry with "
+            f"extra_budget set to the figure they give."
+        )
+        self.remaining = round(remaining, 2)
+
+
+@traced("itinerary.add_day", run_type="chain")
+def add_day(
+    db: Session,
+    itinerary: Itinerary,
+    user: User,
+    extra_budget: float | None = None,
+    emirates: Sequence[str] | None = None,
+) -> Plan:
+    """Append one more day to the end of a plan, leaving every existing day untouched.
+
+    The gap this fills: there was a `drop_day` and no way back. Asked to add a day, the model
+    called drop_day — the only day-shaped tool it had — and then offered a rebuild, which is the
+    one thing that would have thrown away every stop the user had approved.
+
+    So the new day is SOLVED ON ITS OWN, at num_days=1, and appended. The existing days are never
+    handed to the planner, which is what makes this an edit rather than a rebuild: nothing already
+    on the plan can be re-scored, re-timed or dropped by adding to it.
+
+    `extra_budget` raises the cap rather than sharing it. A trip that has spent 2,961 of 3,000 has
+    39 left, and solving a day into 39 either returns something empty or sends `repair_plan` off
+    to strip stops from the days the user already has. The cap is a ceiling they set, so only they
+    can raise it — which is why the tool takes the figure instead of inventing one.
+    """
+    # Zero is not a budget, it is the absence of one — and it is what arrives, because strict mode
+    # gives the model a slot it must fill and "leave it out" is advice. Rejecting it asked the user
+    # to fund a day their own remaining 2,859 already covered.
+    if extra_budget is not None and extra_budget <= 0:
+        extra_budget = None
+    if itinerary.num_days >= MAX_DAYS:
+        raise ValueError(f"A trip runs at most {MAX_DAYS} days, and this one already does.")
+
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+    event = db.get(Event, itinerary.event_id) if itinerary.event_id else None
+
+    # Spend what the trip has not spent before asking for more. A plan that came in well under its
+    # cap already has the day paid for, and asking anyway is asking the user to fund something
+    # they funded — while a plan that spent nearly all of it cannot fit a day into the difference.
+    # Which of the two this is nobody can say from a number, so it is settled by trying.
+    remaining = max(itinerary.total_budget - plan.total_cost, 0.0)
+    budget_for_day = extra_budget if extra_budget is not None else remaining
+    new_index = itinerary.num_days
+    new_date = itinerary.start_date + timedelta(days=new_index)
+
+    # A day of its own can go somewhere of its own. Narrowing only the retrieval leaves the trip's
+    # own `emirates_json` alone, which is the point: this is where ONE day happens, not a decision
+    # that the whole trip has moved.
+    #
+    # ponytail: the day still sets off from the trip's origin, so an Abu Dhabi day on a Dubai trip
+    # is priced with the drive there — which is the truth. Move the origin per day if that ever
+    # needs to model an overnight instead.
+    candidates = retrieve_candidates(
+        db,
+        context.profile,
+        query_for(context.profile, event.title if event else "", event.notes if event else ""),
+        origin=context.origin,
+        emirates=list(emirates) if emirates else context.emirates,
+    )
+    travel_service = _travel_service(db, itinerary, context)
+
+    # A day that repeats what the trip has already seen is not another day out. The places
+    # already on the plan are dropped from the candidate pool, so the new one is somewhere new.
+    #
+    # `or candidates` because an exclusion that empties the pool is not an exclusion, it is a
+    # dead end — a trip confined to one emirate can genuinely run out. A repeat beats no day.
+    # It is a filter on the POOL, not a rule inside the day: a restaurant appearing twice within
+    # a single day is the planner's own doing and stays that way.
+    used = {slot.place.id for day in plan.days for slot in day.slots}
+    candidates = [c for c in candidates if c.id not in used] or candidates
+
+    solved = generate_plan(
+        candidates,
+        context.profile,
+        travel_service.estimate_fn(),
+        start_date=new_date,
+        num_days=1,
+        total_budget=budget_for_day,
+        origin=context.origin,
+        preferences=context.preferences,
+        currency=plan.currency,
+    )
+    if not solved.days or not solved.days[0].slots:
+        if emirates:
+            raise ValueError(
+                f"Nothing fits a day in {', '.join(emirates)} at "
+                f"{budget_for_day:,.0f} {plan.currency}. Say so, and ask whether to spend more or "
+                f"look somewhere else."
+            )
+        if extra_budget is None:
+            raise DayBudgetRequired(remaining, plan.currency)
+        raise ValueError(
+            f"Nothing fits a day at {extra_budget:,.0f} {plan.currency}. Ask for a higher figure."
+        )
+
+    fresh = solved.days[0]
+    fresh.day_index = new_index
+    fresh.day_date = new_date
+    for slot in fresh.slots:
+        slot.day_index = new_index
+    for segment in fresh.segments:
+        segment.day_index = new_index
+
+    plan.days.append(fresh)
+    itinerary.num_days += 1
+    # Only a figure the user added raises the cap. Spending the remainder is spending what the cap
+    # already allowed, and raising it here would hand the trip a budget nobody agreed to.
+    itinerary.total_budget += extra_budget or 0.0
+    plan.total_budget = itinerary.total_budget
+
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+    plan = route_for_real(plan, context, travel_fn)
     persist_plan(db, itinerary, plan)
     db.commit()
     return plan

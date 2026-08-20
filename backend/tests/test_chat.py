@@ -13,7 +13,8 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import select
 
-from app.models import Conversation, Event, FamilyMember, Preference, User
+from app.models import Conversation, Event, FamilyMember, Itinerary, Preference, User
+from app.services import itinerary as itinerary_service
 from app.services.budget import Attendee
 from app.services.orchestrator import TOOLS, ChatOrchestrator
 
@@ -90,6 +91,15 @@ def test_the_spec_tools_are_all_exposed():
     # is asked to change plans it has no way to change — and answers by describing edits it never
     # made; and find_places, without which the catalog is unreachable and "what is there to see
     # in the UAE" is answered from the model's own knowledge — places the planner cannot book.
+    #
+    # And three that exist because every field an Itinerary is built with was write-once except
+    # start_date and transport_mode. Asked to change any of the others the model had no legal move,
+    # so it said it had done it anyway: "change the location of the plan to Abu Dhabi" was answered
+    # twice with the same unchanged Dubai plan. set_origin moves where the trip sets off from and
+    # keeps every stop; replace_plan is the only thing that can move the REGION, because no Dubai
+    # place survives the trip becoming an Abu Dhabi one; drop_day removes a day, and add_day is
+    # the way back — without it "add one more day" had no legal move, and the model reached for
+    # drop_day, the only day-shaped tool there was.
     assert names == spec_tools | {
         "get_itinerary",
         "find_live_events",
@@ -100,6 +110,10 @@ def test_the_spec_tools_are_all_exposed():
         "set_transport",
         "add_stop",
         "reschedule_itinerary",
+        "set_origin",
+        "drop_day",
+        "add_day",
+        "replace_plan",
     }
 
 
@@ -560,7 +574,7 @@ def test_a_blocked_intake_is_surfaced_to_the_client(client, make_user, monkeypat
     monkeypatch.setattr(ChatOrchestrator, "_llm", fake_llm)
 
     headers, _ = make_user("intake@rihla.app")  # registered, but no family recorded
-    events = frames(client.post("/chat", headers=headers, json={"message": "plan my trip"}))
+    events = frames(client.post("/chat", headers=headers, json={"message": "plan my trip, 3000 budget"}))
 
     checklist = next(e for e in events if e["type"] == "intake_required")
     assert "adults" in checklist["data"]["missing_fields"]
@@ -905,10 +919,15 @@ def test_an_explicit_event_id_still_wins_over_the_conversations(client, planned,
     assert db.get(Itinerary, result["itinerary_id"]).event_id == asked_for.id
 
 
-def test_the_system_prompt_forbids_rebuilding_as_a_workaround(db, orchestrator):
+def test_rebuilding_as_a_workaround_is_forbidden_where_it_can_be_enforced(db, orchestrator):
+    """The prompt keeps the judgement the model has to make before calling; the description of
+    what a rebuild destroys moved to the refusal, which is delivered at the moment of the call and
+    now also stops it."""
+    from app.services.policy import REBUILD_IS_NOT_AN_EDIT
+
     prompt = orchestrator().system_prompt()
-    assert "throws the current one away" in prompt
     assert "never a reason to start over" in prompt
+    assert "the current plan, and every edit the user approved, is abandoned" in REBUILD_IS_NOT_AN_EDIT
 
 
 def test_saying_you_have_your_own_car_actually_reprices_the_plan(client, planned, db):
@@ -1423,7 +1442,7 @@ def test_the_plan_still_links_to_its_thread_after_the_session_is_closed(client, 
 
     conversation_id = conversation.id
     db.close()  # exactly what the dependency's `finally` does, before the body streams
-    list(chat.stream("plan it"))
+    list(chat.stream("plan it, 4500 budget"))
 
     db.expire_all()
     linked = db.get(Conversation, conversation_id)
@@ -1875,9 +1894,16 @@ def test_a_fresh_thread_is_not_blocked_by_an_older_plan(client, planned, db):
 
 
 def test_the_prompt_no_longer_offers_start_over_as_a_way_around_a_failed_edit(db, orchestrator):
+    """What stays in the prompt is the distinction the model has to make BEFORE it calls: that
+    agreeing to spend more is agreeing to an edit. How the consent flag works came out — it is
+    enforced in code now, and the refusal explains itself at the point of the wrong call, which
+    is both later and better placed than a paragraph read at the top of every turn."""
+    from app.services.policy import CONSENT_DOES_NOT_GRANT_ITSELF
+
     prompt = orchestrator().system_prompt()
     assert "agreeing to an EDIT" in prompt
-    assert "replace_existing" in prompt
+    assert "replace_existing" not in prompt
+    assert "replace_existing" in CONSENT_DOES_NOT_GRANT_ITSELF
 
 
 # --- a filler itinerary_id must not hide the plan ----------------------------------------------
@@ -1977,6 +2003,23 @@ def _chunk(content=None, tool=None):
     return type("Chunk", (), {"choices": [choice]})()
 
 
+def _spoken(frames: str) -> str:
+    """The prose the user actually saw, reassembled from the `token` frames.
+
+    The reply is held back until it has been checked and then replayed in chunks, so it arrives
+    as several frames and a substring search over the raw stream can land in the JSON between
+    two of them.
+    """
+    text = ""
+    for line in frames.splitlines():
+        if not line.startswith("data: "):
+            continue
+        frame = json.loads(line[len("data: "):])
+        if frame.get("type") == "token":
+            text += frame["data"]
+    return text
+
+
 def test_a_turn_that_spends_every_round_on_tools_still_answers(client, planned, db, monkeypatch):
     """The reported bug: three assistant messages saved as an empty string.
 
@@ -1998,11 +2041,19 @@ def test_a_turn_that_spends_every_round_on_tools_still_answers(client, planned, 
 
     frames = "".join(chat.stream("what does the plan look like?"))
 
-    assert "Here is where things stand." in frames
+    assert "Here is where things stand." in _spoken(frames)
     saved = [m for m in _messages(db, chat) if m.role == "assistant"][-1]
     assert saved.content, "an empty bubble is what the user actually saw"
-    # The rescue round must not hand the tools back, or it can loop forever.
-    assert "tools" not in fake.calls[-1]
+
+    # The last round must not be able to act, or the turn can loop forever. It is pinned rather
+    # than stripped: taking the tools away left the model able to describe an action and unable to
+    # take one, which is how a turn that ran out of rounds ended up narrating an edit it never
+    # made. It can still see what exists, and it is told to report the trace and claim no more.
+    last = fake.calls[-1]
+    assert last["tool_choice"] == "none"
+    assert "tools" in last, "the model should still know what it could have called"
+    assert any(orch_msg["role"] == "system" and "every tool round" in orch_msg["content"]
+               for orch_msg in last["messages"])
 
 
 def _messages(db, chat):
@@ -2107,6 +2158,55 @@ def test_a_repeated_name_on_one_day_is_told_apart_by_day_and_meal(client, planne
     assert found.id == duplicate.id
 
 
+def test_three_sittings_at_one_place_are_told_apart_by_the_meal_word(client, planned, db):
+    """Three sittings on one day, and the meal word has to land on the right one.
+
+    Resolving by position could not do this: "lunch" was whichever match came earliest, which is
+    breakfast once a day has three. And "breakfast" was not handled at all, though the prompt has
+    always told the model to disambiguate with it — so the one word the user was invited to say
+    dead-ended in the same ambiguity error it was meant to answer, which the prompt then forbade
+    retrying.
+    """
+    from app.models import Itinerary, Slot, TravelSegment
+    from app.services.itinerary import find_stop
+
+    _, _, plan = planned
+    itinerary = db.get(Itinerary, plan["id"])
+    day0 = (
+        db.query(Slot)
+        .filter(Slot.itinerary_id == itinerary.id, Slot.day_index == 0)
+        .order_by(Slot.position)
+        .all()
+    )
+    place_id, name = day0[0].place_id, day0[0].place.name
+
+    # Segments hold FKs to slots, so they go first — the same order persist_plan uses.
+    db.query(TravelSegment).filter(TravelSegment.itinerary_id == itinerary.id).delete()
+    db.flush()
+    for row in day0:
+        db.delete(row)
+    db.flush()
+
+    sittings = {}
+    for position, (label, start, end) in enumerate(
+        (("breakfast", "08:15", "09:00"), ("lunch", "12:41", "13:30"), ("dinner", "19:24", "20:30"))
+    ):
+        row = Slot(
+            itinerary_id=itinerary.id, day_index=0, position=position,
+            place_id=place_id, start_time=start, end_time=end,
+        )
+        db.add(row)
+        sittings[label] = row
+    db.commit()
+
+    for label, row in sittings.items():
+        assert find_stop(db, itinerary, f"{name} {label}", day=1).id == row.id, label
+
+    # The bare name is still genuinely ambiguous — three sittings, nothing said about which.
+    with pytest.raises(ValueError, match="more than one stop"):
+        find_stop(db, itinerary, name, day=1)
+
+
 def test_an_empty_description_is_an_omission_not_a_match(client, planned, db):
     """Every stop contains the empty string, so this read as ambiguity instead of a mistake."""
     from app.models import Itinerary
@@ -2155,6 +2255,41 @@ def _abu_dhabi_day(db, planned):
     return chat
 
 
+def _thin_day_to(chat, limit: int) -> None:
+    """Remove stops until day 1 holds at most `limit` of them.
+
+    Every stop is addressed precisely, and a pass that removes nothing fails instead of going
+    round again. Removing `stops[0]` blindly did not terminate: the planner puts the same
+    restaurant on a day twice on purpose, a bare name cannot say which sitting is meant, and
+    `call_tool` reports that as a result rather than raising — so the day never got smaller and
+    the loop asked forever.
+    """
+    from app.services.itinerary import MEAL_SITTINGS
+
+    def handle_for(stop, names) -> str | None:
+        if names.count(stop["name"]) == 1:
+            return stop["name"]
+        start = int(stop["start"][:2]) * 60 + int(stop["start"][3:])
+        for word, (opens, closes) in MEAL_SITTINGS.items():
+            if opens <= start < closes:
+                return f"{stop['name']} {word}"
+        return None
+
+    while True:
+        stops = chat.call_tool("get_itinerary", {})["days"][0]["stops"]
+        if len(stops) <= limit:
+            return
+        names = [s["name"] for s in stops]
+        for stop in stops:
+            handle = handle_for(stop, names)
+            if handle is None:
+                continue
+            if "error" not in chat.call_tool("edit_stop", {"stop": handle, "action": "remove"}):
+                break
+        else:
+            raise AssertionError(f"no stop on this day could be removed: {names}")
+
+
 def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
     """The reported bug: 'replace shopping with an adventure' refused with AED 1,168 unspent.
 
@@ -2165,9 +2300,7 @@ def test_a_swap_the_hour_forbids_offers_to_re_time_the_day(client, planned, db):
     chat = _abu_dhabi_day(db, planned)
     # A packed day has no room to re-time INTO — the honest answer there is "that would cost the
     # day a stop", tested separately. Thin it out so re-timing is the thing under test.
-    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
-        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
-        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+    _thin_day_to(chat, 2)
 
     plan = chat.call_tool("get_itinerary", {})
     last = plan["days"][0]["stops"][-1]
@@ -2365,9 +2498,7 @@ def test_a_confirmation_carries_the_plan_as_it_really_stands(client, planned, db
     correct all along and the user was told otherwise, which is the worst way to be wrong.
     """
     chat = _abu_dhabi_day(db, planned)
-    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
-        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
-        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+    _thin_day_to(chat, 2)
 
     before = [s["name"] for s in chat.call_tool("get_itinerary", {})["days"][0]["stops"]]
     asked = chat.call_tool(
@@ -2387,9 +2518,7 @@ def test_a_confirmation_does_not_nudge_the_right_pane(client, planned, db):
     """`touched_itinerary` is what makes the stream emit `itinerary_updated`. A question changed
     nothing, so a refresh would only redraw the same plan and imply otherwise."""
     chat = _abu_dhabi_day(db, planned)
-    while len(chat.call_tool("get_itinerary", {})["days"][0]["stops"]) > 2:
-        doomed = chat.call_tool("get_itinerary", {})["days"][0]["stops"][0]["name"]
-        chat.call_tool("edit_stop", {"stop": doomed, "action": "remove"})
+    _thin_day_to(chat, 2)
 
     last = chat.call_tool("get_itinerary", {})["days"][0]["stops"][-1]["name"]
     chat.touched_itinerary = None
@@ -2405,8 +2534,13 @@ def test_finalising_a_plan_is_not_a_thing_the_model_has_to_do(db, orchestrator):
     There is nothing to call: the plan is already saved. The prompt now says so, and the refusal
     repeats it, because the refusal is what the model reads when it guesses wrong.
     """
+    from app.services.policy import REBUILD_IS_NOT_AN_EDIT
+
     prompt = orchestrator().system_prompt()
-    assert "there is no " in prompt and "finalising, confirming or committing" in prompt
+    # This moved out of the prompt entirely: the refusal is what the model reads when it guesses
+    # wrong, and it is now also what stops the call, so saying it twice bought nothing.
+    assert "finalising, confirming or committing" not in prompt
+    assert "no finalising, confirming or committing" in REBUILD_IS_NOT_AN_EDIT
     assert "A tool that comes back asking has changed NOTHING" in prompt
 
 
@@ -2679,3 +2813,688 @@ def test_a_listing_without_a_query_stays_alphabetical(catalog, orchestrator):
     names = [place["name"] for place in result["places"]]
     assert names == sorted(names)
     assert "matched_by" not in result
+
+
+# --- the plan can be moved, shortened and re-solved ---------------------------------------------
+
+
+def _dubai_day(db, planned, days: int = 2):
+    """A plan that lands in Dubai, so moving it somewhere else is a real change."""
+    from app.models import Conversation, User
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    built = chat.call_tool("generate_itinerary", {
+        "days": days, "budget": 6000, "start_date": FUTURE, "emirates": ["Dubai"],
+    })
+    assert "error" not in built, built
+    return chat
+
+
+def _remember_turn(chat, name, args, result, *, applied=False):
+    """End a turn the way the loop does, so the next one inherits what was asked.
+
+    A question only counts as put once it is on the record — which is what stops the model
+    granting itself an answer by passing the argument.
+    """
+    from app.services.orchestrator import persisted_trace
+
+    chat.record("assistant", "I put that to you.", tool_calls=persisted_trace(
+        [{"name": name, "args": args, "applied": applied, "result": result}]
+    ))
+    chat.db.commit()
+
+
+def test_moving_the_starting_point_keeps_the_trip_where_it_is(client, planned, db):
+    """The reported bug, first half: "we live in Abu Dhabi" was answered by claiming the whole
+    plan had moved to Abu Dhabi, twice, while returning the identical Dubai itinerary.
+
+    It says where the car sets off, not what the trip is — so the stops stay and only the driving
+    is re-costed. The tool that changes what the trip IS is replace_plan, and it costs the stops.
+    """
+    chat = _dubai_day(db, planned)
+    before = chat.call_tool("get_itinerary", {})
+    names = [s["name"] for d in before["days"] for s in d["stops"]]
+    origin_before = chat._resolve_itinerary().start_lat
+
+    moved = chat.call_tool("set_origin", {"emirate": "Abu Dhabi"})
+
+    assert "error" not in moved, moved
+    assert moved["origin_emirate"] == "Abu Dhabi"
+    # _plan_result lists a day's stops by name, so these are strings, not slot dicts.
+    assert [name for d in moved["days"] for name in d["stops"]] == names, "a stop was lost"
+    assert chat._resolve_itinerary().start_lat < origin_before, "the origin did not move south"
+
+
+def test_only_replace_plan_can_move_the_region(client, planned, db):
+    """The reported bug, second half: "change the location of the plan to Abu Dhabi".
+
+    emirates_json was written once, at creation, and no tool could touch it — so the model had no
+    legal move, and said it had done it anyway. Every Dubai stop has to go, because none of them
+    exist in Abu Dhabi; what must NOT go is the plan's identity, which the conversation points at.
+    """
+    chat = _dubai_day(db, planned)
+    before = chat.call_tool("get_itinerary", {})
+    itinerary_id = before["itinerary_id"]
+
+    # Replacing throws away every stop, so it asks once before it does.
+    asked = chat.call_tool("replace_plan", {"emirates": ["Abu Dhabi"]})
+    assert asked["applied"] is False
+    assert asked["needs_confirmation"] == "plan_replacement"
+    assert asked["plan_is_unchanged"], "the plan as it stands travels with the question"
+
+    _remember_turn(chat, "replace_plan", {"emirates": ["Abu Dhabi"]}, asked)
+
+    moved = chat.call_tool("replace_plan", {"emirates": ["Abu Dhabi"]})
+
+    assert "error" not in moved, moved
+    assert moved["itinerary_id"] == itinerary_id, "a new row would orphan the conversation"
+    assert chat.conversation.itinerary_id == itinerary_id
+    assert moved["emirates"] == ["Abu Dhabi"]
+    assert moved["replaced"], "the reply has to be able to say what was given up"
+
+    from app.models import Place
+
+    stops = [name for d in moved["days"] for name in d["stops"]]
+    assert stops, "the re-solved plan has no stops"
+    emirates = {
+        row.emirate
+        for name in stops
+        if (row := db.query(Place).filter(Place.name == name).first()) is not None
+    }
+    assert emirates == {"Abu Dhabi"}, emirates
+
+
+def test_adding_a_day_appends_one_and_leaves_the_rest_alone(client, planned, db):
+    """There was a drop_day and no way back, so "add one more day" got answered with drop_day —
+    the only day-shaped tool — and then an offer to rebuild, which is the one move that would
+    have thrown away every stop the user approved."""
+    chat = _dubai_day(db, planned, days=2)
+    before = chat.call_tool("get_itinerary", {})
+    kept = [stop["name"] for day in before["days"] for stop in day["stops"]]
+    cap_before = before["budget"]["cap"]
+
+    added = chat.call_tool("add_day", {"extra_budget": 1800})
+
+    assert "error" not in added, added
+    assert added["added_day"] == 3 and len(added["days"]) == 3
+    # An edit, not a rebuild: every stop that was there is still there, in order.
+    assert [name for day in added["days"][:2] for name in day["stops"]] == kept, \
+        "adding a day re-solved the days that were already planned"
+    assert added["days"][2]["stops"], "the new day came back empty"
+    # And it is somewhere new: a day that repeats what the trip has already seen is not another
+    # day out. The pool is filtered, so this holds across days without touching what a single
+    # day is allowed to do with a restaurant.
+    assert not set(added["days"][2]["stops"]) & set(kept), "the new day repeats an earlier stop"
+    # The figure raises the cap rather than being shared with days already planned — 39 AED of
+    # leftover is not a day, and spending it would send repair_plan at the days the user has.
+    assert added["budget_now"] == round(cap_before + 1800, 2)
+
+
+def test_a_day_the_trip_can_already_afford_costs_the_user_nothing_extra(client, planned, db):
+    """Money the trip did not spend has already been agreed to. Asking for more when the cap
+    covers the day is asking the user to fund something they funded."""
+    chat = _dubai_day(db, planned, days=1)
+    before = chat.call_tool("get_itinerary", {})
+    cap_before = before["budget"]["cap"]
+    assert before["budget"]["remaining"] > 0, "this test needs a plan that came in under its cap"
+
+    added = chat.call_tool("add_day", {})
+
+    assert "error" not in added and added.get("added_day") == 2, added
+    assert added["days"][1]["stops"], "the new day came back empty"
+    # The cap is untouched: spending the remainder is spending what it already allowed.
+    assert added["budget_now"] == cap_before
+    assert added["total"] <= cap_before
+
+
+def test_a_budget_of_zero_is_no_budget_rather_than_a_bad_one(client, planned, db):
+    """What the model actually sent. Told to leave the figure out it passed 0 — strict mode gives
+    it a slot it must fill — and the day was refused while 2,859 of the trip's own budget sat
+    unspent. Zero is the absence of a figure, and absence is what spends the remainder."""
+    chat = _dubai_day(db, planned, days=1)
+    cap_before = chat.call_tool("get_itinerary", {})["budget"]["cap"]
+
+    added = chat.call_tool("add_day", {"extra_budget": 0})
+
+    assert "error" not in added, added
+    assert added["added_day"] == 2 and added["days"][1]["stops"]
+    assert added["budget_now"] == cap_before, "zero was treated as a top-up"
+
+
+def test_a_new_day_can_be_confined_to_its_own_emirate(client, planned, db):
+    """"Make it an Abu Dhabi day" is about one day, not about the trip. The stops come from
+    there; nothing already planned moves, and the trip's own region is untouched."""
+    from app.models import Itinerary
+
+    chat = _dubai_day(db, planned, days=1)
+    before = [name for day in chat.call_tool("get_itinerary", {})["days"]
+              for name in [stop["name"] for stop in day["stops"]]]
+
+    added = chat.call_tool("add_day", {"emirates": ["Abu Dhabi"]})
+
+    assert "error" not in added, added
+    assert added["added_day_emirates"] == ["Abu Dhabi"]
+    assert [name for name in added["days"][0]["stops"]] == before, "day one moved"
+
+    itinerary = db.query(Itinerary).order_by(Itinerary.id.desc()).first()
+    new_day = [slot for slot in itinerary.slots if slot.day_index == 1]
+    assert new_day and all(slot.place.emirate == "Abu Dhabi" for slot in new_day)
+    # The trip is still a Dubai trip: one day went visiting, the plan did not relocate.
+    assert itinerary.emirates_json == ["Dubai"]
+
+
+def test_a_remainder_too_small_for_a_day_asks_instead_of_shrinking_one(client, planned, db):
+    """The other half of the same rule. "Enough for a day" is not a number anyone can name up
+    front, so it is settled by trying — and a shortfall is a question, not a failure."""
+    from app.models import Itinerary
+
+    chat = _dubai_day(db, planned, days=1)
+    itinerary = db.query(Itinerary).order_by(Itinerary.id.desc()).first()
+    spent = chat.call_tool("get_itinerary", {})["budget"]["total"]
+    itinerary.total_budget = spent + 5  # a fiver is not a day out
+    db.commit()
+
+    asked = chat.call_tool("add_day", {})
+
+    assert asked["applied"] is False and asked["needs_confirmation"] == "day_budget"
+    assert asked["proposed_remaining"] == 5
+    assert "extra_budget" in asked["question_for_the_user"]
+    # And nothing moved: the plan is still the length it was, at the cap it was.
+    assert len(chat.call_tool("get_itinerary", {})["days"]) == 1
+    assert itinerary.num_days == 1
+
+
+def test_a_budget_for_the_new_day_is_the_users_to_give(client, planned, db):
+    """add_day raises the trip's cap, so its figure is invented exactly as readily as the trip's
+    own budget was — and is checked the same way."""
+    from app.models import Conversation, User
+    from app.services import policy
+    from app.services.orchestrator import ChatOrchestrator
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    chat.record("user", "add one more day to the plan")
+    db.commit()
+
+    assert policy.intercept(chat, "add_day", {"extra_budget": 1800}) is not None
+    chat.record("user", "1800 for it")
+    db.commit()
+    assert policy.intercept(chat, "add_day", {"extra_budget": 1800}) is None
+
+
+def test_a_day_nothing_fits_into_is_refused_rather_than_appended_empty(client, planned, db):
+    """A day with nothing in it is not a day, and reporting one as added is the lie this whole
+    file exists to prevent."""
+    chat = _dubai_day(db, planned, days=1)
+    result = chat.call_tool("add_day", {"extra_budget": 1})
+
+    assert "error" in result and "higher figure" in result["error"]
+    assert len(chat.call_tool("get_itinerary", {})["days"]) == 1
+
+
+def test_dropping_a_middle_day_asks_before_it_moves_anything(client, planned, db):
+    """Shift the later days up, or leave the day free? An event on a later date decides it, so
+    there is no safe default — and the question travels with the plan as it really stands."""
+    chat = _dubai_day(db, planned, days=3)
+    before = chat.call_tool("get_itinerary", {})
+
+    asked = chat.call_tool("drop_day", {"day": 2})
+
+    assert asked["applied"] is False
+    assert asked["needs_confirmation"] == "day_shift_choice"
+    assert asked["plan_is_unchanged"] == [s["name"] for d in before["days"] for s in d["stops"]]
+    assert chat.touched_itinerary is None, "a question must not nudge the right pane"
+    assert chat.call_tool("get_itinerary", {})["num_days"] == 3
+
+    # Passing the argument is not the same as the user having answered. Live validation caught
+    # the model calling drop_day(day=2, shift_later_days=False) unprompted — inventing an answer
+    # to the one question the tool exists to ask.
+    guessed = chat.call_tool("drop_day", {"day": 2, "shift_later_days": False})
+    assert guessed["needs_confirmation"] == "day_shift_choice", "the model answered for the user"
+
+    _remember_turn(chat, "drop_day", {"day": 2}, asked)
+
+    answered = chat.call_tool("drop_day", {"day": 2, "shift_later_days": True})
+    assert "error" not in answered, answered
+    assert answered["remaining_days"] == 2, "the trip did not get shorter"
+
+
+def test_the_last_day_goes_without_a_question(client, planned, db):
+    chat = _dubai_day(db, planned, days=3)
+    dropped = chat.call_tool("drop_day", {"day": 3})
+    assert "error" not in dropped, dropped
+    assert dropped["remaining_days"] == 2
+
+
+def test_where_the_family_lives_is_not_where_the_current_trip_goes(client, planned, db):
+    """Recording a home emirate sets the default origin for plans built later. It must not
+    silently re-point a plan that already exists — that one moves through set_origin, or not at
+    all."""
+    chat = _dubai_day(db, planned)
+    origin_before = chat._resolve_itinerary().start_lat
+    home_before = chat.user.home_base_lat
+
+    saved = chat.call_tool("save_family_details", {"adults": 2, "home_emirate": "Sharjah"})
+
+    assert saved["home_emirate"] == "Sharjah"
+    assert chat.user.home_base_lat != home_before, "the home base was not recorded"
+    assert chat._resolve_itinerary().start_lat == origin_before, "the live plan was moved too"
+
+
+# --- the deterministic layer, against a real plan ----------------------------------------------
+
+
+def test_the_fingerprint_changes_exactly_when_the_plan_does(client, planned, db):
+    """Ground truth for "did anything change", computed rather than believed.
+
+    Cheap on purpose: itinerary_payload is a full re-render with places and geometry attached,
+    and this runs twice a turn to answer a yes/no question.
+    """
+    from app.services.policy import plan_fingerprint
+
+    chat = _dubai_day(db, planned, days=2)
+    itinerary = chat._resolve_itinerary()
+
+    first = plan_fingerprint(db, itinerary)
+    assert plan_fingerprint(db, itinerary) == first, "reading the plan is not changing it"
+
+    chat.call_tool("get_itinerary", {})
+    assert plan_fingerprint(db, itinerary) == first, "a read moved the fingerprint"
+
+    chat.call_tool("set_transport", {"mode": "own_car"})
+    after_transport = plan_fingerprint(db, itinerary)
+    assert after_transport != first
+
+    chat.call_tool("set_origin", {"emirate": "Abu Dhabi"})
+    assert plan_fingerprint(db, itinerary) != after_transport, "moving the origin did not show"
+
+
+def test_a_refused_rebuild_never_reaches_the_handler(client, planned, db):
+    """The gate runs in policy.intercept, before the handler — so a rebuild that must not happen
+    cannot get as far as writing a row and then being tidied up."""
+    from app.models import Itinerary
+    from app.services import policy
+
+    chat = _dubai_day(db, planned)
+    rows_before = db.query(Itinerary).count()
+
+    refusal = policy.intercept(chat, "generate_itinerary", {"days": 1, "budget": 5000})
+
+    assert refusal is not None and "replace_plan" in refusal["error"]
+    assert db.query(Itinerary).count() == rows_before
+    # And the warning is now on record, which is what a later consent is measured against.
+    assert chat.conversation.rebuild_warned is True
+
+
+def test_consent_still_takes_two_turns_after_the_move(client, planned, db):
+    """`replace_existing` set in the same turn as the warning is the model granting itself
+    permission. Moving the gate out of the handler must not have loosened that."""
+    from app.services import policy
+
+    chat = _dubai_day(db, planned)
+    chat.warned_at_turn_start = False
+
+    same_turn = policy.intercept(chat, "generate_itinerary", {"days": 1, "replace_existing": True})
+    assert same_turn is not None and "does not grant itself" in same_turn["error"]
+
+    # A turn later, the user having spoken since, the same call is allowed through.
+    chat.warned_at_turn_start = True
+    assert policy.intercept(chat, "generate_itinerary", {"days": 1, "replace_existing": True}) is None
+
+
+def test_a_figure_the_user_never_gave_is_asked_for_rather_than_invented(client, planned, db):
+    """Live validation, three runs. "He has a bunch of friends" was priced as party_size 11, then
+    as the household with the friends dropped, then as party_size 6 with four invented guests and
+    a budget of 3000 nobody had been asked for. Absence was never the failure — invention was."""
+    from app.models import Conversation, User
+    from app.services import policy
+    from app.services.itinerary import family_attendees
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    household = len(family_attendees(db, row.id))
+
+    chat.record("user", "my brother turns 20 and he has a bunch of friends — give him a day out")
+    db.commit()
+    refused = policy.intercept(
+        chat, "generate_itinerary",
+        {"days": 1, "budget": 3000, "party_size": household + 2, "start_date": FUTURE},
+    )
+    assert refused is not None and refused["applied"] is False
+    assert refused["needs_confirmation"] == "stated_figures"
+    # Both are named, because asking for one and inventing the other is how run three went.
+    assert "budget 3,000" in refused["question_for_the_user"]
+    assert f"party size {household + 2}" in refused["question_for_the_user"]
+
+    # Guests invented one by one are a headcount by another route, and are caught the same way.
+    assert policy.intercept(chat, "generate_itinerary", {
+        "days": 1, "budget": 3000, "party_size": None,
+        "guests": [{"role": "adult", "age": 20, "name": f"Friend {n}"} for n in range(4)],
+    }) is not None
+
+    # A figure the user actually typed is theirs, and the refusal narrows to what is still made up.
+    chat.record("user", "7500")
+    db.commit()
+    narrowed = policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household + 2}
+    )
+    assert narrowed is not None
+    named = narrowed["question_for_the_user"].split("user's: ")[1].split(". Nobody")[0]
+    assert named == f"party size {household + 2}", named
+
+    # An increment is theirs too: "10 friends" is a party of household + 10, which the prompt asks
+    # for as a sum — so the sum must not read as invented.
+    chat.record("user", "10 friends are coming")
+    db.commit()
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household + 10}
+    ) is None
+
+    # Silence about the party still means the household: the documented default, and not something
+    # to interrogate a family about when their members are already on file.
+    chat.record("user", "plan us a beach day, 7500 again")
+    db.commit()
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household}
+    ) is None
+
+    # Asked once is enough. If they answer with a number it is theirs from then on; if they would
+    # rather leave it to us, the next attempt goes through instead of looping.
+    chat.record("assistant", "how many, and what budget?",
+                {"calls": [{"name": "generate_itinerary", "result": refused}]})
+    chat.record("user", "you decide")
+    db.commit()
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 4321, "party_size": household + 3}
+    ) is None
+
+
+def test_no_other_tool_is_intercepted(client, planned, db):
+    """Interception is a short list of refusals, not a gate every call has to argue with."""
+    from app.services import policy
+
+    chat = _dubai_day(db, planned)
+    for name in ("get_itinerary", "find_places", "edit_stop", "set_origin", "drop_day",
+                 "reschedule_itinerary", "record_preference", "add_stop", "make_day_cheaper"):
+        assert policy.intercept(chat, name, {}) is None, name
+
+    # The two that are: both throw away work the user approved.
+    assert policy.intercept(chat, "generate_itinerary", {}) is not None
+    assert policy.intercept(chat, "replace_plan", {}) is not None
+
+
+# --- the trace survives the turn ---------------------------------------------------------------
+
+
+def test_history_never_hands_the_api_a_tool_call_it_cannot_match(client, planned, db):
+    """The API requires a role:"tool" message per tool_call_id immediately after an assistant
+    row that carries tool_calls. Those rows are not stored, so replaying the trace structurally
+    would be rejected outright rather than degrading. It goes back as prose."""
+    from app.services.orchestrator import persisted_trace
+
+    chat = _dubai_day(db, planned)
+    chat.record("assistant", "Here you go.", tool_calls=persisted_trace([
+        {"name": "edit_stop", "args": {"stop": "the park"}, "applied": False,
+         "result": {"needs_confirmation": "day_reorder", "question_for_the_user": "may it re-time?"}},
+    ]))
+    db.commit()
+
+    for entry in chat.history():
+        assert set(entry) == {"role", "content"}, entry
+
+
+def test_a_refused_proposal_is_still_on_record_next_turn(client, planned, db):
+    """The confirmation protocol spans two turns: _unapplied returns the proposal and the plan as
+    it really stands, and the user answers "yes" in their NEXT message. Everything structured
+    about that question used to be thrown away, leaving the model to reconstruct it from its own
+    prose — the one source already known to be wrong about this."""
+    from app.services.orchestrator import persisted_trace
+
+    chat = _dubai_day(db, planned)
+    chat.record("assistant", "Shall I re-time the day?", tool_calls=persisted_trace([
+        {
+            "name": "edit_stop",
+            "args": {"stop": "the park", "action": "replace", "category": "museum"},
+            "applied": False,
+            "result": {
+                "applied": False,
+                "needs_confirmation": "day_reorder",
+                "question_for_the_user": "nothing of that kind is open at that hour",
+                "proposed_place": "Louvre Abu Dhabi",
+                "plan_is_unchanged": ["the park", "a cafe"],
+            },
+        },
+    ]))
+    db.commit()
+
+    replayed = "\n".join(entry["content"] for entry in chat.history())
+
+    assert "NOT applied" in replayed, "the next turn has to know nothing happened"
+    assert "day_reorder" in replayed
+    assert "Louvre Abu Dhabi" in replayed, "the proposal itself has to survive"
+    assert "the park" in replayed
+
+
+def test_the_plan_itself_is_not_copied_into_history(client, planned, db):
+    """The plan is persisted and authoritative; re-reading it is one tool call away. What is not
+    recoverable is what was asked and refused, so that is all that is carried."""
+    from app.services.orchestrator import persisted_trace
+
+    stored = persisted_trace([
+        {"name": "get_itinerary", "args": {}, "applied": False,
+         "result": {"days": [{"stops": ["a"] * 50}], "total": 1940.05, "cap": 2000}},
+    ])
+    assert stored["calls"][0]["result"] == {}, "a read carries nothing forward"
+
+
+def test_a_turn_of_pure_tool_calls_no_longer_vanishes(client, planned, db):
+    """history() drops empty-content rows, so a turn that was all tools and no prose disappeared
+    from the replay entirely."""
+    from app.services.orchestrator import persisted_trace
+
+    chat = _dubai_day(db, planned)
+    chat.record("assistant", "", tool_calls=persisted_trace([
+        {"name": "set_transport", "args": {"mode": "own_car"}, "applied": True, "result": {}},
+    ]))
+    db.commit()
+
+    replayed = [e for e in chat.history() if "set_transport" in e["content"]]
+    assert replayed, "the turn left no trace at all"
+    assert "applied" in replayed[0]["content"]
+
+
+def test_nothing_called_means_nothing_stored(client, planned, db):
+    from app.services.orchestrator import persisted_trace
+
+    assert persisted_trace([]) is None
+
+
+def test_a_real_turn_stores_what_it_called(client, planned, db, monkeypatch):
+    """End to end, not just the helpers: the loop has to actually hand the trace to record()."""
+    from app.services import orchestrator as orch
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+
+    fake = _FakeStream([
+        [_chunk(tool=("get_itinerary", "{}"))],
+        [_chunk(content="Your plan is on screen.")],
+    ])
+    monkeypatch.setattr(orch, "wrap_openai", lambda c: c)
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai", type("M", (), {"OpenAI": lambda **_: fake})
+    )
+
+    "".join(chat.stream("what does the plan look like?"))
+
+    saved = [m for m in _messages(db, chat) if m.role == "assistant"][-1]
+    assert saved.tool_calls_json is not None, "the turn recorded no trace at all"
+    called = saved.tool_calls_json["calls"]
+    assert [c["name"] for c in called] == ["get_itinerary"]
+    assert called[0]["applied"] is False, "reading the plan is not changing it"
+
+
+def test_a_turn_that_came_back_asking_is_not_second_guessed(client, planned, db, monkeypatch):
+    """A confirmation turn has one right reply — the question. Live validation showed what asking
+    a reviewer anyway costs: it answered `needs_tools` ("read the plan before summarising it"),
+    and the rewrite came back as a tidy summary of the unchanged plan with the question gone.
+    Safe, and useless — the user waits on an answer nobody asked them for."""
+    from app.services import reviewer as rev
+    from app.services.turn import _check
+
+    consulted = []
+    monkeypatch.setattr(rev, "review", lambda *a, **k: consulted.append(a) or rev.Verdict())
+
+    trace = [{
+        "name": "drop_day", "args": {"day": 2}, "applied": False,
+        "result": {"applied": False, "needs_confirmation": "day_shift_choice",
+                   "question_for_the_user": "shift the later days, or leave day 2 free?"},
+    }]
+    verdict = _check("drop day 2", trace, "Shall I shift the later days earlier, or leave it free?")
+
+    assert verdict.is_ok
+    assert consulted == [], "the reviewer was asked to weigh in on a question"
+
+
+def test_a_confirmation_that_also_lies_is_still_caught(client, planned, db, monkeypatch):
+    """The skip above is only safe because claim_check runs first."""
+    from app.services import reviewer as rev
+    from app.services.turn import _check
+
+    consulted = []
+    monkeypatch.setattr(rev, "review", lambda *a, **k: consulted.append(a) or rev.Verdict())
+
+    trace = [{
+        "name": "drop_day", "args": {"day": 2}, "applied": False,
+        "result": {"applied": False, "needs_confirmation": "day_shift_choice"},
+    }]
+    _check("drop day 2", trace, "I have removed day 2 for you.")
+
+    assert consulted, "a claim with nothing applied must still reach the reviewer"
+
+
+# --- what ships must still be readable ---------------------------------------------------------
+
+MARKDOWN_REPLY = """Here's the updated plan for your brother's 20th birthday:
+
+### Day 1: December 10 - Culture & Cruise
+
+- **Sheikh Zayed Grand Mosque**
+- **Louvre Abu Dhabi**
+- **Shawarma Time** (Dinner)
+
+**Subtotal**: 1,196.14 AED
+
+I invented a whole extra day here.
+
+### Overview
+
+- **Budget**: 6,000 AED
+- **Transport Mode**: Taxi
+"""
+
+
+def test_stripping_a_sentence_does_not_flatten_the_reply():
+    """Reported from the browser: the reply arrived as one wall of literal ### and -.
+
+    `" ".join(text.split())` reads like whitespace tidying and is not — split() with no argument
+    splits on newlines too. The client renders markdown, where a heading or a bullet means nothing
+    without a line break, so a reply that had merely lost a sentence became unreadable. It only
+    ever fired when the reviewer objected, which is why most replies looked fine.
+    """
+    from app.services.reviewer import REWRITE, Verdict
+    from app.services.turn import _settle
+
+    verdict = Verdict(verdict=REWRITE, unsupported_claims=["I invented a whole extra day here."])
+    settled = _settle(MARKDOWN_REPLY, verdict, [])
+
+    assert "I invented a whole extra day here." not in settled, "the claim survived"
+    assert "\n### Day 1" in settled, "the heading lost its line break"
+    assert "\n- **Louvre Abu Dhabi**" in settled, "the bullets lost their line breaks"
+    assert "### Overview" in settled
+    assert settled.count("\n") > 8, f"the reply was flattened: {settled!r}"
+    # No run of blank lines where the sentence used to be.
+    assert "\n\n\n" not in settled
+
+
+def test_an_approved_reply_is_shipped_byte_for_byte():
+    from app.services.reviewer import Verdict
+    from app.services.turn import _settle
+
+    assert _settle(MARKDOWN_REPLY, Verdict(), []) == MARKDOWN_REPLY
+
+
+def test_the_chunking_that_streams_it_keeps_the_newlines(client, planned, db, monkeypatch):
+    """The reply is replayed in fixed-size slices; a slice boundary must not eat a newline."""
+    from app.services import orchestrator as orch
+
+    _, _, plan = planned
+    chat = _chat_for(db, plan)
+    fake = _FakeStream([[_chunk(content=MARKDOWN_REPLY)]])
+    monkeypatch.setattr(orch, "wrap_openai", lambda c: c)
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai", type("M", (), {"OpenAI": lambda **_: fake})
+    )
+
+    frames = "".join(chat.stream("what does the plan look like?"))
+
+    assert _spoken(frames) == MARKDOWN_REPLY
+
+
+def test_a_stated_total_below_the_household_trims_the_party(client, planned, db):
+    """The reported bug: "dinner for me and my wife" in a household of four priced four seats.
+
+    `party_size` could only ever ADD guests — `_fit_party` computes `max(0, total - household)` —
+    so the household was a floor no request could get under. A couple living with their parents
+    had no way to say "just the two of us": `adults_only` only removes children, and there were
+    none to remove.
+    """
+    _, _, plan = planned
+    chat = _warned_last_turn(_chat_for(db, plan))
+    chat.call_tool("save_family_details", {"adults": 4, "children_ages": []})
+
+    result = chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, "days": 1, "budget": 700, "start_date": FUTURE,
+         "focus": "dinner_only", "adults_only": True, "party_size": 2},
+    )
+    assert result["party_size"] == 2, result
+
+    payload = itinerary_service.itinerary_payload(db, db.get(Itinerary, result["itinerary_id"]))
+    priced = 0
+    for day in payload["days"]:
+        for slot in day["slots"]:
+            cost = slot["cost_breakdown"]
+            heads = len(cost["adults"]) + len(cost["children"]) + cost["free_children"]
+            assert heads == 2, f"{slot['place'].name} charged {heads} people, not 2"
+            priced += 1
+    assert priced, "the plan had no slots to check"
+
+
+def test_a_trimmed_party_survives_a_re_price(client, planned, db):
+    """Same hole the guests had: the trim lived only in the call that made the plan.
+
+    Everything reached later — a transport switch, the payload's vehicle tier — re-derives the
+    party from the household, so a plan solved for two went back to being charged for four.
+    """
+    _, _, plan = planned
+    chat = _warned_last_turn(_chat_for(db, plan))
+    chat.call_tool("save_family_details", {"adults": 4, "children_ages": []})
+    chat.call_tool(
+        "generate_itinerary",
+        {"replace_existing": True, "days": 1, "budget": 700, "start_date": FUTURE,
+         "focus": "dinner_only", "party_size": 2},
+    )
+
+    back = chat.call_tool("set_transport", {"mode": "own_car"})
+    assert back["party_size"] == 2, "the re-price fell back to the household"

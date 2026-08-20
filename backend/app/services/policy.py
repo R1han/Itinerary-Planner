@@ -1,0 +1,524 @@
+"""The rules about tool calls that used to live in the system prompt.
+
+A rule written in English is advice: the model follows it most of the time, and the times it does
+not are the bugs this file exists to close. Everything here is a plain function over the same
+facts the model has, decided in code, and answerable in a test without an API key.
+
+Four jobs, in the order a turn meets them:
+
+  `intercept`        before a tool runs — refuse a call that must not happen, with a message that
+                     names what the model should have called instead.
+  `applied`          after it runs — did this call actually change anything. A fact, not the
+                     model's opinion of one.
+  `plan_fingerprint` a cheap cross-check on that, for the tools that touch an itinerary.
+  `claim_check`      before the answer ships — does the prose claim a change the trace cannot
+                     support.
+
+Deliberately NOT here: choosing which tools to expose. Removing a tool from the request based on
+state reads like the stronger move and is a trap — `Conversation.rebuild_warned` is set inside the
+very handler such a rule would remove, so gating the tool on the flag makes the flag unreachable
+and no restart is ever possible again. Interception gets the same guarantee (a refused call cannot
+mutate anything) while leaving every tool reachable, and leaves the refusal text in place, which is
+what teaches the model the right call.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from sqlalchemy.orm import Session
+
+    from ..models import Itinerary
+
+
+# --- which tools can change anything -----------------------------------------------------------
+
+# Everything not listed is read-only. `applied` is False for those by definition: a search that
+# found nothing has not failed, and a turn that only looked things up has changed nothing to
+# report — telling a reviewer "nothing changed" about such a turn invents a problem.
+MUTATING_TOOLS = frozenset(
+    {
+        "save_family_details",
+        "create_event",
+        "record_preference",
+        "generate_itinerary",
+        "replace_plan",
+        "reschedule_itinerary",
+        "set_origin",
+        "drop_day",
+        "add_day",
+        "make_day_cheaper",
+        "add_prayer_breaks",
+        "set_transport",
+        "add_stop",
+        "edit_stop",
+    }
+)
+
+# The tools that write to an itinerary specifically, and so can be cross-checked against a
+# fingerprint of one.
+PLAN_TOOLS = frozenset(
+    {
+        "generate_itinerary",
+        "replace_plan",
+        "reschedule_itinerary",
+        "set_origin",
+        "drop_day",
+        "add_day",
+        "make_day_cheaper",
+        "add_prayer_breaks",
+        "set_transport",
+        "add_stop",
+        "edit_stop",
+    }
+)
+
+
+def applied(name: str, result: Any) -> bool:
+    """Did this call change anything.
+
+    Three ways a call changes nothing, and all of them have been narrated as success at least
+    once: it errored, it came back asking (`applied: false`, the confirmation protocol), or it
+    never writes in the first place.
+    """
+    if name not in MUTATING_TOOLS or not isinstance(result, dict):
+        return False
+    if result.get("error"):
+        return False
+    return result.get("applied") is not False
+
+
+def plan_fingerprint(db: "Session", itinerary: "Itinerary | None") -> tuple | None:
+    """A cheap value that changes exactly when the plan does.
+
+    Deliberately not `itinerary_payload`: that is a full re-render with places and geometry
+    attached, and it would run twice a turn purely to answer a yes/no question.
+    """
+    if itinerary is None:
+        return None
+
+    from sqlalchemy import select
+
+    from ..models import Slot
+
+    rows = db.execute(
+        select(Slot.id, Slot.place_id, Slot.day_index, Slot.position, Slot.start_time, Slot.end_time)
+        .where(Slot.itinerary_id == itinerary.id)
+        .order_by(Slot.day_index, Slot.position)
+    ).all()
+    return (
+        itinerary.id,
+        itinerary.num_days,
+        itinerary.start_date,
+        itinerary.total_budget,
+        itinerary.transport_mode,
+        tuple(itinerary.emirates_json or ()),
+        (itinerary.start_lat, itinerary.start_lng),
+        tuple(tuple(row) for row in rows),
+    )
+
+
+# --- before the call ---------------------------------------------------------------------------
+
+
+REBUILD_IS_NOT_AN_EDIT = (
+    "This conversation already has a plan, and this tool builds a SEPARATE one — the current "
+    "plan, and every edit the user approved, is abandoned along with the thread that points at "
+    "it. There is a tool for whatever was actually meant. Adding, removing or swapping one stop "
+    "is add_stop or edit_stop. Different dates, same stops, is reschedule_itinerary. Setting off "
+    "from somewhere else — 'we live in Abu Dhabi', 'start us from Sharjah' — is set_origin, and "
+    "it costs nothing. Removing a whole day is drop_day. Moving the trip's REGION, or genuinely "
+    "starting over, is replace_plan: it re-solves in place, so the conversation and the event "
+    "stay attached. Nothing else needs this tool: a plan is saved as it is built and edited, so "
+    "there is no finalising, confirming or committing to do. If the user is choosing one specific "
+    "place out of options you listed ('choose Beirut Restaurant') that is edit_stop with "
+    "place='Beirut Restaurant', never this tool — this tool has no `place` argument, so a named "
+    "choice made through it is silently dropped and the solver picks whatever it likes instead. "
+    "If they truly want a separate plan rather than this one re-solved, tell them the current "
+    "plan will be discarded, and ask. Their ANSWER is what unlocks this."
+)
+
+CONSENT_DOES_NOT_GRANT_ITSELF = (
+    "replace_existing does not grant itself. The user has not been told this plan would be "
+    "discarded and has not agreed to it — as of the start of this turn, nobody had raised it. "
+    "Stop calling tools, tell them what would be lost, and ask. Their next message is when this "
+    "works."
+)
+
+
+REPLACING_LOSES_THE_STOPS = (
+    "Replacing this plan re-solves it from scratch. Every stop goes, and so does every edit the "
+    "user has approved — only the dates, the budget and the party carry over. Tell them that in "
+    "plain words, name what they are about to lose, and ask. Their answer is what unlocks this. "
+    "If they only want the trip to set off from somewhere else, that is set_origin and it keeps "
+    "the whole plan."
+)
+
+# Company the user has named but not counted. Only the unquantified words: the number itself is
+# what the gate wants, so "10 friends" must sail through while "a bunch of friends" does not.
+#
+# ponytail: a word list, so "the whole crew" slips past. Ask the model to classify if that matters.
+_VAGUE_COMPANY = re.compile(
+    r"(?<!\d )\b(?:friends?|mates|buddies|classmates|colleagues|cousins|a bunch|a group|"
+    r"a crew|the guys|the girls|some people|a few people)\b",
+    re.IGNORECASE,
+)
+
+# Numbers as the user typed them. Digits with optional separators, plus "7.5k" for money, plus the
+# small words a headcount actually gets said in.
+#
+# ponytail: ten to twenty is where counting out loud stops. "Three thousand dirhams" is not read,
+# and neither are dates written in words — both come back as a refusal asking for the figure,
+# which is a worse answer than understanding it but a much better one than inventing it.
+_DIGITS = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)\s*(k\b)?", re.IGNORECASE)
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+}
+
+
+FIGURES_THE_USER_NEVER_GAVE = (
+    "These figures are not the user's: {fields}. Nobody said them — they were filled in because "
+    "the argument was there to fill, and a plan priced on them is shown to the user as settled "
+    "fact. A budget and a headcount are theirs to state and nobody else's: the headcount decides "
+    "the vehicle, the fares and every ticket, and the budget decides the whole plan. Stop calling "
+    "tools and ask for {ask}. Their answer is what unlocks this."
+)
+
+
+def _stated_numbers(orchestrator: Any) -> set[float]:
+    """Every number the user has typed in this conversation.
+
+    Read from the persisted messages rather than taken on the model's word — the same reason
+    `asked_before` reads the trace. Dates and ages land in here too ("December 10", "turning 20"),
+    which loosens the check by exactly those values and is the price of not writing a parser.
+    """
+    from ..models import Message
+
+    rows = orchestrator.db.query(Message).filter(
+        Message.conversation_id == orchestrator.conversation.id,
+        Message.role == "user",
+    )
+    found: set[float] = set()
+    for row in rows:
+        text = row.content or ""
+        for raw, thousands in _DIGITS.findall(text):
+            try:
+                value = float(raw.replace(",", ""))
+            except ValueError:  # pragma: no cover — the regex cannot produce this
+                continue
+            found.add(value * 1000 if thousands else value)
+        for word, value in _NUMBER_WORDS.items():
+            if re.search(rf"\b{word}\b", text, re.IGNORECASE):
+                found.add(float(value))
+    return found
+
+
+def _figures_the_user_never_gave(orchestrator: Any, args: dict) -> dict | None:
+    """Refuse a plan priced on numbers nobody said.
+
+    Live validation, three runs. "He has a bunch of friends" was priced as party_size 11, then as
+    the household exactly with the friends dropped, then as party_size 6 with four invented guests
+    — "Brother's Friend 1" through 4 — and a budget of 3000 the user was never asked for.
+
+    The earlier gates here checked for ABSENCE: budget rejected `<= 0`, party size rejected the
+    household count. This model rarely produces absence. It produces a confident, plausible,
+    invented value, and it will build a supporting cast to make the value look derived. So the
+    test is provenance instead: a figure only the user can know has to have come from the user.
+
+    Allowed without them saying it: the household, which is the documented default for a party,
+    but only while they have not named company they left uncounted; and whatever the current plan
+    was already solved for, so a re-price is not an interrogation.
+
+    Asked once, then allowed. Not a loop the user cannot escape: if they answer with a number it
+    is theirs from then on, and if they would rather leave it to us ("surprise me", "you decide")
+    the second attempt goes through. The trade is that a figure invented AFTER the question still
+    lands — visible in the progress line, where they can see it and say so.
+    """
+    if asked_before(orchestrator, "stated_figures"):
+        return None
+
+    from ..models import Message
+    from .itinerary import family_attendees
+
+    said = orchestrator.db.query(Message).filter(
+        Message.conversation_id == orchestrator.conversation.id,
+        Message.role == "user",
+    ).count()
+    # Nothing to judge provenance against. A conversation with no user turn in it is a tool called
+    # directly — the test suite, and the UI's own server-side calls — not a model filling a blank.
+    if not said:
+        return None
+
+    stated = _stated_numbers(orchestrator)
+    current = orchestrator._resolve_itinerary()
+    household = len(family_attendees(orchestrator.db, orchestrator.user.id))
+    unnamed: list[str] = []
+
+    budget = (
+        float(args.get("budget") or 0)
+        or float(args.get("budget_per_day") or 0)
+        or float(args.get("extra_budget") or 0)
+    )
+    on_file = {float(current.total_budget)} if current else set()
+    if budget > 0 and budget not in stated | on_file:
+        unnamed.append(f"budget {budget:,.0f}")
+
+    # Guests without a stated total are a headcount too: four friends invented one by one price
+    # the trip for four extra people just as surely as passing the number would.
+    guests = args.get("guests") or []
+    total = int(args.get("party_size") or 0) or (household + len(guests) if guests else 0)
+    # "10 friends are joining" is an increment, and the prompt asks for the sum — so the household
+    # added to something they said is theirs as much as the figure itself.
+    theirs = stated | {n + household for n in stated}
+    if current is not None:
+        theirs.add(float(current.party_size or household))
+    if total and total not in theirs:
+        # Silence about the party still means the household. Naming company and then landing on
+        # the household is not silence — it is the friends going missing, which is run two.
+        if total != household or _VAGUE_COMPANY.search(_last_user_message(orchestrator)):
+            unnamed.append(f"party size {total}")
+
+    if not unnamed:
+        return None
+    asks = [field.split()[0] for field in unnamed]
+    # Shaped like `_unapplied` minus the plan, since there may not be one yet: `applied: false`
+    # and a question, so no reply can narrate this as a trip that got built.
+    return {
+        "applied": False,
+        "needs_confirmation": "stated_figures",
+        "question_for_the_user": FIGURES_THE_USER_NEVER_GAVE.format(
+            fields=", ".join(unnamed), ask=" and ".join(asks)
+        ),
+    }
+
+
+def _last_user_message(orchestrator: Any) -> str:
+    """What the user just said. Committed before the model runs, so it is already on the row."""
+    from ..models import Message
+
+    row = (
+        orchestrator.db.query(Message)
+        .filter(
+            Message.conversation_id == orchestrator.conversation.id,
+            Message.role == "user",
+        )
+        .order_by(Message.id.desc())
+        .first()
+    )
+    return row.content if row else ""
+
+
+def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
+    """Refuse a call that must not happen, or None to let it through.
+
+    Runs before the handler, so a refusal cannot have written anything on its way to being
+    refused. The returned dict is what the model sees as the tool's result.
+    """
+    if name == "generate_itinerary":
+        return (
+            _rebuild_is_not_an_edit(orchestrator, args)
+            or _figures_the_user_never_gave(orchestrator, args)
+        )
+    # add_day raises the trip's cap, so its figure is the user's to give for the same reason the
+    # trip's own budget is — and is invented just as readily when nobody asks for it.
+    if name == "add_day":
+        return _figures_the_user_never_gave(orchestrator, args)
+    if name == "replace_plan":
+        return _replacing_needs_the_users_word(orchestrator, args)
+    if name == "drop_day":
+        _shift_is_not_ours_to_choose(orchestrator, args)
+    return None
+
+
+def asked_before(orchestrator: Any, kind: str) -> bool:
+    """Did the assistant already put this question to the user, in an earlier turn?
+
+    Read from the persisted trace rather than taken on the model's word, for the same reason
+    `replace_existing` does not grant itself: setting an argument is free, and a model with a
+    blank to fill will fill it. The last assistant row is necessarily from a previous turn,
+    because this turn's reply has not been recorded yet.
+    """
+    from ..models import Message
+
+    row = (
+        orchestrator.db.query(Message)
+        .filter(
+            Message.conversation_id == orchestrator.conversation.id,
+            Message.role == "assistant",
+        )
+        .order_by(Message.id.desc())
+        .first()
+    )
+    if row is None:
+        return False
+    for call in (row.tool_calls_json or {}).get("calls") or []:
+        if (call.get("result") or {}).get("needs_confirmation") == kind:
+            return True
+    return False
+
+
+def _replacing_needs_the_users_word(orchestrator: Any, args: dict) -> dict | None:
+    """Ask once before throwing away every stop in the plan.
+
+    Live validation is what put this here. "Change the location of the plan to Abu Dhabi" went
+    straight through: the region moved, which is what the user asked for, and every edit they had
+    made went with it without anyone mentioning that it would. The tool description said to ask
+    first, and a description is advice.
+    """
+    current = orchestrator._resolve_itinerary()
+    if current is None:
+        return {
+            "error": (
+                "There is no plan in this conversation to replace. Build one with "
+                "generate_itinerary."
+            )
+        }
+    if asked_before(orchestrator, "plan_replacement"):
+        return None
+
+    emirates = [e for e in (args.get("emirates") or []) if e]
+    return orchestrator._unapplied(
+        current,
+        "plan_replacement",
+        ValueError(REPLACING_LOSES_THE_STOPS),
+        proposed_emirates=emirates or None,
+    )
+
+
+def _shift_is_not_ours_to_choose(orchestrator: Any, args: dict) -> None:
+    """Make `drop_day` put its question, rather than answer it on the user's behalf.
+
+    Also from live validation. Told "Drop day 2", the model called
+    `drop_day(day=2, shift_later_days=False)` — inventing an answer to the one question the tool
+    exists to ask, and leaving a silent gap in the middle of the trip. The handler only asks when
+    the argument is absent, so the argument is removed unless the question has actually been put.
+
+    Mutates `args` rather than returning a refusal, deliberately: what should happen next is the
+    handler raising DayShiftChoiceRequired, which is already shaped so a question cannot be read
+    as an answer.
+    """
+    if args.get("shift_later_days") is None:
+        return
+    if asked_before(orchestrator, "day_shift_choice"):
+        return
+    args["shift_later_days"] = None
+
+
+def _rebuild_is_not_an_edit(orchestrator: Any, args: dict) -> dict | None:
+    """Protect the conversation's own plan from being replaced by a brand new one.
+
+    The reported bug: asked to add one adventure, the model called generate_itinerary, a new
+    itinerary row was created, the conversation was re-pointed at it, and the approved plan was
+    orphaned — a stop the user never touched vanished and one they had swapped out came back.
+    Prompt text was the only thing standing in the way, and the prompt's own carve-out ("or agreed
+    to start over") is exactly what a reply like "sure, I can sacrifice some budget" reads as.
+
+    Only the conversation's OWN plan is protected: a new thread still plans freely even though the
+    user has older plans elsewhere.
+    """
+    current = orchestrator._resolve_itinerary()
+    if current is None or current.id != orchestrator.conversation.itinerary_id:
+        return None
+
+    # `replace_existing` alone is not permission. Setting it is free, and the model set it on its
+    # first attempt — "let us finalize it" became a rebuild that threw away every edit. Permission
+    # arrives a TURN after the warning, because that is how long it takes the user to answer, so
+    # the flag counts only once the warning has been given and the user has spoken since.
+    warned_before_this_turn = orchestrator.warned_at_turn_start
+    orchestrator.conversation.rebuild_warned = True
+    orchestrator.rebuild_refused = True
+
+    value = args.get("replace_existing")
+    if not bool(value if value is not None else False):
+        return {"error": REBUILD_IS_NOT_AN_EDIT}
+    if not warned_before_this_turn:
+        return {"error": CONSENT_DOES_NOT_GRANT_ITSELF}
+    return None
+
+
+# --- before the answer ships -------------------------------------------------------------------
+
+
+# Past participles, on purpose. "I can add a museum" is an offer and "shall I remove it?" is a
+# question; neither claims anything happened, and both use the base form — so leaving the base
+# forms out is what keeps an offer from being read as a lie.
+#
+# `set`, `put` and `cut` are their own past participles, so they carry both readings. They are in
+# the list because the reported bug was "the location ... has now been SET to Abu Dhabi", and the
+# `_HYPOTHETICAL` filter below is what keeps "I can set the transport" out of it.
+CHANGE_VERBS = frozenset(
+    {
+        "added", "created", "changed", "updated", "moved", "removed", "replaced", "swapped",
+        "rescheduled", "dropped", "applied", "adjusted", "shortened", "saved", "recorded",
+        "rebuilt", "relocated", "shifted", "made", "set", "put", "cut", "took", "switched",
+    }
+)
+
+# A sentence that says a change did NOT happen contains the same verbs as one that says it did —
+# it is the honest answer, and flagging it would train the fix out of existence.
+_NEGATED = re.compile(
+    r"\b(not|never|unable|cannot|can't|couldn't|didn't|wasn't|weren't|hasn't|haven't|failed|"
+    r"unchanged|nothing)\b|\bno (change|stops?|plan)\b",
+    re.IGNORECASE,
+)
+
+# Offers and intentions, which are about the future rather than the past.
+_HYPOTHETICAL = re.compile(
+    r"\b(can|could|shall|should|would|will|may|might|want|like me to|going to|if you)\b",
+    re.IGNORECASE,
+)
+
+_SENTENCE = re.compile(r"[^.!?\n]+[.!?\n]?")
+
+
+def claim_check(draft: str, trace: list[dict]) -> list[str]:
+    """Sentences that claim a change the trace cannot support.
+
+    A first filter, not the guarantee. It is a verb list, so a paraphrase gets past it — which
+    costs nothing, because the LLM reviewer runs on every mutating turn regardless of what this
+    returns. What it buys is the other direction: a turn that changed nothing and claims nothing
+    needs no reviewer at all, and a turn that changed nothing and claims something is caught here
+    without one.
+
+    `trace` is this turn's calls, each `{"name": ..., "applied": bool}`.
+    """
+    if any(entry.get("applied") for entry in trace):
+        return []  # something really did change; whether the prose describes it right is T3's job
+
+    flagged = []
+    for raw in _SENTENCE.findall(draft or ""):
+        sentence = raw.strip()
+        if not sentence or sentence.endswith("?"):
+            continue
+        if _NEGATED.search(sentence) or _HYPOTHETICAL.search(sentence):
+            continue
+        words = {word.lower() for word in re.findall(r"[a-zA-Z']+", sentence)}
+        if words & CHANGE_VERBS:
+            flagged.append(sentence)
+    return flagged
+
+
+# --- whether a turn should be made to call something -------------------------------------------
+
+
+_SMALL_TALK = frozenset(
+    {
+        "hi", "hello", "hey", "yo", "salam", "assalamu alaikum",
+        "thanks", "thank you", "thanks!", "cheers", "much appreciated",
+        "bye", "goodbye", "good night", "see you",
+    }
+)
+
+
+def is_small_talk(message: str) -> bool:
+    """True only for a greeting or a thank-you, where forcing a tool call would be absurd.
+
+    Used to decide `tool_choice` on the FIRST request of a turn, so the bar is deliberately high:
+    "ok", "yes" and "sure" are not small talk — they are usually the answer to a confirmation
+    question, and that answer is precisely when a tool must run.
+    """
+    text = " ".join((message or "").lower().split()).strip(" .!,")
+    return text in _SMALL_TALK

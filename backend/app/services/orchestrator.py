@@ -39,6 +39,7 @@ from ..models import (
     utcnow,
 )
 from . import itinerary as itinerary_service
+from . import policy
 from .budget import Attendee
 from .retrieval import EMIRATES, keyword_similarities, semantic_similarities
 from .memory import MemoryService
@@ -97,6 +98,16 @@ _TOOL_DEFINITIONS = [
                     },
                     "likes": {"type": "array", "items": {"type": "string"}},
                     "dislikes": {"type": "array", "items": {"type": "string"}},
+                    "home_emirate": {
+                        "type": "string",
+                        "enum": list(EMIRATES),
+                        "description": (
+                            "Where the family lives. Record it whenever they say so — it is where "
+                            "future plans set off from, so saying it once should be enough. It "
+                            "does not touch a plan that already exists: moving that one's "
+                            "starting point is set_origin."
+                        ),
+                    },
                 },
                 "required": ["adults"],
             },
@@ -403,6 +414,169 @@ _TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "set_origin",
+            "description": (
+                "Move where an existing plan sets off from — day one's starting point and the "
+                "map's first pin. Every stop stays exactly where it is; only the drive into each "
+                "day and its fare change. This is what 'we live in Abu Dhabi' or 'start us from "
+                "Sharjah' asks for. It does NOT move the trip: if the user wants the PLACES to be "
+                "somewhere else, none of the current ones can come along and that is replace_plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emirate": {
+                        "type": "string",
+                        "enum": list(EMIRATES),
+                        "description": "Where the trip should set off from.",
+                    },
+                },
+                "required": ["emirate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "drop_day",
+            "description": (
+                "Remove one whole day from an existing plan. Every other day keeps its stops. "
+                "Dropping a day that is not the last one comes back asking, because the days "
+                "after it can either shift earlier — the trip ends a day sooner — or hold their "
+                "dates and leave that day free. Put the choice to the user, wait, and only then "
+                "retry with shift_later_days."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {
+                        "type": "integer",
+                        "description": "Which day to remove, 1-based, as the plan is numbered.",
+                    },
+                    "shift_later_days": {
+                        "type": "boolean",
+                        "description": (
+                            "True pulls the later days up, ending the trip a day sooner. False "
+                            "leaves them on their dates with the dropped day free. Set it only "
+                            "once the user has answered — never guess, and never set it "
+                            "unasked."
+                        ),
+                    },
+                },
+                "required": ["day"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_day",
+            "description": (
+                "Add one more day to the END of an existing plan. Every day already on the plan "
+                "keeps its stops, its times and every edit the user made — the new day is solved "
+                "on its own and appended, so this is an edit, not a rebuild. Never use "
+                "generate_itinerary to lengthen a trip: that discards the whole plan to build a "
+                "new one. Call it with no arguments first: whatever the trip has not spent pays "
+                "for the new day, and a plan that came in under its cap needs nothing more. If "
+                "the remainder cannot fill a day it comes back asking, and THEN you put the "
+                "question to the user and retry with the figure they give."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "extra_budget": {
+                        "type": "number",
+                        "description": (
+                            "Leave this out on the first attempt. The server spends what is left "
+                            "of the trip's budget first, and only comes back asking when the "
+                            "remainder cannot fill a day. Set it then, to the figure the user "
+                            "gave in answer — never to one of your own. It is ADDED to the "
+                            "trip's cap rather than shared with the days already planned."
+                        ),
+                    },
+                    "emirates": {
+                        "type": "array",
+                        "description": (
+                            "Confine the NEW day to these emirates — 'make it an Abu Dhabi day'. "
+                            "Only this day is affected; the rest of the trip stays where it is, "
+                            "and the trip's own region is not changed. Leave empty to draw from "
+                            "wherever the trip already draws from. A city belongs to an emirate: "
+                            "'Al Ain' is ['Abu Dhabi'], 'Khor Fakkan' is ['Sharjah']."
+                        ),
+                        "items": {"type": "string", "enum": list(EMIRATES)},
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_plan",
+            "description": (
+                "Re-solve THIS plan, keeping the same trip: the conversation and the event stay "
+                "attached, and anything you do not pass stays as it is — but every stop is "
+                "replaced. This is the ONLY way a plan changes emirate: 'make it Abu Dhabi "
+                "instead of Dubai' cannot be done stop by stop, because none of the Dubai places "
+                "exist there. It is also how a genuine start-over happens. Every edit the user "
+                "approved is lost, so say that in plain words and get their answer FIRST. If they "
+                "only want the trip to set off from somewhere else, that is set_origin and it "
+                "costs them nothing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emirates": {
+                        "type": "array",
+                        "description": (
+                            "Confine the re-solved trip to these emirates. A CITY belongs to one "
+                            "of the seven: 'Al Ain' means ['Abu Dhabi']. Leave empty to keep the "
+                            "region the plan already has."
+                        ),
+                        "items": {"type": "string", "enum": list(EMIRATES)},
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": (
+                            "ISO date, YYYY-MM-DD. Leave empty to keep the plan's dates — moving "
+                            "dates alone is reschedule_itinerary, which keeps every stop."
+                        ),
+                    },
+                    "days": {"type": "integer", "description": "1 to 5. Empty keeps the current."},
+                    "budget": {
+                        "type": "number",
+                        "description": "The WHOLE trip in AED. Empty keeps the current cap.",
+                    },
+                    "budget_per_day": {
+                        "type": "number",
+                        "description": (
+                            "Budget for EACH day in AED — use this whenever the user says per "
+                            "day, a day, daily or nightly. Never pass both this and `budget`."
+                        ),
+                    },
+                    "focus": {
+                        "type": "string",
+                        "enum": list(itinerary_service.PLAN_FOCUS),
+                        "description": "'dinner_only' plans one evening stop, not a day out.",
+                    },
+                    "adults_only": {"type": "boolean"},
+                    "prayer_breaks": {"type": "boolean"},
+                    "party_size": {
+                        "type": "integer",
+                        "description": (
+                            "Total people, exactly as the user said it. Empty keeps the party the "
+                            "plan was priced for."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "make_day_cheaper",
             "description": (
                 "Re-solve one day of an existing plan against a smaller budget, swapping in "
@@ -572,7 +746,13 @@ _TOOL_DEFINITIONS = [
                 "Record a like or dislike the user mentions, whether they ask you to or not. "
                 "Call it alongside whatever else the message needs — 'I don't like kayaking' is "
                 "an edit AND a preference, and doing only the edit forgets it by the next "
-                "session."
+                "session. A preference counts however it arrives: a LIKE as readily as a "
+                "dislike, about anyone in the party rather than the user alone ('my brother "
+                "likes skateboarding'), and dropped as background to a request rather than "
+                "declared on its own — that sentence is the whole reason the trip is being "
+                "planned, and it is gone by the next session unless this is called. Store it "
+                "on the account: there is nowhere to attribute it per person, and a "
+                "household-level like still steers the plan."
             ),
             "parameters": {
                 "type": "object",
@@ -830,7 +1010,8 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
     if name == "generate_itinerary":
         bits = []
         if args.get("days"):
-            bits.append(f"{int(args['days'])} days")
+            day = int(args["days"])
+            bits.append(f"{day} day{'s' if day != 1 else ''}")
         if args.get("budget"):
             bits.append(_money(args["budget"]))
         if args.get("start_date"):
@@ -892,7 +1073,77 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
         verb = "likes" if kind == "like" else "dislikes"
         return "Noting a preference", f"{verb} {subject}" if subject else None
 
+    if name == "set_origin":
+        where = str(_arg(args, "emirate", "")).strip()
+        return "Moving the starting point", f"to {where}" if where else None
+
+    if name == "drop_day":
+        day = _arg(args, "day", None)
+        return "Removing a day", f"day {day}" if day else None
+
+    if name == "add_day":
+        extra = _arg(args, "extra_budget", None)
+        where = " / ".join(str(e) for e in (_arg(args, "emirates", []) or []))
+        spend = f"{_money(extra)} for it" if extra else "from what is left"
+        return "Adding a day", f"{where} · {spend}" if where else spend
+
+    if name == "replace_plan":
+        # Labelled by where it lands, because that is the part the user asked for; that every stop
+        # is replaced is the outcome's job to say, not the row's.
+        where = ", ".join(str(e) for e in (_arg(args, "emirates", []) or []))
+        return "Rebuilding the plan", f"in {where}" if where else None
+
     return name.replace("_", " ").capitalize(), None
+
+
+# What a call is worth remembering into the next turn. Not the whole result: the plan itself is
+# persisted and authoritative, so re-reading it is a tool call away. What is NOT recoverable is
+# what was asked and refused — a proposal that was never applied exists nowhere but here.
+_CARRIED_RESULT_KEYS = frozenset(
+    {"error", "needs_confirmation", "question_for_the_user", "plan_is_unchanged"}
+)
+
+
+def persisted_trace(trace: list[dict]) -> dict | None:
+    """Shape this turn's calls for `Message.tool_calls_json`. None when nothing was called."""
+    calls = []
+    for entry in trace:
+        result = entry.get("result")
+        carried = (
+            {
+                key: value
+                for key, value in result.items()
+                if key in _CARRIED_RESULT_KEYS or key.startswith("proposed_")
+            }
+            if isinstance(result, dict)
+            else {}
+        )
+        calls.append(
+            {
+                "name": entry.get("name"),
+                "args": entry.get("args") or {},
+                "applied": bool(entry.get("applied")),
+                "result": carried,
+            }
+        )
+    # A dict rather than a bare list, because the column is typed as one and a later turn may want
+    # to carry something alongside the calls.
+    return {"calls": calls} if calls else None
+
+
+def replay_trace(payload: dict | None) -> str:
+    """One line per call, for splicing into history as prose."""
+    calls = (payload or {}).get("calls") or []
+    lines = []
+    for call in calls:
+        # Spelled out rather than left as a flag: "NOT applied" is the fact the next turn most
+        # needs and the one the model has most often read past.
+        state = "applied" if call.get("applied") else "NOT applied — nothing changed"
+        line = f"{call.get('name')}({json.dumps(call.get('args') or {}, default=str)}) → {state}"
+        if call.get("result"):
+            line += f", {json.dumps(call['result'], default=str)}"
+        lines.append(line)
+    return " | ".join(lines)
 
 
 def summarise_tool_result(name: str, result: dict) -> str:
@@ -953,6 +1204,9 @@ def summarise_tool_result(name: str, result: dict) -> str:
         return f"swapped in {replaced} · {cost_line}" if replaced else cost_line
     if name == "add_prayer_breaks":
         return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
+    if name == "add_day":
+        days = _count(result.get("days", []), "day")
+        return f"now {days} · {_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "create_event":
         return "added" if result.get("created") else "already on your calendar"
     if name == "save_family_details":
@@ -1057,6 +1311,20 @@ class ChatOrchestrator:
             "you only described in prose. If a tool call errors or times out, say the change did "
             "not go through and the plan is unchanged; never present a failed call as done.\n\n"
             "# Editing plans\n"
+            "Where the user lives and where the trip goes are different questions, and answering "
+            "one with the other is how a plan gets reported as moved while nothing moves. "
+            "'We live in Abu Dhabi', 'start us from Sharjah' is set_origin: the stops all stay "
+            "and only the driving is re-costed. 'Make the trip Abu Dhabi instead of Dubai' is "
+            "replace_plan, because not one Dubai place exists in Abu Dhabi — say that every stop "
+            "goes and get their answer before you call it. Removing a whole day is drop_day, and "
+            "for any day but the last it comes back asking whether the later days shift earlier "
+            "or keep their dates; put that to the user rather than choosing. Adding a day is "
+            "add_day, which appends one and keeps every existing day as it is. Call it with "
+            "nothing set: what the trip has not spent pays for the day, and only if that will not "
+            "stretch to one does it come back asking for a figure — which is when you ask the "
+            "user, not before. The new day can be confined to its own emirate — 'add an Abu Dhabi "
+            "day' — with add_day's `emirates`, which moves nothing but that day. A longer trip is "
+            "never a reason to call generate_itinerary.\n\n"
             "You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
             "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
             "for an existing plan is reschedule_itinerary, never generate_itinerary — it keeps "
@@ -1084,22 +1352,22 @@ class ChatOrchestrator:
             "which place, how long it runs, and that the later stops shift. Ask, wait for the "
             "answer, and only then retry with allow_overrun or allow_reorder. Do not set either "
             "unasked.\n\n"
+            "plan_replacement and day_shift_choice work the same way, and the same rule applies: "
+            "the question is the whole reply. Put it in plain words — what will be lost, or which "
+            "of the two things should happen — and stop there. Do not summarise the plan instead, "
+            "and do not retry the call in the same turn; the answer comes in their next message, "
+            "and until it does nothing has happened.\n\n"
             "find_places only ever returns price_adult, one adult's ticket — never the swap's "
             "real cost, which is every adult plus every paying child. Never tell the user a place "
             "'fits' or 'is within budget' from that number: you have not checked, and edit_stop "
             "is the only place that actually prices the whole party against what's left. State "
             "the ticket price plainly and let the swap itself confirm affordability; if it comes "
             "back over budget, just say so — don't repeat a fit you never actually checked.\n\n"
-            "Do NOT reach for generate_itinerary to work around an edit: it builds a replacement "
-            "plan from scratch and throws the current one away. Once a conversation has a plan "
-            "the server refuses to rebuild it unless you pass replace_existing, and rightly so: "
-            "an edit that cannot be made is a reason to say so or to try a different edit, never "
-            "a reason to start over. A user agreeing to spend more, to a later finish, or to a "
-            "different kind of place is agreeing to an EDIT. Only an explicit ask to start again "
-            "is agreeing to lose the plan, and you must say what will be lost before you treat "
-            "anything as that yes. The same applies once the user is happy: a plan is saved the "
-            "moment it is built and again on every edit — there is no finalising, confirming or "
-            "committing step, and nothing to call when they approve it. Say so and stop.\n\n"
+            "Do NOT reach for generate_itinerary to work around an edit. The server refuses it, "
+            "and the refusal names the tool you actually wanted — so guessing here costs the user "
+            "a round rather than their plan. An edit that cannot be made is a reason to say so or "
+            "to try a different edit, never a reason to start over: a user agreeing to spend more, "
+            "to a later finish, or to a different kind of place is agreeing to an EDIT.\n\n"
             "Listing a stop the plan does not contain is worse than admitting the limit — the "
             "real plan is on screen beside you, and the user can see that it did not change.\n\n"
             "A tool that comes back asking has changed NOTHING. `applied: false` means the plan "
@@ -1132,10 +1400,8 @@ class ChatOrchestrator:
             "the seven emirates are valid, so map a city to the emirate containing it: Al Ain "
             "and Liwa are Abu Dhabi, Khor Fakkan is Sharjah. Leaving it empty draws from the "
             "whole country, and the catalog is densest in Dubai, so an unset region quietly "
-            "returns a Dubai trip no matter what the user asked for. A message may open with "
-            "`[Starting emirate: <emirate>]` — that's the emirate picked in the UI dropdown, not "
-            "idle context. Treat it exactly like the user naming that place and pass it as "
-            "`emirates`, unless the rest of the message names a different one.\n\n"
+            "returns a Dubai trip no matter what the user asked for. The emirate picked in the UI "
+            "dropdown is applied by the server, so there is nothing to carry across for it.\n\n"
             "# Party and budget\n"
             "The family listed below is who a plan is priced for by default. When anyone else "
             "is coming, pass `party_size` — the TOTAL number of people. When the user states a "
@@ -1144,7 +1410,9 @@ class ChatOrchestrator:
             "sum — the user gave an increment, not a total. Add `guests` as well only when one "
             "of the extras is a child, so their age reaches the ticket bands. Party size decides "
             "the vehicle, the fares and every ticket, so never just acknowledge a headcount in "
-            "prose and plan without passing it.\n\n"
+            "prose and plan without passing it. When their headcount is vague — 'a bunch "
+            "of friends', 'some of the family' — ask for the number instead of estimating "
+            "one: a guess here is priced as fact, and they see it as a settled figure.\n\n"
             "A budget is one figure for the trip or one figure for each day, and which one "
             "decides the whole plan. \"3000 a day\" over five days is a 15,000 trip: pass it as "
             "budget_per_day and let the server multiply. Pass `budget` only when the user gave a "
@@ -1167,14 +1435,21 @@ class ChatOrchestrator:
             "differs from the event's own date, pass event_id as None and use their date — or "
             "ask which they meant if it reads like a mistake. A named event with no date given "
             "still gets its event_id. get_upcoming_events is only for looking further ahead than "
-            "the list below.\n\n"
+            "the list below. "
+            "If an event and date is mentioned by the user, add it to our events list using the tool "
+            "so that there is a reference for that event always.'\n\n"
             "# Preferences\n"
             "Likes and dislikes are worth recording the moment they are said, and a message can "
             "be two things at once: \"I don't like kayaking\" is an edit to make AND a preference "
             "to keep, so call record_preference in the same turn as the edit. Doing only the "
             "edit fixes today's plan and forgets the reason by the next session, which is how "
             "the same thing gets suggested again. Record what they actually said and leave "
-            "`category` unset unless they dislike the entire kind of place.\n\n"
+            "`category` unset unless they dislike the entire kind of place. "
+            "Preference do not always have be mentioned directly, it can be placed inside a query, "
+            "Identify whether it is a valid preference and call the tool to store it for future. "
+            "For example: \"I have my brothers birthday coming up this December 11, he is turning 20. "
+            "He likes skateboards and he has a bunch of friends. Give me a day out for him.\" This is a "
+            "preference that he likes skateboards that we need to save.\n\n"
             "# Conversation style\n"
             "Everything listed below is already on file — never ask the user to repeat it. Ask "
             "only for what is genuinely missing: usually just the budget and the dates, and an "
@@ -1197,6 +1472,18 @@ class ChatOrchestrator:
         )
 
     def history(self) -> list[dict]:
+        """The conversation as the model sees it, with each turn's tool trace attached as prose.
+
+        Prose, and never as `tool_calls` on the assistant row: the API hard-requires a `role:
+        "tool"` message for every `tool_call_id` immediately after, those rows are not stored, and
+        a request missing them is rejected outright rather than degrading.
+
+        Carrying the trace at all is what makes the confirmation protocol survive a turn.
+        `_unapplied` returns `applied: false` with the proposal and the plan as it really stands;
+        the user answers "yes" in their next message; and until now everything structured about
+        that question had been thrown away, leaving the model to reconstruct it from its own prose
+        — the one source already known to be wrong about this.
+        """
         rows = (
             self.db.query(Message)
             .filter(Message.conversation_id == self.conversation.id)
@@ -1204,11 +1491,21 @@ class ChatOrchestrator:
             .limit(HISTORY_LIMIT)
             .all()
         )
-        return [
-            {"role": row.role, "content": row.content}
-            for row in reversed(rows)
-            if row.role in ("user", "assistant") and row.content
-        ]
+
+        history: list[dict] = []
+        for row in reversed(rows):
+            if row.role not in ("user", "assistant"):
+                continue
+            content = row.content or ""
+            if row.role == "assistant" and row.tool_calls_json:
+                replayed = replay_trace(row.tool_calls_json)
+                if replayed:
+                    # A turn that was all tool calls and no prose used to vanish from the replay
+                    # entirely, because the row's content was empty.
+                    content = f"{content}\n[tools that turn: {replayed}]".strip()
+            if content:
+                history.append({"role": row.role, "content": content})
+        return history
 
     def record(self, role: str, content: str, tool_calls: dict | None = None) -> Message:
         message = Message(
@@ -1233,6 +1530,10 @@ class ChatOrchestrator:
             "find_places": self._find_places,
             "generate_itinerary": self._generate_itinerary,
             "get_itinerary": self._get_itinerary,
+            "set_origin": self._set_origin,
+            "drop_day": self._drop_day,
+            "add_day": self._add_day,
+            "replace_plan": self._replace_plan,
             "reschedule_itinerary": self._reschedule_itinerary,
             "make_day_cheaper": self._make_day_cheaper,
             "add_prayer_breaks": self._add_prayer_breaks,
@@ -1243,6 +1544,12 @@ class ChatOrchestrator:
         }.get(name)
         if handler is None:
             return {"error": f"unknown tool {name}"}
+        # Deterministic refusals run BEFORE the handler, so a call that must not happen cannot
+        # have written anything on its way to being refused. The rules live in policy.py rather
+        # than in the system prompt, because prompt text is advice and this is not.
+        refusal = policy.intercept(self, name, arguments)
+        if refusal is not None:
+            return refusal
         try:
             return handler(arguments)
         except Exception as exc:  # noqa: BLE001 — a tool failure is a message, not a 500
@@ -1264,8 +1571,20 @@ class ChatOrchestrator:
         for subject in _arg(args, "dislikes", []):
             self._remember("dislike", str(subject))
 
+        saved = {"saved": True, "adults": adults, "children_ages": ages}
+
+        # Where they live, not where a trip goes: this sets the default origin for plans built
+        # from here on and leaves any existing plan alone. Moving that one's starting point is
+        # set_origin, which keeps its stops.
+        home = str(_arg(args, "home_emirate", "") or "").strip()
+        if home in EMIRATES:
+            centroid = itinerary_service.emirate_centroid(self.db, [home])
+            if centroid is not None:
+                self.user.home_base_lat, self.user.home_base_lng = centroid
+                saved["home_emirate"] = home
+
         self.db.flush()
-        return {"saved": True, "adults": adults, "children_ages": ages}
+        return saved
 
     def _create_event(self, args: dict) -> dict:
         try:
@@ -1533,56 +1852,9 @@ class ChatOrchestrator:
         # family says "we have our own car", the plan is rebuilt, and the taxi fares come back.
         current = self._resolve_itinerary()
 
-        # The reported bug: asked to add one adventure, the model called this instead, a brand
-        # new itinerary row was created, the conversation was re-pointed at it, and the approved
-        # plan was orphaned — a stop the user never touched vanished and one they had swapped out
-        # came back. Prompt text was the only thing standing in the way of that, and the prompt's
-        # own carve-out ("or agreed to start over") is exactly what a reply like "sure, I can
-        # sacrifice some budget" reads as. Only the conversation's *own* plan is protected: a new
-        # thread still plans freely even though the user has older plans elsewhere.
-        #
-        # A second reported bug, same root cause: shown a list of cheaper restaurants and told
-        # "choose Beirut Restaurant", the model reached for this tool instead of edit_stop. This
-        # tool has no `place` argument at all, so the named choice had nowhere to go — the
-        # rebuild silently re-solved the day and landed on whatever the optimiser picked instead
-        # of what the user asked for. The refusal below now says so explicitly, at the exact
-        # point the model is about to make that choice.
-        if current is not None and current.id == self.conversation.itinerary_id:
-            # `replace_existing` alone is not permission. Setting it is free, and the model set
-            # it on its first attempt — "let us finalize it" became a rebuild that threw away
-            # every edit. Permission arrives a TURN after the warning, because that is how long
-            # it takes the user to answer, so the flag counts only once the warning has been
-            # given and the user has spoken since.
-            warned_before_this_turn = self.warned_at_turn_start
-            self.conversation.rebuild_warned = True
-            self.rebuild_refused = True
-
-            if not bool(_arg(args, "replace_existing", False)):
-                return {
-                    "error": (
-                        "This conversation already has a plan, and generating another one "
-                        "replaces it completely — every edit the user has approved is lost. "
-                        "Adding, removing or swapping a single stop is add_stop or edit_stop, "
-                        "never this. Nothing else needs this tool: a plan is saved as it is "
-                        "built and edited, so there is no finalising, confirming or committing "
-                        "to do. If the user is choosing one specific place out of options you "
-                        "listed ('choose Beirut Restaurant') that is edit_stop with "
-                        "place='Beirut Restaurant', never this tool — this tool has no `place` "
-                        "argument, so a named choice made through it is silently dropped and "
-                        "the solver picks whatever it likes instead. If the user genuinely wants "
-                        "to start over, tell them the current plan will be discarded, and ask. "
-                        "Their ANSWER is what unlocks this."
-                    )
-                }
-            if not warned_before_this_turn:
-                return {
-                    "error": (
-                        "replace_existing does not grant itself. The user has not been told this "
-                        "plan would be discarded and has not agreed to it — as of the start of "
-                        "this turn, nobody had raised it. Stop calling tools, tell them what "
-                        "would be lost, and ask. Their next message is when this works."
-                    )
-                }
+        # The gate that protects this conversation's own plan from being replaced by a brand new
+        # one now runs in policy.intercept, before this handler is entered at all — so a rebuild
+        # that must not happen cannot get as far as writing a row. See policy._rebuild_is_not_an_edit.
 
         emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
         if not emirates and self.starting_emirate_hint in EMIRATES:
@@ -1607,7 +1879,9 @@ class ChatOrchestrator:
             # rebuilds the plan, and the extra four silently stop being charged for.
             guests = itinerary_service.guest_attendees(self.db, current.id)
 
-        total = int(_arg(args, "party_size", 0) or 0)
+        # Carried the same way the guests are: a rebuild that says nothing about the party must
+        # not silently put back the people the user excluded on the call before.
+        total = int(_arg(args, "party_size", 0) or 0) or (current.party_size if current else 0) or 0
         if total > 0:
             household = len(itinerary_service.family_attendees(self.db, self.user.id))
             guests = _fit_party(household, total, guests)
@@ -1629,6 +1903,7 @@ class ChatOrchestrator:
                 focus=focus,
                 guests=guests,
                 emirates=emirates or None,
+                party_size=total or None,
             )
         except itinerary_service.IntakeIncomplete as exc:
             return {"error": "intake_incomplete", "missing_fields": exc.missing}
@@ -1753,6 +2028,193 @@ class ChatOrchestrator:
         if itinerary is None:
             return None, {"error": "No plan has been generated yet, so there is nothing to edit."}
         return itinerary, None
+
+    def _set_origin(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to move."}
+
+        emirate = str(_arg(args, "emirate", "")).strip()
+        if emirate not in EMIRATES:
+            return {"error": f"{emirate!r} is not one of the seven emirates: {', '.join(EMIRATES)}."}
+
+        centroid = itinerary_service.emirate_centroid(self.db, [emirate])
+        if centroid is None:
+            return {"error": f"The catalog has nothing in {emirate}, so there is nowhere to start from."}
+
+        before = {
+            slot["place"].name
+            for day in itinerary_service.itinerary_payload(self.db, itinerary)["days"]
+            for slot in day["slots"]
+        }
+        itinerary_service.set_origin(self.db, itinerary, self.user, centroid[0], centroid[1])
+        result = self._plan_result(itinerary)
+        result["origin_emirate"] = emirate
+        # Every stop should survive a move that only changed the driving, but repair_plan is still
+        # the authority — a longer first leg can push a day past a venue's closing time. Saying so
+        # is the difference between this and the bug it replaces.
+        dropped = sorted(before - {name for day in result["days"] for name in day["stops"]})
+        if dropped:
+            result["dropped_after_the_move"] = dropped
+        return result
+
+    def _drop_day(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to edit."}
+
+        try:
+            day = int(_arg(args, "day", 0))
+        except (TypeError, ValueError):
+            return {"error": f"{args.get('day')!r} is not a day number."}
+
+        shift = args.get("shift_later_days")
+        try:
+            itinerary_service.drop_day(
+                self.db, itinerary, self.user, day,
+                shift_later_days=None if shift is None else bool(shift),
+            )
+        except itinerary_service.DayShiftChoiceRequired as exc:
+            return self._unapplied(
+                itinerary, "day_shift_choice", exc,
+                proposed_day=exc.day,
+                proposed_choices=["shift_later_days_true", "shift_later_days_false"],
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        result = self._plan_result(itinerary)
+        result["dropped_day"] = day
+        # Stated rather than left to be counted off the day list: leaving a day free keeps the
+        # trip the same length, and shifting shortens it, and the reply has to get that right.
+        result["remaining_days"] = itinerary.num_days
+        return result
+
+    def _add_day(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to add a day to. Build one with generate_itinerary."}
+
+        raw = _arg(args, "extra_budget", None)
+        try:
+            extra = None if raw in (None, "") else float(raw)
+        except (TypeError, ValueError):
+            return {"error": f"{args.get('extra_budget')!r} is not a budget."}
+
+        emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
+        try:
+            itinerary_service.add_day(self.db, itinerary, self.user, extra, emirates=emirates)
+        except itinerary_service.DayBudgetRequired as exc:
+            # A shortfall is a question, not a failure: the plan is intact, nothing was added, and
+            # the figure that would fix it is the user's to give.
+            return self._unapplied(itinerary, "day_budget", exc, proposed_remaining=exc.remaining)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        result = self._plan_result(itinerary)
+        # Both stated rather than left to be counted off the day list, for the same reason
+        # drop_day states them: the reply has to get the trip's new length and cap right.
+        result["added_day"] = itinerary.num_days
+        result["budget_now"] = round(itinerary.total_budget, 2)
+        if emirates:
+            result["added_day_emirates"] = emirates
+        return result
+
+    def _replace_plan(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to replace."}
+
+        start = args.get("start_date")
+        if start is None:
+            new_start = itinerary.start_date
+        else:
+            try:
+                new_start = date.fromisoformat(str(start))
+            except (TypeError, ValueError):
+                return {"error": f"{start!r} is not an ISO date"}
+            if new_start < date.today():
+                return {"error": "That start date is in the past. Please choose a future date."}
+
+        days = int(_arg(args, "days", itinerary.num_days) or itinerary.num_days)
+        if not 1 <= days <= itinerary_service.MAX_DAYS:
+            return {"error": f"A plan runs 1 to {itinerary_service.MAX_DAYS} days, not {days}."}
+
+        budget = _arg(args, "budget", None)
+        per_day = _arg(args, "budget_per_day", None)
+        if budget is not None and per_day is not None:
+            return {
+                "error": (
+                    "Pass either budget or budget_per_day, never both. Ask the user which figure "
+                    "governs if they gave two that do not reconcile."
+                )
+            }
+        if per_day is not None:
+            total_budget = float(per_day) * days
+        elif budget is not None:
+            total_budget = float(budget)
+        else:
+            total_budget = itinerary.total_budget
+
+        focus = str(_arg(args, "focus", itinerary_service.FULL_DAY))
+        if focus not in itinerary_service.PLAN_FOCUS:
+            return {"error": f"{focus!r} is not a plan focus."}
+
+        emirates = [e for e in (_arg(args, "emirates", []) or []) if e in EMIRATES]
+        if not emirates and self.starting_emirate_hint in EMIRATES:
+            emirates = [self.starting_emirate_hint]
+        if not emirates:
+            emirates = itinerary.emirates_json or []
+
+        # The origin follows the region, the same way it does on generation — a plan re-solved
+        # into Abu Dhabi that still sets off from a Dubai address prices every first leg wrong.
+        start_lat, start_lng = itinerary.start_lat, itinerary.start_lng
+        centroid = itinerary_service.emirate_centroid(self.db, emirates)
+        if centroid is not None:
+            start_lat, start_lng = centroid
+
+        guests = _guests(args) or itinerary_service.guest_attendees(self.db, itinerary.id)
+        total = int(_arg(args, "party_size", 0) or 0) or (itinerary.party_size or 0)
+        if total > 0:
+            household = len(itinerary_service.family_attendees(self.db, self.user.id))
+            guests = _fit_party(household, total, guests)
+
+        before = [
+            slot["place"].name
+            for day in itinerary_service.itinerary_payload(self.db, itinerary)["days"]
+            for slot in day["slots"]
+        ]
+        try:
+            itinerary_service.generate(
+                self.db,
+                self.user,
+                start_date=new_start,
+                num_days=days,
+                total_budget=total_budget,
+                start_lat=start_lat,
+                start_lng=start_lng,
+                event_id=itinerary.event_id,
+                currency=itinerary.currency,
+                prayer_breaks=bool(_arg(args, "prayer_breaks", False)),
+                transport_mode=itinerary.transport_mode,
+                adults_only=bool(_arg(args, "adults_only", False)),
+                focus=focus,
+                guests=guests,
+                emirates=emirates or None,
+                party_size=total or None,
+                into=itinerary,
+            )
+        except itinerary_service.IntakeIncomplete as exc:
+            return {"error": "intake_incomplete", "missing_fields": exc.missing}
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        self.conversation.rebuild_warned = False  # spent — the next one must ask again
+        result = self._plan_result(itinerary)
+        # Named so the reply can say what the user actually gave up, rather than describing the
+        # new plan as though nothing was lost.
+        result["replaced"] = before
+        return result
 
     def _reschedule_itinerary(self, args: dict) -> dict:
         itinerary, error = self._open_plan(args)
@@ -1985,120 +2447,15 @@ class ChatOrchestrator:
         yield from self._llm(user_message)
 
     def _llm(self, user_message: str) -> Iterator[str]:
-        from openai import OpenAI
+        """The turn itself, which lives in turn.py.
 
-        client = wrap_openai(OpenAI(api_key=settings.openai_api_key))
-        messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt(user_message)},
-            *self.history(),
-        ]
+        Kept as a one-line delegate rather than folded away: this is the seam the whole test suite
+        stubs the model at, and moving it would have meant editing every one of those tests during
+        the change most likely to need them honest.
+        """
+        from .turn import run_turn
 
-        answer = ""
-        for _ in range(MAX_TOOL_ROUNDS):
-            stream = client.chat.completions.create(
-                model=settings.openai_chat_model,
-                messages=messages,
-                tools=TOOLS,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-
-            content = ""
-            pending: dict[int, dict] = {}
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-
-                if delta.content:
-                    content += delta.content
-                    yield sse("token", delta.content)
-
-                for call in delta.tool_calls or []:
-                    slot = pending.setdefault(
-                        call.index, {"id": "", "name": "", "arguments": ""}
-                    )
-                    if call.id:
-                        slot["id"] = call.id
-                    if call.function and call.function.name:
-                        slot["name"] = call.function.name
-                    if call.function and call.function.arguments:
-                        slot["arguments"] += call.function.arguments
-
-            if not pending:
-                answer = content
-                break
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [
-                        {
-                            "id": call["id"],
-                            "type": "function",
-                            "function": {"name": call["name"], "arguments": call["arguments"] or "{}"},
-                        }
-                        for call in pending.values()
-                    ],
-                }
-            )
-
-            for call in pending.values():
-                try:
-                    arguments = json.loads(call["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                label, detail = describe_tool_call(call["name"], arguments)
-                yield sse(
-                    "tool",
-                    {"id": call["id"], "name": call["name"], "label": label, "detail": detail},
-                )
-
-                result = self.call_tool(call["name"], arguments)
-                self.db.commit()
-
-                yield sse(
-                    "tool_done",
-                    {
-                        "id": call["id"],
-                        "outcome": summarise_tool_result(call["name"], result),
-                        "failed": bool(isinstance(result, dict) and result.get("error")),
-                    },
-                )
-
-                # Surface a blocked intake to the client as well as to the model, so the chat can
-                # render the numbered checklist from the design. The model will also ask in prose;
-                # the checklist makes what is missing scannable.
-                if isinstance(result, dict) and result.get("error") == "intake_incomplete":
-                    yield sse("intake_required", {"missing_fields": result.get("missing_fields", [])})
-
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": json.dumps(result, default=str),
-                    }
-                )
-                yield from self._emit_updates()
-
-        if not answer:
-            # Every round went on tool calls, so the loop ran out mid-work and the user got an
-            # empty bubble — the tool rows scrolled past and nothing explained them. Taking the
-            # tools away is what makes this terminate: the model has no move left but to answer.
-            for chunk in client.chat.completions.create(
-                model=settings.openai_chat_model,
-                messages=messages,
-                stream=True,
-                stream_options={"include_usage": True},
-            ):
-                if chunk.choices and chunk.choices[0].delta.content:
-                    answer += chunk.choices[0].delta.content
-                    yield sse("token", chunk.choices[0].delta.content)
-
-        self.record("assistant", answer)
-        self.db.commit()
-        yield sse("done", {"conversation_id": self.conversation.id})
+        yield from run_turn(self, user_message)
 
     def _emit_updates(self) -> Iterator[str]:
         """Push the right pane's new state as soon as a tool changed it."""

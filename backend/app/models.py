@@ -189,6 +189,11 @@ class Itinerary(Base):
     # Emirates this trip is confined to, or NULL for "anywhere". Stored rather than applied once,
     # so a stop added later cannot quietly reintroduce the region the user ruled out.
     emirates_json: Mapped[list | None] = mapped_column(JSON)
+    # How many people this plan is priced for, when the user gave a number that is SMALLER than
+    # the household — "dinner for me and my wife" in a house of four. NULL means everyone.
+    # Stored because `guests` can only ever grow the party, so without this the household is a
+    # floor and every later re-price puts the people back that the user just excluded.
+    party_size: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
