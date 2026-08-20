@@ -97,7 +97,9 @@ def test_the_spec_tools_are_all_exposed():
     # so it said it had done it anyway: "change the location of the plan to Abu Dhabi" was answered
     # twice with the same unchanged Dubai plan. set_origin moves where the trip sets off from and
     # keeps every stop; replace_plan is the only thing that can move the REGION, because no Dubai
-    # place survives the trip becoming an Abu Dhabi one; drop_day removes a day.
+    # place survives the trip becoming an Abu Dhabi one; drop_day removes a day, and add_day is
+    # the way back — without it "add one more day" had no legal move, and the model reached for
+    # drop_day, the only day-shaped tool there was.
     assert names == spec_tools | {
         "get_itinerary",
         "find_live_events",
@@ -110,6 +112,7 @@ def test_the_spec_tools_are_all_exposed():
         "reschedule_itinerary",
         "set_origin",
         "drop_day",
+        "add_day",
         "replace_plan",
     }
 
@@ -2903,6 +2906,101 @@ def test_only_replace_plan_can_move_the_region(client, planned, db):
         if (row := db.query(Place).filter(Place.name == name).first()) is not None
     }
     assert emirates == {"Abu Dhabi"}, emirates
+
+
+def test_adding_a_day_appends_one_and_leaves_the_rest_alone(client, planned, db):
+    """There was a drop_day and no way back, so "add one more day" got answered with drop_day —
+    the only day-shaped tool — and then an offer to rebuild, which is the one move that would
+    have thrown away every stop the user approved."""
+    chat = _dubai_day(db, planned, days=2)
+    before = chat.call_tool("get_itinerary", {})
+    kept = [stop["name"] for day in before["days"] for stop in day["stops"]]
+    cap_before = before["budget"]["cap"]
+
+    added = chat.call_tool("add_day", {"extra_budget": 1800})
+
+    assert "error" not in added, added
+    assert added["added_day"] == 3 and len(added["days"]) == 3
+    # An edit, not a rebuild: every stop that was there is still there, in order.
+    assert [name for day in added["days"][:2] for name in day["stops"]] == kept, \
+        "adding a day re-solved the days that were already planned"
+    assert added["days"][2]["stops"], "the new day came back empty"
+    # And it is somewhere new: a day that repeats what the trip has already seen is not another
+    # day out. The pool is filtered, so this holds across days without touching what a single
+    # day is allowed to do with a restaurant.
+    assert not set(added["days"][2]["stops"]) & set(kept), "the new day repeats an earlier stop"
+    # The figure raises the cap rather than being shared with days already planned — 39 AED of
+    # leftover is not a day, and spending it would send repair_plan at the days the user has.
+    assert added["budget_now"] == round(cap_before + 1800, 2)
+
+
+def test_a_day_the_trip_can_already_afford_costs_the_user_nothing_extra(client, planned, db):
+    """Money the trip did not spend has already been agreed to. Asking for more when the cap
+    covers the day is asking the user to fund something they funded."""
+    chat = _dubai_day(db, planned, days=1)
+    before = chat.call_tool("get_itinerary", {})
+    cap_before = before["budget"]["cap"]
+    assert before["budget"]["remaining"] > 0, "this test needs a plan that came in under its cap"
+
+    added = chat.call_tool("add_day", {})
+
+    assert "error" not in added and added.get("added_day") == 2, added
+    assert added["days"][1]["stops"], "the new day came back empty"
+    # The cap is untouched: spending the remainder is spending what it already allowed.
+    assert added["budget_now"] == cap_before
+    assert added["total"] <= cap_before
+
+
+def test_a_remainder_too_small_for_a_day_asks_instead_of_shrinking_one(client, planned, db):
+    """The other half of the same rule. "Enough for a day" is not a number anyone can name up
+    front, so it is settled by trying — and a shortfall is a question, not a failure."""
+    from app.models import Itinerary
+
+    chat = _dubai_day(db, planned, days=1)
+    itinerary = db.query(Itinerary).order_by(Itinerary.id.desc()).first()
+    spent = chat.call_tool("get_itinerary", {})["budget"]["total"]
+    itinerary.total_budget = spent + 5  # a fiver is not a day out
+    db.commit()
+
+    asked = chat.call_tool("add_day", {})
+
+    assert asked["applied"] is False and asked["needs_confirmation"] == "day_budget"
+    assert asked["proposed_remaining"] == 5
+    assert "extra_budget" in asked["question_for_the_user"]
+    # And nothing moved: the plan is still the length it was, at the cap it was.
+    assert len(chat.call_tool("get_itinerary", {})["days"]) == 1
+    assert itinerary.num_days == 1
+
+
+def test_a_budget_for_the_new_day_is_the_users_to_give(client, planned, db):
+    """add_day raises the trip's cap, so its figure is invented exactly as readily as the trip's
+    own budget was — and is checked the same way."""
+    from app.models import Conversation, User
+    from app.services import policy
+    from app.services.orchestrator import ChatOrchestrator
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    chat.record("user", "add one more day to the plan")
+    db.commit()
+
+    assert policy.intercept(chat, "add_day", {"extra_budget": 1800}) is not None
+    chat.record("user", "1800 for it")
+    db.commit()
+    assert policy.intercept(chat, "add_day", {"extra_budget": 1800}) is None
+
+
+def test_a_day_nothing_fits_into_is_refused_rather_than_appended_empty(client, planned, db):
+    """A day with nothing in it is not a day, and reporting one as added is the lie this whole
+    file exists to prevent."""
+    chat = _dubai_day(db, planned, days=1)
+    result = chat.call_tool("add_day", {"extra_budget": 1})
+
+    assert "error" in result and "higher figure" in result["error"]
+    assert len(chat.call_tool("get_itinerary", {})["days"]) == 1
 
 
 def test_dropping_a_middle_day_asks_before_it_moves_anything(client, planned, db):

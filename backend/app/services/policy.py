@@ -48,6 +48,7 @@ MUTATING_TOOLS = frozenset(
         "reschedule_itinerary",
         "set_origin",
         "drop_day",
+        "add_day",
         "make_day_cheaper",
         "add_prayer_breaks",
         "set_transport",
@@ -65,6 +66,7 @@ PLAN_TOOLS = frozenset(
         "reschedule_itinerary",
         "set_origin",
         "drop_day",
+        "add_day",
         "make_day_cheaper",
         "add_prayer_breaks",
         "set_transport",
@@ -255,7 +257,11 @@ def _figures_the_user_never_gave(orchestrator: Any, args: dict) -> dict | None:
     household = len(family_attendees(orchestrator.db, orchestrator.user.id))
     unnamed: list[str] = []
 
-    budget = float(args.get("budget") or 0) or float(args.get("budget_per_day") or 0)
+    budget = (
+        float(args.get("budget") or 0)
+        or float(args.get("budget_per_day") or 0)
+        or float(args.get("extra_budget") or 0)
+    )
     on_file = {float(current.total_budget)} if current else set()
     if budget > 0 and budget not in stated | on_file:
         unnamed.append(f"budget {budget:,.0f}")
@@ -316,6 +322,10 @@ def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
             _rebuild_is_not_an_edit(orchestrator, args)
             or _figures_the_user_never_gave(orchestrator, args)
         )
+    # add_day raises the trip's cap, so its figure is the user's to give for the same reason the
+    # trip's own budget is — and is invented just as readily when nobody asks for it.
+    if name == "add_day":
+        return _figures_the_user_never_gave(orchestrator, args)
     if name == "replace_plan":
         return _replacing_needs_the_users_word(orchestrator, args)
     if name == "drop_day":

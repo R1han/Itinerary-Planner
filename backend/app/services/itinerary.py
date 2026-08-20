@@ -1734,6 +1734,119 @@ def drop_day(
     return plan
 
 
+class DayBudgetRequired(ValueError):
+    """What is left of the trip's cap will not fill another day, so the user has to top it up.
+
+    Raised only after trying: "enough for a day" is not a number anyone can name in advance — it
+    depends on the party, the emirate and what is still open — so the remainder is handed to the
+    planner and this fires when the planner comes back with nothing.
+    """
+
+    def __init__(self, remaining: float, currency: str) -> None:
+        super().__init__(
+            f"Only {remaining:,.0f} {currency} is left of this trip's budget, and nothing fits a "
+            f"day into it. Ask the user what they want to spend on the extra day, then retry with "
+            f"extra_budget set to the figure they give."
+        )
+        self.remaining = round(remaining, 2)
+
+
+@traced("itinerary.add_day", run_type="chain")
+def add_day(
+    db: Session, itinerary: Itinerary, user: User, extra_budget: float | None = None
+) -> Plan:
+    """Append one more day to the end of a plan, leaving every existing day untouched.
+
+    The gap this fills: there was a `drop_day` and no way back. Asked to add a day, the model
+    called drop_day — the only day-shaped tool it had — and then offered a rebuild, which is the
+    one thing that would have thrown away every stop the user had approved.
+
+    So the new day is SOLVED ON ITS OWN, at num_days=1, and appended. The existing days are never
+    handed to the planner, which is what makes this an edit rather than a rebuild: nothing already
+    on the plan can be re-scored, re-timed or dropped by adding to it.
+
+    `extra_budget` raises the cap rather than sharing it. A trip that has spent 2,961 of 3,000 has
+    39 left, and solving a day into 39 either returns something empty or sends `repair_plan` off
+    to strip stops from the days the user already has. The cap is a ceiling they set, so only they
+    can raise it — which is why the tool takes the figure instead of inventing one.
+    """
+    if extra_budget is not None and extra_budget <= 0:
+        raise ValueError("A budget for the new day has to be above zero.")
+    if itinerary.num_days >= MAX_DAYS:
+        raise ValueError(f"A trip runs at most {MAX_DAYS} days, and this one already does.")
+
+    context = context_for(db, itinerary, user)
+    plan = load_plan(db, itinerary)
+    event = db.get(Event, itinerary.event_id) if itinerary.event_id else None
+
+    # Spend what the trip has not spent before asking for more. A plan that came in well under its
+    # cap already has the day paid for, and asking anyway is asking the user to fund something
+    # they funded — while a plan that spent nearly all of it cannot fit a day into the difference.
+    # Which of the two this is nobody can say from a number, so it is settled by trying.
+    remaining = max(itinerary.total_budget - plan.total_cost, 0.0)
+    budget_for_day = extra_budget if extra_budget is not None else remaining
+    new_index = itinerary.num_days
+    new_date = itinerary.start_date + timedelta(days=new_index)
+
+    candidates = retrieve_candidates(
+        db,
+        context.profile,
+        query_for(context.profile, event.title if event else "", event.notes if event else ""),
+        origin=context.origin,
+        emirates=context.emirates,
+    )
+    travel_service = _travel_service(db, itinerary, context)
+
+    # A day that repeats what the trip has already seen is not another day out. The places
+    # already on the plan are dropped from the candidate pool, so the new one is somewhere new.
+    #
+    # `or candidates` because an exclusion that empties the pool is not an exclusion, it is a
+    # dead end — a trip confined to one emirate can genuinely run out. A repeat beats no day.
+    # It is a filter on the POOL, not a rule inside the day: a restaurant appearing twice within
+    # a single day is the planner's own doing and stays that way.
+    used = {slot.place.id for day in plan.days for slot in day.slots}
+    candidates = [c for c in candidates if c.id not in used] or candidates
+
+    solved = generate_plan(
+        candidates,
+        context.profile,
+        travel_service.estimate_fn(),
+        start_date=new_date,
+        num_days=1,
+        total_budget=budget_for_day,
+        origin=context.origin,
+        preferences=context.preferences,
+        currency=plan.currency,
+    )
+    if not solved.days or not solved.days[0].slots:
+        if extra_budget is None:
+            raise DayBudgetRequired(remaining, plan.currency)
+        raise ValueError(
+            f"Nothing fits a day at {extra_budget:,.0f} {plan.currency}. Ask for a higher figure."
+        )
+
+    fresh = solved.days[0]
+    fresh.day_index = new_index
+    fresh.day_date = new_date
+    for slot in fresh.slots:
+        slot.day_index = new_index
+    for segment in fresh.segments:
+        segment.day_index = new_index
+
+    plan.days.append(fresh)
+    itinerary.num_days += 1
+    # Only a figure the user added raises the cap. Spending the remainder is spending what the cap
+    # already allowed, and raising it here would hand the trip a budget nobody agreed to.
+    itinerary.total_budget += extra_budget or 0.0
+    plan.total_budget = itinerary.total_budget
+
+    travel_fn = travel_service.travel_fn([s.place for d in plan.days for s in d.slots])
+    plan = route_for_real(plan, context, travel_fn)
+    persist_plan(db, itinerary, plan)
+    db.commit()
+    return plan
+
+
 @traced("itinerary.prayer_breaks", run_type="chain")
 def add_prayer_breaks(db: Session, itinerary: Itinerary, user: User) -> Plan:
     context = context_for(db, itinerary, user)

@@ -470,6 +470,38 @@ _TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "add_day",
+            "description": (
+                "Add one more day to the END of an existing plan. Every day already on the plan "
+                "keeps its stops, its times and every edit the user made — the new day is solved "
+                "on its own and appended, so this is an edit, not a rebuild. Never use "
+                "generate_itinerary to lengthen a trip: that discards the whole plan to build a "
+                "new one. Call it with no arguments first: whatever the trip has not spent pays "
+                "for the new day, and a plan that came in under its cap needs nothing more. If "
+                "the remainder cannot fill a day it comes back asking, and THEN you put the "
+                "question to the user and retry with the figure they give."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "extra_budget": {
+                        "type": "number",
+                        "description": (
+                            "Leave this out on the first attempt. The server spends what is left "
+                            "of the trip's budget first, and only comes back asking when the "
+                            "remainder cannot fill a day. Set it then, to the figure the user "
+                            "gave in answer — never to one of your own. It is ADDED to the "
+                            "trip's cap rather than shared with the days already planned."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "replace_plan",
             "description": (
                 "Re-solve THIS plan, keeping the same trip: the conversation and the event stay "
@@ -1038,6 +1070,10 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
         day = _arg(args, "day", None)
         return "Removing a day", f"day {day}" if day else None
 
+    if name == "add_day":
+        extra = _arg(args, "extra_budget", None)
+        return "Adding a day", f"{_money(extra)} for it" if extra else "from what is left"
+
     if name == "replace_plan":
         # Labelled by where it lands, because that is the part the user asked for; that every stop
         # is replaced is the outcome's job to say, not the row's.
@@ -1155,6 +1191,9 @@ def summarise_tool_result(name: str, result: dict) -> str:
         return f"swapped in {replaced} · {cost_line}" if replaced else cost_line
     if name == "add_prayer_breaks":
         return f"{_money(result.get('total'))} of {_money(result.get('cap'))}"
+    if name == "add_day":
+        days = _count(result.get("days", []), "day")
+        return f"now {days} · {_money(result.get('total'))} of {_money(result.get('cap'))}"
     if name == "create_event":
         return "added" if result.get("created") else "already on your calendar"
     if name == "save_family_details":
@@ -1266,7 +1305,11 @@ class ChatOrchestrator:
             "replace_plan, because not one Dubai place exists in Abu Dhabi — say that every stop "
             "goes and get their answer before you call it. Removing a whole day is drop_day, and "
             "for any day but the last it comes back asking whether the later days shift earlier "
-            "or keep their dates; put that to the user rather than choosing.\n\n"
+            "or keep their dates; put that to the user rather than choosing. Adding a day is "
+            "add_day, which appends one and keeps every existing day as it is. Call it with "
+            "nothing set: what the trip has not spent pays for the day, and only if that will not "
+            "stretch to one does it come back asking for a figure — which is when you ask the "
+            "user, not before. A longer trip is never a reason to call generate_itinerary.\n\n"
             "You can edit an existing plan with make_day_cheaper, add_prayer_breaks, "
             "set_transport, add_stop, edit_stop and reschedule_itinerary. A different start date "
             "for an existing plan is reschedule_itinerary, never generate_itinerary — it keeps "
@@ -1474,6 +1517,7 @@ class ChatOrchestrator:
             "get_itinerary": self._get_itinerary,
             "set_origin": self._set_origin,
             "drop_day": self._drop_day,
+            "add_day": self._add_day,
             "replace_plan": self._replace_plan,
             "reschedule_itinerary": self._reschedule_itinerary,
             "make_day_cheaper": self._make_day_cheaper,
@@ -2029,6 +2073,33 @@ class ChatOrchestrator:
         # Stated rather than left to be counted off the day list: leaving a day free keeps the
         # trip the same length, and shifting shortens it, and the reply has to get that right.
         result["remaining_days"] = itinerary.num_days
+        return result
+
+    def _add_day(self, args: dict) -> dict:
+        itinerary, error = self._open_plan(args)
+        if error or itinerary is None:
+            return error or {"error": "No plan to add a day to. Build one with generate_itinerary."}
+
+        raw = _arg(args, "extra_budget", None)
+        try:
+            extra = None if raw in (None, "") else float(raw)
+        except (TypeError, ValueError):
+            return {"error": f"{args.get('extra_budget')!r} is not a budget."}
+
+        try:
+            itinerary_service.add_day(self.db, itinerary, self.user, extra)
+        except itinerary_service.DayBudgetRequired as exc:
+            # A shortfall is a question, not a failure: the plan is intact, nothing was added, and
+            # the figure that would fix it is the user's to give.
+            return self._unapplied(itinerary, "day_budget", exc, proposed_remaining=exc.remaining)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        result = self._plan_result(itinerary)
+        # Both stated rather than left to be counted off the day list, for the same reason
+        # drop_day states them: the reply has to get the trip's new length and cap right.
+        result["added_day"] = itinerary.num_days
+        result["budget_now"] = round(itinerary.total_budget, 2)
         return result
 
     def _replace_plan(self, args: dict) -> dict:
