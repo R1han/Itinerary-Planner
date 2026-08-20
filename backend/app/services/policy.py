@@ -155,6 +155,80 @@ REPLACING_LOSES_THE_STOPS = (
 )
 
 
+# Company the user has named but not counted. Deliberately only the unquantified words: the
+# number itself is what the gate wants, so "10 friends" must sail through while "a bunch of
+# friends" does not.
+#
+# ponytail: a word list, so "the whole crew" and "ten friends" both slip past — the first fires
+# nothing, the second is already a count. Ask the model to classify instead if the misses matter.
+_VAGUE_COMPANY = re.compile(
+    r"(?<!\d )\b(?:friends?|mates|buddies|classmates|colleagues|cousins|a bunch|a group|"
+    r"a crew|the guys|the girls|some people|a few people)\b",
+    re.IGNORECASE,
+)
+
+
+HEADCOUNT_IS_NOT_OURS_TO_GUESS = (
+    "The user named people coming along without saying how many, so the size of this party is "
+    "not known — and it decides the vehicle, the fares and every ticket, so a guess is priced as "
+    "fact and shown to them as a settled figure. The household on file is not the answer here: "
+    "they have already said someone else is coming. Stop calling tools and ask how many people "
+    "in total. Their answer is what unlocks this."
+)
+
+
+def _this_turns_message(orchestrator: Any) -> str:
+    """What the user just said. Committed before the model runs, so it is already on the row."""
+    from ..models import Message
+
+    row = (
+        orchestrator.db.query(Message)
+        .filter(
+            Message.conversation_id == orchestrator.conversation.id,
+            Message.role == "user",
+        )
+        .order_by(Message.id.desc())
+        .first()
+    )
+    return row.content if row else ""
+
+
+def _headcount_is_not_ours_to_guess(orchestrator: Any, args: dict) -> dict | None:
+    """Make the model ask for a headcount it was never told, instead of inventing one.
+
+    Live validation, twice. "He has a bunch of friends" was first priced as party_size 11 — a
+    number nobody said — and then, once the prompt told the model to ask, as party_size 4: the
+    household, exactly, with the friends silently dropped. Prompt text asks for the question; only
+    a refusal actually produces it, which is the difference between this field and `budget`, whose
+    handler has rejected an unset figure all along.
+
+    Deliberately narrow. Silence about the party still means the household, because that is the
+    documented default and asking every time would interrogate a family whose members are on file.
+    This fires only when the user has SAID others are coming and left them uncounted.
+    """
+    if asked_before(orchestrator, "party_size"):
+        return None
+
+    from .itinerary import family_attendees
+
+    household = len(family_attendees(orchestrator.db, orchestrator.user.id))
+    stated = args.get("party_size") or 0
+    # The household count is not evidence of a decision: it is what the model falls back to when
+    # it has nothing, and it is what arrived when the friends went missing.
+    if stated and stated != household:
+        return None
+    if not _VAGUE_COMPANY.search(_this_turns_message(orchestrator)):
+        return None
+
+    # Shaped like `_unapplied`, minus the plan — there may not be one yet. `applied: false` and a
+    # question rather than a proposal, so a reply cannot narrate this as a trip that got built.
+    return {
+        "applied": False,
+        "needs_confirmation": "party_size",
+        "question_for_the_user": HEADCOUNT_IS_NOT_OURS_TO_GUESS,
+    }
+
+
 def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
     """Refuse a call that must not happen, or None to let it through.
 
@@ -162,7 +236,10 @@ def intercept(orchestrator: Any, name: str, args: dict) -> dict | None:
     refused. The returned dict is what the model sees as the tool's result.
     """
     if name == "generate_itinerary":
-        return _rebuild_is_not_an_edit(orchestrator, args)
+        return (
+            _rebuild_is_not_an_edit(orchestrator, args)
+            or _headcount_is_not_ours_to_guess(orchestrator, args)
+        )
     if name == "replace_plan":
         return _replacing_needs_the_users_word(orchestrator, args)
     if name == "drop_day":

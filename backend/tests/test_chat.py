@@ -3015,6 +3015,53 @@ def test_consent_still_takes_two_turns_after_the_move(client, planned, db):
     assert policy.intercept(chat, "generate_itinerary", {"days": 1, "replace_existing": True}) is None
 
 
+def test_a_party_named_but_not_counted_is_asked_about_rather_than_guessed(client, planned, db):
+    """Live validation, twice over. "He has a bunch of friends" was priced first as party_size 11
+    — a number nobody said — and then, once the prompt asked for the question, as the household
+    exactly, with the friends dropped. The prompt asks; only the refusal actually produces it."""
+    from app.models import Conversation, User
+    from app.services import policy
+    from app.services.itinerary import family_attendees
+
+    row = db.query(User).filter(User.email == "planner@rihla.app").one()
+    conversation = Conversation(user_id=row.id)
+    db.add(conversation)
+    db.commit()
+    chat = ChatOrchestrator(db, row, conversation)
+    household = len(family_attendees(db, row.id))
+
+    chat.record("user", "my brother turns 20 and he has a bunch of friends — give him a day out")
+    db.commit()
+    refused = policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household}
+    )
+    assert refused is not None, "the household count is what arrives when the friends go missing"
+    assert refused["needs_confirmation"] == "party_size" and refused["applied"] is False
+
+    # A real total is an answer, not a fallback, so it goes straight through.
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household + 7}
+    ) is None
+
+    # And silence about the party still means the household — the documented default, and not
+    # something to interrogate a family about when their members are already on file.
+    chat.record("user", "plan us a beach day")
+    db.commit()
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": None}
+    ) is None
+
+    # Asked once is enough: the question is on the record, so the next attempt is not refused
+    # again into a loop the user can never answer their way out of.
+    chat.record("assistant", "how many?", {"calls": [{"name": "generate_itinerary",
+                                                      "result": refused}]})
+    chat.record("user", "a bunch of friends, like I said")
+    db.commit()
+    assert policy.intercept(
+        chat, "generate_itinerary", {"days": 1, "budget": 7500, "party_size": household}
+    ) is None
+
+
 def test_no_other_tool_is_intercepted(client, planned, db):
     """Interception is a short list of refusals, not a gate every call has to argue with."""
     from app.services import policy

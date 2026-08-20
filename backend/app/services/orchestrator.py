@@ -703,7 +703,13 @@ _TOOL_DEFINITIONS = [
                 "Record a like or dislike the user mentions, whether they ask you to or not. "
                 "Call it alongside whatever else the message needs — 'I don't like kayaking' is "
                 "an edit AND a preference, and doing only the edit forgets it by the next "
-                "session."
+                "session. A preference counts however it arrives: a LIKE as readily as a "
+                "dislike, about anyone in the party rather than the user alone ('my brother "
+                "likes skateboarding'), and dropped as background to a request rather than "
+                "declared on its own — that sentence is the whole reason the trip is being "
+                "planned, and it is gone by the next session unless this is called. Store it "
+                "on the account: there is nowhere to attribute it per person, and a "
+                "household-level like still steers the plan."
             ),
             "parameters": {
                 "type": "object",
@@ -961,7 +967,8 @@ def describe_tool_call(name: str, args: dict) -> tuple[str, str | None]:
     if name == "generate_itinerary":
         bits = []
         if args.get("days"):
-            bits.append(f"{int(args['days'])} days")
+            day = int(args["days"])
+            bits.append(f"{day} day{'s' if day != 1 else ''}")
         if args.get("budget"):
             bits.append(_money(args["budget"]))
         if args.get("start_date"):
@@ -1345,7 +1352,9 @@ class ChatOrchestrator:
             "sum — the user gave an increment, not a total. Add `guests` as well only when one "
             "of the extras is a child, so their age reaches the ticket bands. Party size decides "
             "the vehicle, the fares and every ticket, so never just acknowledge a headcount in "
-            "prose and plan without passing it.\n\n"
+            "prose and plan without passing it. When their headcount is vague — 'a bunch "
+            "of friends', 'some of the family' — ask for the number instead of estimating "
+            "one: a guess here is priced as fact, and they see it as a settled figure.\n\n"
             "A budget is one figure for the trip or one figure for each day, and which one "
             "decides the whole plan. \"3000 a day\" over five days is a 15,000 trip: pass it as "
             "budget_per_day and let the server multiply. Pass `budget` only when the user gave a "
