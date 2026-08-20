@@ -1,4 +1,4 @@
-# Rihla — UAE Event-Based Itinerary Planner
+# Rihla
 
 Rihla plans complete itineraries (up to 5 days, UAE only) around your upcoming personal events —
 a birthday, an anniversary, cousins visiting — with per-user family personalisation, long-term
@@ -110,7 +110,13 @@ flowchart TB
 
     subgraph BE["Backend — FastAPI"]
         RT["routers/<br/>auth · chat · itineraries · events · family"]
-        ORCH["orchestrator.py<br/><i>OpenAI tool calling</i>"]
+        subgraph TURN["The turn — no agent framework"]
+            direction LR
+            TN["turn.py<br/><i>agent → tools → review → respond</i>"]
+            PO["policy.py<br/><i>refuse · applied · claim_check</i>"]
+            RV["reviewer.py<br/><i>draft vs. what ran</i>"]
+        end
+        ORCH["orchestrator.py<br/><i>17 tools · prompt · SSE rows</i>"]
         RP["repo.py<br/><i>per-user scoping choke point</i>"]
         subgraph CORE["Planning core"]
             direction LR
@@ -139,7 +145,10 @@ flowchart TB
 
     CP -->|"POST /chat · SSE"| RT
     ZS -->|REST| RT
-    RT --> ORCH
+    RT --> TN
+    TN --> PO
+    TN --> RV
+    TN --> ORCH
     RT --> RP
     ORCH --> CORE
     ORCH --> RP
@@ -147,7 +156,8 @@ flowchart TB
     RP --> SQL
     RE --> CDB
     ME --> CDB
-    ORCH --> OPENAI
+    TN --> OPENAI
+    RV --> OPENAI
     RE --> OPENAI
     TV --> ORSVC
     ORCH --> TAV
@@ -168,9 +178,8 @@ sequenceDiagram
     U->>C: "plan Aisha's birthday, 4500 AED"
     C->>O: POST /chat
     O-->>C: conversation · thread id
-    O-->>C: token · token · token …
 
-    Note over O: model calls generate_itinerary
+    Note over O: round 0 is pinned to tool_choice="required"<br/>unless the message is a greeting
     O-->>C: tool · "Building your itinerary"
 
     O->>P: retrieve → score → cluster → assemble
@@ -182,6 +191,12 @@ sequenceDiagram
     O-->>C: itinerary_updated
     O-->>C: budget_updated
     C->>C: right pane redraws live
+
+    Note over O: the draft is held back, not streamed
+    O->>O: claim_check — does the prose claim<br/>a change nothing applied?
+    O->>O: reviewer, only if the turn mutated<br/>or a claim looks unsupported
+    O-->>C: token · token · token …
+    O->>D: save the reply AND the tool trace
     O-->>C: done
 ```
 
@@ -203,6 +218,46 @@ The model decides **when** to plan and **what was asked for**; it never decides 
 places or totals. Every tool result is recomputed from persisted rows, so a reply cannot quote a
 figure that disagrees with the budget bar next to it. Tool schemas use OpenAI **strict mode**, so
 arguments are guaranteed to match their shape before a handler ever sees them.
+
+### The checked turn
+
+Keeping the model out of *planning* was never enough. It still chose which tool to call, and it
+still wrote the sentence describing what happened — and a rule about either lived only in the
+system prompt, where it is advice. Asked to move a plan's region, with no tool that could, the
+model said it had done it and returned the identical plan. Twice.
+
+A turn now runs as a small state machine in `turn.py` — a `while` loop, a conditional, and two
+calls. **No agent framework:** the graph is trivial, and a library would have brought worker-thread
+node execution, a cross-thread SQLAlchemy session and a recursion limit to tune, none of which are
+the problem.
+
+```mermaid
+flowchart LR
+    A["agent<br/><i>tool_choice=required on round 0</i>"] --> B{"tool calls?"}
+    B -->|yes, rounds left| C["tools<br/><i>rows stream live</i>"]
+    C --> A
+    B -->|no| D["review"]
+    D -->|"rewrite · needs_tools<br/>(once)"| A
+    D -->|ok| E["respond<br/><i>held back, then streamed</i>"]
+```
+
+Three tiers, deliberately in this order — the cheap deterministic ones first, so the expensive
+judgement runs only where it can add something:
+
+| | What it does | Cost |
+|---|---|---|
+| **Refuse** | `policy.intercept` runs *before* a handler, so a call that must not happen cannot write on its way to being refused. Throwing away a plan takes the user's word, given in an earlier turn — never the model's own argument | free |
+| **Ledger** | `policy.applied` records per call whether anything actually changed. An error is not a change; neither is a confirmation that came back asking | free |
+| **Check** | `policy.claim_check` matches change-claims in the draft against that ledger. The LLM reviewer is consulted only if the turn mutated something, or a claim looks unsupported | one call, sometimes |
+
+Notably **not** done: scoping the exposed tool list by state. It reads like the stronger move and
+is a trap — `rebuild_warned` is set *inside* the handler such a rule would remove, so gating the
+tool on the flag makes the flag unreachable and no restart is ever possible again. Refusal gets
+the same guarantee while leaving every tool reachable and its error text in place, which is what
+teaches the model the right call.
+
+The reply is **held back until it has been checked**, then streamed. Tool rows still go out live,
+so the pane and the activity list move while the model works.
 
 ---
 
@@ -306,9 +361,9 @@ erDiagram
 | `travel_segments` | One leg between slots: distance, duration, cost, geometry | `estimated` flags a haversine fallback, drawn dashed |
 | `travel_cache` | Shared `(from, to, mode)` route lookups | See the note below |
 | `conversations` | A chat thread, optionally bound to one itinerary and event | The thread owns what the right pane shows |
-| `messages` | Chat history, plus `tool_calls_json` for the activity trace | Last 20 are replayed into the model's context |
+| `messages` | Chat history, plus `tool_calls_json` — what each turn called and whether it applied | Last 20 replayed into context, the trace spliced back as prose |
 
-### Three design decisions worth knowing
+### Four design decisions worth knowing
 
 **`travel_cache` caches distance, never price.** Distance between two places is a property of the
 road and is shared freely between all users. Price depends on who is travelling and how — a
@@ -320,6 +375,17 @@ cached price would let one party's fare leak into another's plan.
 never silently rewrites a plan someone already saw. Changing transport mode re-prices the stored
 legs explicitly, via `POST /itineraries/{id}/transport`.
 
+**A question only counts as asked once it is written down.** `messages.tool_calls_json` existed
+from the first schema and nothing ever wrote to it, so every turn's structured evidence was
+discarded with the reply. That is why confirmations only half worked: a tool returns
+`applied: false` with its proposal, the user says "yes" in their *next* message, and by then the
+model was reconstructing what it had offered from its own prose — the one source already known to
+be wrong about this. The trace is now stored with the reply, and only the part that cannot be
+recovered: the plan itself is authoritative and one tool call away, but a proposal that was never
+applied exists nowhere else. It is replayed into context **as prose**, never as `tool_calls` on an
+assistant row — the API hard-requires a matching `role: "tool"` message per id, those rows are not
+stored, and the request would be rejected outright rather than degrading.
+
 **There are no migrations.** `create_all()` builds missing tables, and `db.py` carries a short
 list of columns added after the fact, applied with an idempotent `ALTER TABLE`. That is a
 deliberate trade for a single-column change; if the list grows or anything needs a data backfill,
@@ -329,25 +395,51 @@ bring in Alembic.
 
 ## The assistant's tools
 
-Eleven, all strict-schema, none of which accepts a `user_id` — the model cannot address another
-user however it is prompted.
+Seventeen, all strict-schema, none of which accepts a `user_id` or an `itinerary_id` — the model
+cannot address another user however it is prompted, and cannot invent an id it never had.
 
 | Tool | Does |
 |---|---|
-| `save_family_details` | Record who is in the family and what they like |
+| `save_family_details` | Record who is in the family, what they like, and `home_emirate` — where they live |
 | `create_event` | Add an event to the calendar |
 | `get_upcoming_events` | Look further ahead than the calendar already in context |
 | `find_live_events` | Search the web for concerts and festivals — **read-only, saves nothing** |
+| `find_places` | Search the catalog. The only source of what there is to visit |
 | `generate_itinerary` | Build a plan. `focus` = `full_day` or `dinner_only`; `adults_only` for a couple's night |
 | `get_itinerary` | Read a plan's current state before describing it |
+| `reschedule_itinerary` | New dates, every stop kept |
+| `set_origin` | New starting point, every stop kept — re-routes and re-prices the origin legs |
+| `drop_day` | Remove a whole day. Asks shift-or-gap for any day but the last |
+| `replace_plan` | Re-solve in place. The **only** way a plan's region can move |
 | `make_day_cheaper` | Re-solve one day against a smaller budget; reports what it actually saved |
 | `add_prayer_breaks` | Insert prayer breaks and reflow the day |
+| `add_stop` | Add one stop to a day |
 | `set_transport` | Switch between taxi fares and driving yourself, and re-price |
-| `edit_stop` | Remove a stop, or move it to a different time |
+| `edit_stop` | Swap, remove, or re-time one stop |
 | `record_preference` | Note a like or dislike mentioned in passing |
 
 The user's calendar, family and preferences are **injected into the system prompt**, not fetched —
 so the assistant never asks for a date it already has.
+
+### Every field a plan is built with has a way to change it
+
+That was not true for a long time, and it is why the assistant used to fabricate. `emirates_json`
+was written in exactly one place, at plan creation, and no code path anywhere could change it — so
+"change the location of the plan to Abu Dhabi" was a request with **no legal move behind it**. A
+model with no legal move narrates.
+
+The four that were missing are not the same operation, and conflating the first two is the whole
+of that bug:
+
+| The user says | Changes | Destructive? |
+|---|---|---|
+| "we live in Abu Dhabi" | `users.home_base_*` — the default origin for plans built later | no |
+| "start us from Sharjah" | `itineraries.start_lat/lng` — `set_origin`, keeps every stop | no |
+| "make the trip Abu Dhabi instead of Dubai" | `itineraries.emirates_json` — `replace_plan` | yes: no Dubai place exists in Abu Dhabi |
+| "drop day 2" | `itineraries.num_days` — `drop_day` | one day, and it asks first |
+
+Both destructive ones take the user's answer from a **previous** turn, read back out of the stored
+tool trace. Passing an argument is not the user having spoken.
 
 ---
 
@@ -405,7 +497,7 @@ Interactive docs at `http://localhost:8000/docs` while the server is running.
 ## Testing
 
 ```bash
-cd backend && .venv/bin/python -m pytest    # 288 tests, ~70s (the model is stubbed)
+cd backend && .venv/bin/python -m pytest    # 472 tests, ~65s (the model is stubbed)
 cd frontend && npm run build                # tsc + vite
 ```
 
@@ -413,7 +505,14 @@ No test ever makes a billable API call. Coverage includes the scheduler (overlap
 opening hours, venues open past midnight, age gates, meal placement, the 60 km hop cap, detour
 scoring, restaurant revisits), the travel provider (cache hit, timeout → haversine, fare tiers,
 transport modes), slot patching, per-user isolation, the web search adapter, strict tool schemas,
-and eight Hypothesis properties.
+the deterministic tool-call rules, the reviewer's failure paths, and eight Hypothesis properties.
+
+**What the suite cannot cover** is anything a browser renders, anything resting on the model's
+judgement, and anything spanning two turns of a real conversation — the model is stubbed
+throughout. `docs/manual-verification.md` is the checklist for those, and it is not optional
+before a release: the two worst bugs in the orchestration work were both found by replaying a real
+conversation, and neither could have failed a stubbed test. One had the reviewer confidently
+deleting a real day from replies.
 
 ---
 
@@ -455,6 +554,15 @@ down a file cannot leave a half-applied import. Idempotent on `(user_id, title, 
 - **"The best restaurant" is not a concept.** Scoring weights cuisine preference above romance,
   and price only ever constrains — it never attracts — so "budget is no issue" does not make an
   expensive venue win.
+- **The reviewer is a check, not a guarantee.** It runs only where it can add something — a
+  turn that mutated a plan, or a draft claiming a change nothing applied — and it fails **open**:
+  a refusal, a timeout or malformed JSON lets the draft through and logs. One that takes down a
+  turn would be worse than the bug it catches. The deterministic half (`claim_check`) is a verb
+  list, so a paraphrase gets past it; that costs nothing, because the reviewer still runs on every
+  mutating turn.
+- **A checked reply arrives a beat later.** The prose is held back until it has been checked, so
+  there is a pause before the first word that did not exist before. Tool rows stream live to cover
+  it. If it ever reads as a stall, the fallback is to stream the draft and emit a correction frame.
 - **Web search needs both keys.** Tavily finds the pages; pulling an event name out of scraped
   page chrome needs comprehension, so without `OPENAI_API_KEY` the adapter returns nothing rather
   than feeding the planner noise.
